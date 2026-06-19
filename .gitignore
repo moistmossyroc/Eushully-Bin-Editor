@@ -1,0 +1,22 @@
+# Node / frontend
+node_modules/
+dist/
+*.log
+
+# Rust / Tauri
+src-tauri/target/
+
+# Editor/OS cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Game data — NEVER commit. Users supply their own legally-obtained files.
+*.BIN
+*.bin
+*.arc
+*.dat
+sys3/
+sys4/
+sys5/
