@@ -590,22 +590,6 @@
         </button>
       {/if}
 
-      {#if store.mergedGlossary.some((g) => g.english.trim())}
-        <button
-          class="ctrl-btn"
-          onclick={() => (store.glossaryConsistencyOpen = true)}
-          title="Flag translated rows where a glossary term's Japanese appears but its English rendering is missing (drift check)"
-        >
-          Glossary check
-        </button>
-        <button
-          class="ctrl-btn"
-          onclick={() => (store.glossaryAutoApplyOpen = true)}
-          title="Review safe glossary substitutions: fill exact-term rows + replace Japanese terms that leaked into the English. Nothing applies until you confirm."
-        >
-          Glossary auto-apply
-        </button>
-      {/if}
 
       {#if emptyStats.eligible > 0}
         <button

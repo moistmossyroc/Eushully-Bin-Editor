@@ -535,6 +535,22 @@
     >
       Suggest
     </button>
+    <button
+      class="io-btn"
+      onclick={() => (store.glossaryConsistencyOpen = true)}
+      title="Across ALL open tabs: flag translated rows where a glossary term's Japanese appears but its English rendering is missing. Fix inline or jump to the row."
+      disabled={store.tabs.length === 0}
+    >
+      Check
+    </button>
+    <button
+      class="io-btn"
+      onclick={() => (store.glossaryAutoApplyOpen = true)}
+      title="Across ALL open tabs: review safe glossary substitutions (fill exact-term rows, replace leaked Japanese). Nothing applies until you confirm; the batch is undoable."
+      disabled={store.tabs.length === 0}
+    >
+      Auto-apply
+    </button>
     <button class="io-btn" onclick={handleImportGlossary} title="Import glossary from JSON">
       Import
     </button>

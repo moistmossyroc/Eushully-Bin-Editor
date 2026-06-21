@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0 — 2026-06-21
+
+### Changed — glossary review
+- **Both glossary tools moved into the Glossary panel** (Check + Auto-apply),
+  next to Suggest/Import/Export.
+- **Now span every open tab**, grouped by tab. The consistency **Check** lets you
+  fix each flagged row two ways — edit the translation **inline**, or **jump to
+  the row** in its tab. **Auto-apply** reviews safe substitutions across all tabs
+  and applies them under a single bulk-undo.
+
+### Fixed
+- **Glossary check false positives.** Matching is now Japanese script-boundary
+  aware, so a term is no longer flagged when it's merely an inner fragment of a
+  longer same-script word (e.g. ベル "Bell" inside レベル "level", or 重要 inside
+  重要性). Auto-apply's replace step is boundary-aware too. Duplicate glossary
+  terms also no longer produce duplicate flags.
+
 ## 1.2.0 — 2026-06-21
 
 ### Added — glossary

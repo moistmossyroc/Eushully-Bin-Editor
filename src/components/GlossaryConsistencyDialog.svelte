@@ -1,39 +1,107 @@
 <script lang="ts">
   /**
-   * Glossary consistency review: flags translated rows where a glossary term's
-   * Japanese appears in the original but its English rendering is missing from
-   * the translation (possible drift / forgotten term). Review flags, not errors
-   * — click a row to jump to it and confirm or fix.
+   * Glossary consistency review — ACROSS ALL TABS. Flags translated rows where a
+   * glossary term's Japanese appears in the original but its English rendering is
+   * missing from the translation (possible drift / forgotten term). Results are
+   * grouped by tab → row; each row lists its flagged terms and can be fixed two
+   * ways: edit the translation inline, or jump to the row in its tab.
    */
   import { store } from "../lib/stores.svelte";
-  import { findGlossaryInconsistencies, type GlossaryFlag } from "../lib/glossaryCheck";
+  import { findGlossaryInconsistenciesAllTabs } from "../lib/glossaryCheck";
+  import { toastInfo } from "../lib/toast";
 
   interface Props { onClose: () => void; }
   let { onClose }: Props = $props();
 
-  let flags = $derived.by<GlossaryFlag[]>(() => {
-    const tab = store.activeTab;
-    if (!tab) return [];
-    return findGlossaryInconsistencies(tab.entries, store.mergedGlossary);
-  });
-
-  /** Distinct terms involved, for the summary. */
-  let termCount = $derived(new Set(flags.map((f) => f.term)).size);
-
-  function truncate(s: string, n: number): string {
-    return s.length <= n ? s : s.slice(0, n) + "…";
+  interface RowGroup {
+    rowIndex: number;
+    rowId: number;
+    original: string;
+    translated: string;
+    terms: { jp: string; en: string }[];
+  }
+  interface TabGroup {
+    tabIndex: number;
+    tabId: string;
+    tabName: string;
+    rows: RowGroup[];
   }
 
-  function jumpTo(flag: GlossaryFlag) {
-    const tab = store.activeTab;
+  let hasGlossary = $derived(
+    store.globalGlossary.some((g) => g.english.trim()) ||
+      store.tabs.some((t) => t.glossary.some((g) => g.english.trim())),
+  );
+
+  let flags = $derived.by(() =>
+    findGlossaryInconsistenciesAllTabs(
+      store.tabs.map((t, i) => ({
+        id: t.id,
+        name: t.sourceBinFilename || "Untitled",
+        index: i,
+        entries: t.entries,
+        glossary: t.glossary,
+      })),
+      store.globalGlossary,
+    ),
+  );
+
+  let groups = $derived.by<TabGroup[]>(() => {
+    const byTab = new Map<number, TabGroup>();
+    for (const f of flags) {
+      const ti = f.tabIndex ?? 0;
+      let tg = byTab.get(ti);
+      if (!tg) {
+        tg = { tabIndex: ti, tabId: f.tabId ?? "", tabName: f.tabName ?? "Untitled", rows: [] };
+        byTab.set(ti, tg);
+      }
+      let rg = tg.rows.find((r) => r.rowId === f.rowId);
+      if (!rg) {
+        rg = { rowIndex: f.rowIndex, rowId: f.rowId, original: f.original, translated: f.translated, terms: [] };
+        tg.rows.push(rg);
+      }
+      rg.terms.push({ jp: f.term, en: f.glossaryEn });
+    }
+    return [...byTab.values()].sort((a, b) => a.tabIndex - b.tabIndex);
+  });
+
+  let totalRows = $derived(groups.reduce((n, g) => n + g.rows.length, 0));
+  let termCount = $derived(new Set(flags.map((f) => f.term)).size);
+
+  // Inline-edit drafts keyed by `${tabIndex}|${rowId}`.
+  let drafts = $state<Record<string, string>>({});
+  const keyOf = (tabIndex: number, rowId: number) => `${tabIndex}|${rowId}`;
+  const changed = (tabIndex: number, row: RowGroup) => {
+    const v = drafts[keyOf(tabIndex, row.rowId)];
+    return v !== undefined && v !== row.translated;
+  };
+
+  function applyEdit(tabIndex: number, row: RowGroup) {
+    const key = keyOf(tabIndex, row.rowId);
+    const value = drafts[key];
+    if (value === undefined || value === row.translated) return;
+    const tab = store.tabs[tabIndex];
     if (!tab) return;
-    // rowIndex was computed against the current entries array; re-find by id to
-    // be safe against any intervening edits.
-    const idx = tab.entries.findIndex((e) => e.instruction_index === flag.rowId);
-    const target = idx >= 0 ? idx : flag.rowIndex;
+    tab.entries = tab.entries.map((e, i) =>
+      i === row.rowIndex ? { ...e, translated_text: value } : e,
+    );
+    tab.isDirty = true;
+    delete drafts[key];
+    toastInfo("Translation updated");
+  }
+
+  function jumpTo(tabIndex: number, row: RowGroup) {
+    const tab = store.tabs[tabIndex];
+    if (!tab) return;
+    store.switchTab(tabIndex);
+    const idx = tab.entries.findIndex((e) => e.instruction_index === row.rowId);
+    const target = idx >= 0 ? idx : row.rowIndex;
     tab.selectedRowIndex = target;
     store.pendingScrollRequest = { tabId: tab.id, rowIndex: target, nonce: Date.now() };
     onClose();
+  }
+
+  function truncate(s: string, n: number): string {
+    return s.length <= n ? s : s.slice(0, n) + "…";
   }
 </script>
 
@@ -42,45 +110,48 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="dialog" onclick={(e) => e.stopPropagation()}>
     <header>
-      <h2>Glossary Consistency</h2>
+      <h2>Glossary Consistency — all tabs</h2>
       <button class="close-btn" onclick={onClose}>×</button>
     </header>
 
-    {#if store.mergedGlossary.filter((g) => g.english.trim()).length === 0}
+    {#if !hasGlossary}
       <div class="empty">No glossary entries with English renderings yet — add some to check consistency.</div>
-    {:else if flags.length === 0}
-      <div class="empty">✓ All glossary terms are rendered consistently in the translated rows.</div>
+    {:else if totalRows === 0}
+      <div class="empty">✓ All glossary terms are rendered consistently across every open tab.</div>
     {:else}
       <div class="summary">
-        <strong>{flags.length}</strong> row{flags.length === 1 ? "" : "s"} where a glossary term's English may be missing
-        ({termCount} distinct term{termCount === 1 ? "" : "s"}). Review flags — a term is sometimes legitimately rephrased.
+        <strong>{totalRows}</strong> row{totalRows === 1 ? "" : "s"} across <strong>{groups.length}</strong>
+        tab{groups.length === 1 ? "" : "s"} where a glossary term's English may be missing
+        ({termCount} distinct term{termCount === 1 ? "" : "s"}). Fix inline or open the row — a term is
+        sometimes legitimately rephrased.
       </div>
-      <div class="table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th class="col-term">Term → glossary</th>
-              <th class="col-text">Original / your translation</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each flags as f (f.rowId + "|" + f.term)}
-              <tr>
-                <td class="col-term">
-                  <span class="jp">{f.term}</span>
-                  <span class="arrow">→</span>
-                  <span class="en">{f.glossaryEn}</span>
-                </td>
-                <td class="col-text">
-                  <button class="jump" onclick={() => jumpTo(f)} title="Go to row #{f.rowId} in the editor">
-                    <span class="orig">{truncate(f.original, 80)}</span>
-                    <span class="trans">{truncate(f.translated, 100)}</span>
-                  </button>
-                </td>
-              </tr>
+      <div class="scroll">
+        {#each groups as g (g.tabId)}
+          <div class="tab-section">
+            <div class="tab-head">{g.tabName} <span class="tab-count">{g.rows.length}</span></div>
+            {#each g.rows as row (row.rowId)}
+              <div class="row">
+                <div class="terms">
+                  {#each row.terms as t}
+                    <span class="chip"><span class="jp">{t.jp}</span> <span class="arrow">→</span> <span class="en">{t.en}</span></span>
+                  {/each}
+                </div>
+                <div class="orig" title={row.original}>{truncate(row.original, 120)}</div>
+                <div class="edit">
+                  <textarea
+                    rows="2"
+                    value={drafts[keyOf(g.tabIndex, row.rowId)] ?? row.translated}
+                    oninput={(e) => (drafts[keyOf(g.tabIndex, row.rowId)] = e.currentTarget.value)}
+                  ></textarea>
+                  <div class="row-actions">
+                    <button class="apply" disabled={!changed(g.tabIndex, row)} onclick={() => applyEdit(g.tabIndex, row)}>Apply</button>
+                    <button class="open" onclick={() => jumpTo(g.tabIndex, row)} title="Open this row in the editor">Open row →</button>
+                  </div>
+                </div>
+              </div>
             {/each}
-          </tbody>
-        </table>
+          </div>
+        {/each}
       </div>
     {/if}
 
@@ -97,7 +168,7 @@
   }
   .dialog {
     background: #1a1a3e; border: 1px solid #3a3a5a; border-radius: 6px;
-    width: 880px; max-width: 90vw; max-height: 85vh;
+    width: 920px; max-width: 92vw; max-height: 85vh;
     display: flex; flex-direction: column; box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   }
   header {
@@ -110,18 +181,32 @@
   .empty { padding: 32px 24px; text-align: center; color: #a0a0c0; font-size: 0.9rem; }
   .summary { padding: 12px 20px; font-size: 0.85rem; color: #c0c0e0; border-bottom: 1px solid #2a2a4a; }
   .summary strong { color: #f0a070; }
-  .table-scroll { flex: 1; overflow-y: auto; min-height: 0; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-  th { position: sticky; top: 0; background: #16213e; color: #8ab4f8; padding: 8px 10px; text-align: left; font-weight: 600; border-bottom: 1px solid #2a2a4a; }
-  td { padding: 6px 10px; color: #c0c0e0; border-bottom: 1px solid #20204a; vertical-align: top; }
-  .col-term { width: 240px; }
-  .col-term .jp { color: #e0c0a0; }
-  .col-term .arrow { color: #6a6a8a; margin: 0 6px; }
-  .col-term .en { color: #8ab4f8; font-weight: 600; }
-  .jump { display: block; width: 100%; text-align: left; background: none; border: none; padding: 0; margin: 0; cursor: pointer; font: inherit; }
-  .jump .orig { display: block; color: #9a9ab8; font-size: 0.78rem; }
-  .jump .trans { display: block; color: #d0d0e0; line-height: 1.4; }
-  .jump:hover .trans { color: #8ab4f8; text-decoration: underline; }
+  .scroll { flex: 1; overflow-y: auto; min-height: 0; padding: 4px 0; }
+  .tab-section { border-bottom: 1px solid #20204a; }
+  .tab-head {
+    position: sticky; top: 0; z-index: 1; background: #16213e; color: #8ab4f8;
+    padding: 6px 20px; font-size: 0.82rem; font-weight: 600; border-bottom: 1px solid #2a2a4a;
+  }
+  .tab-count { color: #6a6a8a; font-weight: 400; }
+  .row { padding: 10px 20px; border-bottom: 1px solid #20204a; }
+  .terms { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 5px; }
+  .chip { font-size: 0.76rem; background: #232348; border: 1px solid #34345a; border-radius: 4px; padding: 1px 7px; }
+  .chip .jp { color: #e0c0a0; }
+  .chip .arrow { color: #6a6a8a; margin: 0 3px; }
+  .chip .en { color: #8ab4f8; font-weight: 600; }
+  .orig { color: #9a9ab8; font-size: 0.78rem; margin-bottom: 5px; }
+  .edit { display: flex; gap: 8px; align-items: flex-start; }
+  textarea {
+    flex: 1; resize: vertical; background: #12122c; color: #e0e0f0; border: 1px solid #34345a;
+    border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 0.82rem; line-height: 1.4;
+  }
+  textarea:focus { outline: none; border-color: #6c9bd2; }
+  .row-actions { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  .apply { padding: 5px 12px; border: 1px solid #3e6a54; border-radius: 4px; background: #2a4a3e; color: #c0f0d0; cursor: pointer; font-size: 0.8rem; }
+  .apply:hover:not(:disabled) { background: #3a5a4e; }
+  .apply:disabled { opacity: 0.4; cursor: default; }
+  .open { padding: 5px 12px; border: 1px solid #3a3a5a; border-radius: 4px; background: #1a1a3e; color: #8ab4f8; cursor: pointer; font-size: 0.8rem; white-space: nowrap; }
+  .open:hover { background: #2a2a5e; }
   footer { padding: 12px 20px; border-top: 1px solid #2a2a4a; display: flex; justify-content: flex-end; }
   .btn { padding: 6px 14px; border: 1px solid #3a3a5a; border-radius: 4px; background: #1a1a3e; color: #c0c0e0; cursor: pointer; font-size: 0.85rem; }
   .btn:hover { background: #2a2a5e; }

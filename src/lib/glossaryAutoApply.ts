@@ -1,4 +1,6 @@
 import type { DialogueEntry, GlossaryEntry } from "./types";
+import { mergeGlossary, type TabGlossaryInput } from "./glossaryCheck";
+import { replaceBoundaryMatches } from "./jpMatch";
 
 export type AutoApplyKind = "fill" | "replace";
 
@@ -17,6 +19,10 @@ export interface GlossaryAutoChange {
   before: string;
   /** Proposed translated_text. */
   after: string;
+  /** Owning tab — set only by the all-tabs variant. */
+  tabId?: string;
+  tabName?: string;
+  tabIndex?: number;
 }
 
 const CHECKABLE = new Set(["show-text", "display-furigana", "comment"]);
@@ -73,8 +79,9 @@ export function findGlossaryAutoApply(
     const usedJp: string[] = [];
     const usedEn: string[] = [];
     for (const { jp, en } of terms) {
-      if (after.includes(jp)) {
-        after = after.split(jp).join(en);
+      const next = replaceBoundaryMatches(after, jp, en);
+      if (next !== after) {
+        after = next;
         usedJp.push(jp);
         usedEn.push(en);
       }
@@ -92,4 +99,23 @@ export function findGlossaryAutoApply(
     }
   }
   return changes;
+}
+
+/**
+ * Find auto-apply candidates across EVERY open tab. Each tab is matched against
+ * its own merged glossary (global + that tab's local), and every change is
+ * tagged with its owning tab so the UI can group + apply per-tab.
+ */
+export function findGlossaryAutoApplyAllTabs(
+  tabs: TabGlossaryInput[],
+  globalGlossary: GlossaryEntry[],
+): GlossaryAutoChange[] {
+  const out: GlossaryAutoChange[] = [];
+  for (const t of tabs) {
+    const glossary = mergeGlossary(globalGlossary, t.glossary);
+    for (const c of findGlossaryAutoApply(t.entries, glossary)) {
+      out.push({ ...c, tabId: t.id, tabName: t.name, tabIndex: t.index });
+    }
+  }
+  return out;
 }
