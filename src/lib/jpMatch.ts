@@ -35,6 +35,19 @@ function isBoundaryAt(text: string, i: number, term: string): boolean {
   return leftOk && rightOk;
 }
 
+/** True if `term` is a katakana word — at least one katakana char and no kanji
+ *  or hiragana (long-vowel ー, ・, latin, digits are allowed). In these games
+ *  that almost always means a proper noun / name. */
+export function isKatakanaTerm(term: string): boolean {
+  let hasKatakana = false;
+  for (const ch of term) {
+    const cls = scriptClass(ch);
+    if (cls === "kanji" || cls === "hiragana") return false;
+    if (cls === "katakana") hasKatakana = true;
+  }
+  return hasKatakana;
+}
+
 /** True if `term` occurs in `text` at a script boundary (not as an inner
  *  fragment of a longer same-script word). */
 export function hasBoundaryMatch(text: string, term: string): boolean {

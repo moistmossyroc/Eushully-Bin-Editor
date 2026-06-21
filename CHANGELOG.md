@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.1 — 2026-06-21
+
+### Added — glossary consistency review
+- **Apply all edits** — edit the translation on as many flagged rows as you want
+  (across tabs), then commit them in one click, captured as a single bulk-undo.
+  Per-row Apply / Open-row still available.
+- **Script filter** — All · Katakana (names) · Other, with live counts. Katakana
+  terms are almost always proper nouns, so this lets you triage names separately.
+  Filtering only narrows the list; pending edits and Apply-all stay
+  filter-independent so nothing is lost when you switch.
+
 ## 1.3.0 — 2026-06-21
 
 ### Changed — glossary review
