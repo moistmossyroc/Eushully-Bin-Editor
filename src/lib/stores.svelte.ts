@@ -277,6 +277,11 @@ class AppStore {
    *  (notably auto-wrap SYS4 titles like Sankai where boxes carry long lines). */
   autoSplitOnImport = $state(false);
 
+  /** Last folder a Parente patch was exported to. Used as the save-dialog
+   *  default so it doesn't open inside the game's admin-protected Archives
+   *  folder (which the user usually can't write to without elevation). */
+  lastParenteExportDir = $state<string | null>(null);
+
   /** Whether the characters panel is visible */
   charactersPanelOpen = $state(false);
 
@@ -393,6 +398,17 @@ class AppStore {
   /** Whether the overflow review dialog is open */
   overflowReviewDialogOpen = $state(false);
 
+  /** Whether the glossary-consistency review dialog is open */
+  glossaryConsistencyOpen = $state(false);
+
+  /** One-level undo for bulk operations (replace-all, split/paginate across
+   *  tabs). Snapshots the affected tabs before the op; a floating Undo pill
+   *  restores it. Replaced by the next bulk op or cleared on use. */
+  bulkUndo = $state<{
+    label: string;
+    snapshots: { tabId: string; entries: DialogueEntry[]; insertedInstructions: InsertedInstruction[]; isDirty: boolean }[];
+  } | null>(null);
+
   /** Translation project status snapshot to render in the status dialog.
    *  Set by doCheckTranslationStatus; App.svelte mounts the dialog when present. */
   translationStatusReport = $state<{
@@ -489,6 +505,40 @@ class AppStore {
     if (index >= 0 && index < this.tabs.length) {
       this.activeTabIndex = index;
     }
+  }
+
+  /** Snapshot the given tabs' editable state before a bulk operation, enabling
+   *  one-level undo via `restoreBulkUndo`. Call this at the START of any bulk op
+   *  that mutates many rows (replace-all, split/paginate). */
+  captureBulkUndo(label: string, tabs: TabState[]) {
+    this.bulkUndo = {
+      label,
+      snapshots: tabs.map((t) => ({
+        tabId: t.id,
+        entries: $state.snapshot(t.entries) as DialogueEntry[],
+        insertedInstructions: $state.snapshot(t.insertedInstructions) as InsertedInstruction[],
+        isDirty: t.isDirty,
+      })),
+    };
+  }
+
+  /** Restore the last bulk snapshot. Returns the op label (for a toast), or null. */
+  restoreBulkUndo(): string | null {
+    if (!this.bulkUndo) return null;
+    const { label, snapshots } = this.bulkUndo;
+    for (const s of snapshots) {
+      const tab = this.tabs.find((t) => t.id === s.tabId);
+      if (!tab) continue;
+      tab.entries = structuredClone(s.entries);
+      tab.insertedInstructions = structuredClone(s.insertedInstructions);
+      tab.isDirty = s.isDirty;
+    }
+    this.bulkUndo = null;
+    return label;
+  }
+
+  clearBulkUndo() {
+    this.bulkUndo = null;
   }
 
   /** Move a tab from one index to another, preserving the active tab's

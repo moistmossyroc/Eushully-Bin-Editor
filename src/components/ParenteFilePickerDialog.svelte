@@ -12,6 +12,10 @@
   // Selection by array index (stable within this dialog session).
   let selected = $state<Set<number>>(new Set());
   let filter = $state("");
+  // Active category view-filters (empty = show all). Independent of selection.
+  let activeCats = $state<Set<string>>(new Set());
+  // Content filter: all / normal-only / adult-only.
+  let adultFilter = $state<"all" | "normal" | "adult">("all");
   let loading = $state(false);
 
   /** Group a file into a human category by its path + name. */
@@ -36,51 +40,69 @@
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   });
 
+  // Visible list = text filter AND category view-filter (empty cats = all).
   let shown = $derived.by(() => {
     const q = filter.trim().toLowerCase();
-    const list = files.map((f, i) => ({ f, i }));
-    if (q === "") return list;
-    return list.filter(({ f }) => (f.path + "/" + f.name).toLowerCase().includes(q));
+    return files
+      .map((f, i) => ({ f, i }))
+      .filter(({ f, i }) => {
+        if (activeCats.size > 0 && !activeCats.has(cats[i])) return false;
+        if (adultFilter === "adult" && !f.adult) return false;
+        if (adultFilter === "normal" && f.adult) return false;
+        if (q && !(f.path + "/" + f.name).toLowerCase().includes(q)) return false;
+        return true;
+      });
   });
+  let adultCount = $derived(files.filter((f) => f.adult).length);
 
   // Whether the source archive varies (game-folder mode) — show the column then.
   let showSource = $derived(new Set(files.map((f) => f.source)).size > 1);
   let totalLines = $derived(files.reduce((s, f) => s + f.string_count, 0));
+  let shownLines = $derived(shown.reduce((s, { f }) => s + f.string_count, 0));
+  let selectedLines = $derived(
+    [...selected].reduce((s, i) => s + (files[i]?.string_count ?? 0), 0),
+  );
+  // Master-select state for the currently-shown rows.
+  let allShownSelected = $derived(shown.length > 0 && shown.every(({ i }) => selected.has(i)));
+  let someShownSelected = $derived(shown.some(({ i }) => selected.has(i)));
 
   function toggle(i: number) {
     if (selected.has(i)) selected.delete(i);
     else selected.add(i);
     selected = new Set(selected);
   }
-  function selectAll() {
-    for (let i = 0; i < files.length; i++) selected.add(i);
-    selected = new Set(selected);
+  /** Toggle a category as a VIEW filter (not selection). */
+  function toggleCat(cat: string) {
+    if (activeCats.has(cat)) activeCats.delete(cat);
+    else activeCats.add(cat);
+    activeCats = new Set(activeCats);
   }
-  function selectAllShown() {
-    for (const { i } of shown) selected.add(i);
+  function clearCats() {
+    activeCats = new Set();
+  }
+  /** Select or deselect every currently-shown row (tri-state master). */
+  function toggleSelectAllShown() {
+    if (allShownSelected) {
+      for (const { i } of shown) selected.delete(i);
+    } else {
+      for (const { i } of shown) selected.add(i);
+    }
     selected = new Set(selected);
   }
   function clearSel() {
     selected = new Set();
   }
-  /** Add every file of a category to the selection (respects the text filter). */
-  function selectCategory(cat: string) {
-    const q = filter.trim().toLowerCase();
-    for (let i = 0; i < files.length; i++) {
-      if (cats[i] !== cat) continue;
-      if (q && !(files[i].path + "/" + files[i].name).toLowerCase().includes(q)) continue;
-      selected.add(i);
-    }
-    selected = new Set(selected);
-  }
 
   async function load() {
+    if (loading) return;
     const chosen = [...selected].map((i) => files[i]).filter(Boolean);
     if (chosen.length === 0) return;
     loading = true;
-    await doLoadParenteEntries(chosen);
-    loading = false;
+    // Dismiss the picker FIRST so the global loading-progress overlay (lower
+    // z-index) is visible on top while scenes load. The async load continues
+    // after unmount — it only mutates the store.
     onClose();
+    await doLoadParenteEntries(chosen);
   }
 
   function fmtSize(n: number): string {
@@ -104,19 +126,47 @@
 
     <div class="toolbar">
       <input class="filter" placeholder="Filter by name/path…" bind:value={filter} />
-      <button class="btn small" onclick={selectAll}>Select all</button>
-      <button class="btn small" onclick={selectAllShown} disabled={filter.trim() === ""}>Select shown</button>
-      <button class="btn small" onclick={clearSel}>Clear</button>
-      <span class="count">{selected.size} selected</span>
+      {#if selected.size > 0}
+        <button class="btn small" onclick={clearSel}>Clear selection</button>
+      {/if}
+      <span class="count">
+        {shown.length} of {files.length} shown · <strong>{selected.size} selected</strong>{selected.size > 0 ? ` (${selectedLines.toLocaleString()} lines)` : ""}
+      </span>
     </div>
 
     <div class="cat-bar">
-      <span class="cat-bar-label">Quick select:</span>
+      <span class="cat-bar-label">Show:</span>
+      <button class="cat-chip" class:active={activeCats.size === 0} onclick={clearCats} title="Show all categories">
+        All <span class="cat-n">{files.length}</span>
+      </button>
       {#each catGroups as [cat, n]}
-        <button class="cat-chip" onclick={() => selectCategory(cat)} title={`Select all ${n} ${cat} file(s)${filter.trim() ? " matching the filter" : ""}`}>
+        <button class="cat-chip" class:active={activeCats.has(cat)} onclick={() => toggleCat(cat)} title={`Show ${cat} files`}>
           {cat} <span class="cat-n">{n}</span>
         </button>
       {/each}
+      {#if adultCount > 0}
+        <span class="cat-divider"></span>
+        <button class="cat-chip" class:active={adultFilter === "normal"} onclick={() => (adultFilter = adultFilter === "normal" ? "all" : "normal")} title="Show only non-adult scenes">
+          Normal <span class="cat-n">{files.length - adultCount}</span>
+        </button>
+        <button class="cat-chip adult" class:active={adultFilter === "adult"} onclick={() => (adultFilter = adultFilter === "adult" ? "all" : "adult")} title="Show only adult scenes (heuristic)">
+          🔞 Adult <span class="cat-n">{adultCount}</span>
+        </button>
+      {/if}
+    </div>
+
+    <div class="select-bar">
+      <label class="select-all" title="Select / deselect everything currently shown">
+        <input
+          type="checkbox"
+          checked={allShownSelected}
+          indeterminate={someShownSelected && !allShownSelected}
+          onchange={toggleSelectAllShown}
+          disabled={shown.length === 0}
+        />
+        <span>Select all shown ({shown.length})</span>
+      </label>
+      <span class="select-bar-lines">{shownLines.toLocaleString()} lines shown</span>
     </div>
 
     <div class="list">
@@ -124,7 +174,7 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <label class="row" class:wide={showSource}>
           <input type="checkbox" checked={selected.has(i)} onchange={() => toggle(i)} />
-          <span class="name">{f.name}</span>
+          <span class="name">{f.name}{#if f.adult}<span class="adult-badge" title="Adult content (heuristic)">🔞</span>{/if}</span>
           <span class="cat-tag cat-{cats[i].replace(/[^a-z]/gi,'').toLowerCase()}">{cats[i]}</span>
           <span class="path">{f.path}</span>
           {#if showSource}<span class="src" title={f.arc_path}>{f.source}</span>{/if}
@@ -199,7 +249,24 @@
     color: #bcd0f0; font-size: 0.74rem; padding: 3px 9px; cursor: pointer;
   }
   .cat-chip:hover { background: #2a3a5e; border-color: #5a7aaa; }
+  .cat-chip.active {
+    background: #2f4a7a; border-color: #6f9ad8; color: #e0eeff;
+  }
   .cat-n { color: #7a90b8; font-size: 0.68rem; }
+  .cat-divider { width: 1px; height: 18px; background: #3a3a5a; margin: 0 4px; }
+  .cat-chip.adult { border-color: #6a3a4a; color: #e0a0b8; }
+  .cat-chip.adult.active { background: #5a2a3e; border-color: #b06a86; color: #ffe0ec; }
+  .adult-badge { margin-left: 6px; font-size: 0.72rem; }
+  .select-bar {
+    padding: 6px 20px;
+    display: flex; align-items: center; gap: 10px;
+    border-bottom: 1px solid #2a2a4a; background: #15152e;
+  }
+  .select-all {
+    display: flex; align-items: center; gap: 7px;
+    color: #c0c0e0; font-size: 0.8rem; cursor: pointer;
+  }
+  .select-bar-lines { color: #6fd886; font-size: 0.74rem; margin-left: auto; }
   .list { flex: 1; overflow-y: auto; padding: 4px 0; min-height: 0; }
   .row {
     display: grid;

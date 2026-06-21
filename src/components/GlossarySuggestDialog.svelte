@@ -9,9 +9,11 @@
    * almost always katakana-only sequences. We skip kanji and hiragana to
    * avoid noise from common-vocabulary substrings.
    */
+  import { onDestroy } from "svelte";
+  import { open } from "@tauri-apps/plugin-dialog";
   import { store } from "../lib/stores.svelte";
   import { persistAllSettingsDebounced } from "../lib/settings";
-  import { translateSingleEntry } from "../lib/ipc";
+  import { translateSingleEntry, exportGlossaryCli, readGlossaryCliResults, type GlossaryCliResult } from "../lib/ipc";
   import { toastError } from "../lib/toast";
   import type { GlossaryEntry, DialogueEntry } from "../lib/types";
 
@@ -277,6 +279,123 @@
     }
   }
 
+  // ---- Claude CLI glossary translation (subscription, no API billing) --------
+
+  /** Terms checked for the CLI batch. */
+  let selected = $state<Set<string>>(new Set());
+  let cliFolder = $state<string | null>(null);
+  let cliWatching = $state(false);
+  let cliBusy = $state(false);
+  let pollId: ReturnType<typeof setInterval> | null = null;
+
+  function toggleSelect(term: string) {
+    if (selected.has(term)) selected.delete(term);
+    else selected.add(term);
+    selected = new Set(selected);
+  }
+  /** Tri-state select-all over the currently filtered rows. */
+  let allShownSelected = $derived(filtered.length > 0 && filtered.every((c) => selected.has(c.term)));
+  function toggleSelectAllShown() {
+    if (allShownSelected) {
+      for (const c of filtered) selected.delete(c.term);
+    } else {
+      for (const c of filtered) selected.add(c.term);
+    }
+    selected = new Set(selected);
+  }
+
+  /** Merge CLI results into the target glossary: add new terms, fill EMPTY
+   *  translations, never overwrite an existing non-empty one (count conflicts). */
+  function mergeCliResults(results: GlossaryCliResult[]): { added: number; filled: number; conflicts: number } {
+    const target = getTargetGlossary();
+    const byJp = new Map(target.map((g) => [g.japanese, g] as const));
+    let addedN = 0, filled = 0, conflicts = 0;
+    for (const r of results) {
+      const tr = (r.translation ?? "").trim();
+      if (!r.term || !tr) continue;
+      const existing = byJp.get(r.term);
+      if (!existing) {
+        target.push({ japanese: r.term, english: tr, notes: r.notes ?? "", category: "" });
+        added.add(r.term);
+        addedN++;
+      } else if (existing.english.trim() === "") {
+        existing.english = tr;
+        if (r.notes && !existing.notes) existing.notes = r.notes;
+        added.add(r.term);
+        filled++;
+      } else if (existing.english.trim() !== tr) {
+        conflicts++;
+      }
+    }
+    added = new Set(added);
+    if (activeView === "global") persistAllSettingsDebounced();
+    else if (store.activeTab) store.activeTab.isDirty = true;
+    return { added: addedN, filled, conflicts };
+  }
+
+  function applyResultsToast(results: GlossaryCliResult[]) {
+    const r = mergeCliResults(results);
+    const parts = [`${r.added} added`, `${r.filled} filled`];
+    if (r.conflicts > 0) parts.push(`${r.conflicts} kept (already translated)`);
+    store.statusMessage = `Glossary CLI import — ${parts.join(", ")}`;
+  }
+
+  function stopWatch() {
+    if (pollId != null) { clearInterval(pollId); pollId = null; }
+    cliWatching = false;
+  }
+
+  /** Send the checked terms to a Claude CLI session and watch for results. */
+  async function sendToCli() {
+    if (cliBusy || selected.size === 0) return;
+    cliBusy = true;
+    try {
+      const dir = await open({ directory: true, title: "Where to create the glossary-cli folder" });
+      if (!dir || typeof dir !== "string") { cliBusy = false; return; }
+      const entries = candidates
+        .filter((c) => selected.has(c.term))
+        .map((c) => ({ term: c.term, examples: c.examples, suggestion: suggestions.get(c.term) ?? "" }));
+      const folder = await exportGlossaryCli(dir, entries, true);
+      cliFolder = folder;
+      store.statusMessage = `Launched Claude CLI for ${entries.length} term(s) — auto-importing when it writes glossary-out.json`;
+      // Watch for the results file.
+      stopWatch();
+      cliWatching = true;
+      pollId = setInterval(async () => {
+        if (!cliFolder) return;
+        try {
+          const res = await readGlossaryCliResults(cliFolder);
+          if (res && res.length > 0) {
+            stopWatch();
+            applyResultsToast(res);
+          }
+        } catch { /* keep polling */ }
+      }, 3000);
+    } catch (err) {
+      toastError(`Couldn't start Claude CLI: ${err}`);
+    } finally {
+      cliBusy = false;
+    }
+  }
+
+  /** Manual fallback: pick a glossary-cli folder and import its results. */
+  async function importCliFallback() {
+    try {
+      const dir = await open({ directory: true, title: "Pick the glossary-cli folder (with glossary-out.json)", defaultPath: cliFolder ?? undefined });
+      if (!dir || typeof dir !== "string") return;
+      const res = await readGlossaryCliResults(dir);
+      if (!res || res.length === 0) {
+        store.statusMessage = "No valid glossary-out.json found in that folder.";
+        return;
+      }
+      applyResultsToast(res);
+    } catch (err) {
+      toastError(`Import failed: ${err}`);
+    }
+  }
+
+  onDestroy(stopWatch);
+
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") onClose();
   }
@@ -313,6 +432,7 @@
     />
     <span class="count">{scanning ? "scanning…" : `${filtered.length} / ${candidates.length}`}</span>
     {#if filtered.length > 0}
+      <button class="add-all" onclick={toggleSelectAllShown}>{allShownSelected ? "Deselect all" : "Select all"}</button>
       <button class="add-all" onclick={addAllVisible}>Add all visible ({filtered.length})</button>
     {/if}
   </div>
@@ -342,6 +462,13 @@
       {#each filtered as c (c.term)}
         {@const isOpen = expandedTerm === c.term}
         <div class="row" class:open={isOpen}>
+          <input
+            type="checkbox"
+            class="sel-cb"
+            checked={selected.has(c.term)}
+            onclick={(e) => { e.stopPropagation(); toggleSelect(c.term); }}
+            title="Select for the Claude CLI batch"
+          />
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <button class="term" type="button" onclick={() => toggleExpand(c.term)} title="Show context + suggested translation">
@@ -399,10 +526,22 @@
   </div>
 
   <footer>
-    <p class="hint">
-      Added entries land in the {activeView === "global" ? "global" : "project"} glossary.
-      Click a term for context + a suggested translation.
-    </p>
+    <div class="cli-row">
+      <button
+        class="btn cli"
+        disabled={cliBusy || selected.size === 0}
+        onclick={sendToCli}
+        title="Send the checked terms to a Claude CLI session — your subscription, no API billing. It can translate or discuss, then the editor auto-imports the results."
+      >
+        Translate {selected.size} via Claude CLI
+      </button>
+      {#if cliWatching}
+        <span class="watching" title="Watching the glossary-cli folder for glossary-out.json">● watching for results…</span>
+      {/if}
+      <button class="btn ghost" onclick={importCliFallback} title="Manually import a glossary-cli folder's results (if the CLI was closed before auto-import)">
+        Import CLI results
+      </button>
+    </div>
     <button class="btn" onclick={onClose}>Done</button>
   </footer>
 </div>
@@ -658,11 +797,37 @@
     align-items: center;
     gap: 12px;
   }
-  .hint {
+  .cli-row {
     flex: 1;
-    margin: 0;
-    color: #777799;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .watching {
+    color: #6fd886;
     font-size: 0.75rem;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: 0.45; } }
+  .btn.cli {
+    background: #3a2a6e;
+    border-color: #5a4a9e;
+  }
+  .btn.cli:hover:not(:disabled) { background: #4a3a8e; }
+  .btn.cli:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.ghost {
+    background: transparent;
+    border-color: #3a3a5a;
+    color: #b0b0d0;
+    font-size: 0.78rem;
+    padding: 5px 12px;
+  }
+  .btn.ghost:hover { background: #20203a; }
+  .sel-cb {
+    flex-shrink: 0;
+    margin: 0 2px 0 0;
+    cursor: pointer;
+    accent-color: #8a7ad0;
   }
   .btn {
     padding: 6px 16px;

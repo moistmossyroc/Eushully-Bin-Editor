@@ -140,7 +140,21 @@
       `This cannot be undone in bulk — only the editor's per-cell history applies.`,
     );
     if (!confirmed) return;
+    applyReplace(results.filter((r) => selectedIds.has(rowKey(r))));
+  }
 
+  /** One-click replace across EVERY match (all tabs), no per-result selection. */
+  function performReplaceAll() {
+    if (!query.trim() || results.length === 0) return;
+    const confirmed = confirm(
+      `Replace "${query}" with "${replaceWith}" in ALL ${results.length} match(es) across ${grouped.length} tab(s)?\n\n` +
+      `This cannot be undone in bulk — only the editor's per-cell history applies.`,
+    );
+    if (!confirmed) return;
+    applyReplace(results);
+  }
+
+  function applyReplace(targets: Result[]) {
     const q = query;
     const cs = caseSensitive;
     const repl = replaceWith;
@@ -148,12 +162,15 @@
 
     // Group changes by tab so we mutate each tab's entries array once.
     const byTab = new Map<number, Result[]>();
-    for (const r of results) {
-      if (!selectedIds.has(rowKey(r))) continue;
+    for (const r of targets) {
       let arr = byTab.get(r.tabIndex);
       if (!arr) { arr = []; byTab.set(r.tabIndex, arr); }
       arr.push(r);
     }
+
+    // Snapshot affected tabs first so the bulk replace can be undone in one click.
+    const affected = [...byTab.keys()].map((ti) => store.tabs[ti]).filter(Boolean);
+    store.captureBulkUndo(`Replace "${q}"`, affected);
 
     for (const [tabIndex, items] of byTab) {
       const tab = store.tabs[tabIndex];
@@ -284,6 +301,13 @@
             onclick={performReplace}
           >
             Replace selected ({selectedCount})
+          </button>
+          <button
+            class="replace-btn"
+            onclick={performReplaceAll}
+            title="Replace every match across all shown tabs in one step"
+          >
+            Replace all ({results.length})
           </button>
         </div>
       {/if}

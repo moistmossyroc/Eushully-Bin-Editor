@@ -34,6 +34,8 @@ export interface ParenteGameFile {
   size: number;
   /** Number of translatable (Japanese-containing) strings in the scene. */
   string_count: number;
+  /** Heuristic flag: scene contains adult content (explicit-vocab scan). */
+  adult: boolean;
 }
 
 /** Editor rows + per-row speakers for one loaded Parente scene. */
@@ -153,7 +155,14 @@ export function saveProject(
   });
 }
 
-/** Export a modified BIN file with applied translations. */
+/**
+ * Export a modified BIN file with applied translations.
+ *
+ * IMPORTANT: `entries` MUST be the FULL entries array including negative-index
+ * (synthetic) continuation rows. resolveInsertionsForExport derives insertion
+ * order (_visualOrder) and continuation text from those rows; passing only
+ * positive-index entries silently reverses inserted chains on export.
+ */
 export function exportBin(
   tabId: string,
   outputPath: string,
@@ -429,6 +438,31 @@ export function getBridgeTemplateStatus(tabId: string): Promise<string> {
  *  group splits that need to cross a textbox boundary. */
 export function getBridgeClone(tabId: string): Promise<import("./types").SerializedInstruction[]> {
   return invoke<import("./types").SerializedInstruction[]>("get_bridge_clone", { tabId });
+}
+
+/** Fetch the speaker/character-setup opcodes for the box at `entryIndex` (an
+ *  original instruction index). Cloned into a paginated continuation box to
+ *  re-assert the speaker name plate + color (no play-voice, so no audio). */
+export function getSpeakerSetup(tabId: string, entryIndex: number): Promise<import("./types").SerializedInstruction[]> {
+  return invoke<import("./types").SerializedInstruction[]>("get_speaker_setup", { tabId, entryIndex });
+}
+
+/** A term to send to the Claude CLI for glossary translation. */
+export interface GlossaryCliEntry { term: string; examples: string[]; suggestion: string }
+/** A translated term read back from the CLI's glossary-out.json. */
+export interface GlossaryCliResult { term: string; translation: string; notes: string }
+
+/** Export selected glossary terms to a self-contained `glossary-cli/` folder
+ *  (glossary.json + PROMPT.md + interactive `claude` launcher) and optionally
+ *  launch it. Returns the created folder path. */
+export function exportGlossaryCli(outDir: string, entries: GlossaryCliEntry[], launch: boolean): Promise<string> {
+  return invoke<string>("export_glossary_cli", { outDir, entries, launch });
+}
+
+/** Poll the CLI's glossary-out.json in `folder`. Returns null while missing /
+ *  not-yet-valid (half-written), or the parsed results when ready. */
+export function readGlossaryCliResults(folder: string): Promise<GlossaryCliResult[] | null> {
+  return invoke<GlossaryCliResult[] | null>("read_glossary_cli_results", { folder });
 }
 
 /** Scan a set of BIN files for `set-string [pointer] = "name"` writes matching

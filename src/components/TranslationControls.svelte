@@ -590,6 +590,16 @@
         </button>
       {/if}
 
+      {#if store.mergedGlossary.some((g) => g.english.trim())}
+        <button
+          class="ctrl-btn"
+          onclick={() => (store.glossaryConsistencyOpen = true)}
+          title="Flag translated rows where a glossary term's Japanese appears but its English rendering is missing (drift check)"
+        >
+          Glossary check
+        </button>
+      {/if}
+
       {#if emptyStats.eligible > 0}
         <button
           class="ctrl-btn empty-cells"

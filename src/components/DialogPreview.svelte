@@ -295,11 +295,20 @@
         <div class="speaker-nameplate">{blockData.speaker}</div>
       {/if}
       <div class="dialog-text-area">
-        {#each blockData.lines as line}
+        {#each blockData.lines as line, li}
+          {#if store.maxLinesPerBox > 0 && li === store.maxLinesPerBox && blockData.lines.length > store.maxLinesPerBox}
+            <div
+              class="box-full-divider"
+              title="In-game text boxes show {store.maxLinesPerBox} lines. Lines below this fall off-screen until you paginate (Overflow Review \u2192 Paginate)."
+            >
+              \u25BD box full \u2014 {store.maxLinesPerBox}-line limit; lines below overflow off-screen
+            </div>
+          {/if}
           <div
             class="dialog-line"
             class:active={line.isSelected}
             class:over-line-cap={store.translatedLineCharCap > 0 && line.plainLength > store.translatedLineCharCap}
+            class:overflow-line={store.maxLinesPerBox > 0 && li >= store.maxLinesPerBox}
           >
             {@html line.html || "\u00A0"}
           </div>
@@ -584,6 +593,21 @@
 
   .dialog-line.over-line-cap {
     color: #e0a030;
+  }
+
+  /* Lines past the per-box line limit: render off-screen in-game until paginated. */
+  .dialog-line.overflow-line {
+    opacity: 0.5;
+    color: #d07a7a;
+  }
+  .box-full-divider {
+    margin: 4px 0;
+    border-top: 1px dashed #6a4a4a;
+    padding-top: 3px;
+    font-size: 0.68rem;
+    color: #d07a7a;
+    letter-spacing: 0.3px;
+    user-select: none;
   }
 
   .dialog-line :global(ruby) {

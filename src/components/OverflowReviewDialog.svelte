@@ -2,7 +2,7 @@
   import { store } from "../lib/stores.svelte";
   import { findOverflows, findBoxOverflows, entryDisplayLength, type OverflowRow, type BoxOverflow } from "../lib/overflow";
   import { autoSplitEntry, optimizeEntry } from "../lib/ipc";
-  import { applySplitPlan, splitOverflowingGroup } from "../lib/insertions";
+  import { applySplitPlan, splitOverflowingGroup, paginateBox } from "../lib/insertions";
 
   interface Props {
     onClose: () => void;
@@ -29,21 +29,43 @@
   let working = $state(false);
   let progress = $state<{ current: number; total: number; action: string } | null>(null);
 
-  let templateQuality = $derived(store.activeTab?.bridgeTemplateQuality);
-  // Line-splitting (wrapping within one box) needs no bridge — only a per-line
-  // cap. A bridge is required only to spill into an EXTRA box.
+  // Line-splitting (wrapping within one box) needs only a per-line cap.
   let canAutoSplit = $derived(store.translatedLineCharCap > 0);
-  let canAddBoxes = $derived(
-    templateQuality === "clean" || templateQuality === "degraded",
-  );
+  // Pagination (adding boxes) clones the BIN's box-transition bridge — which
+  // carries the engine "advance box" call — so it needs a usable bridge.
+  let templateQuality = $derived(store.activeTab?.bridgeTemplateQuality);
+  let canAddBoxes = $derived(templateQuality === "clean" || templateQuality === "degraded");
 
-  /** Handle the per-row "Split" button.
+  /** Total splittable overflowing rows across ALL open tabs (for the global
+   *  split action — so the user doesn't have to visit each tab after a CC import). */
+  let globalOverflowCount = $derived.by<number>(() => {
+    if (store.translatedLineCharCap <= 0) return 0;
+    let n = 0;
+    for (const tab of store.tabs) {
+      n += findOverflows(tab.entries, store.translatedLineCharCap)
+        .filter((r) => !r.isContinuation && r.splittable).length;
+    }
+    return n;
+  });
+
+  /** Total over-long boxes (more than maxLinesPerBox display lines) across ALL
+   *  open tabs — for the global paginate action. */
+  let globalBoxOverflowCount = $derived.by<number>(() => {
+    let n = 0;
+    for (const tab of store.tabs) {
+      n += findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox)
+        .filter((b) => b.tooManyLines).length;
+    }
+    return n;
+  });
+
+  /** Handle the per-row "Split lines" button. LINE-ONLY — wraps the overflow
+   *  into multiple display lines (end-text-line breaks); never opens a new box.
    *
    *  Two cases:
-   *  - If the row's own text exceeds the cap → call Rust auto-split to wrap
-   *    the text into multiple lines/boxes.
-   *  - Else, if the row is part of an over-cap group → insert end-text-line
-   *    opcodes inside the group to break it into multiple display lines.
+   *  - Row's own text exceeds the cap → Rust auto-split wraps it into lines.
+   *  - Row is part of an over-cap group → insert end-text-line opcodes to
+   *    break the group into multiple display lines.
    */
   async function handleAutoSplitRow(row: OverflowRow) {
     const tab = store.activeTab;
@@ -51,7 +73,7 @@
     working = true;
     try {
       if (row.individualLength > store.translatedLineCharCap) {
-        // Single-entry text overflow → use Rust auto-split (wrap text).
+        // Single-entry text overflow → Rust wrap into lines (single box).
         const plan = await autoSplitEntry(
           tab.id,
           row.entry.translated_text,
@@ -65,13 +87,8 @@
           store.statusMessage = result;
         }
       } else if (row.partOfGroup) {
-        // Group overflow → insert end-text-line between entries, bridge to
-        // a new box if needed to respect max-lines-per-box.
-        const result = await splitOverflowingGroup(
-          row.entry,
-          store.translatedLineCharCap,
-          store.maxLinesPerBox,
-        );
+        // Group overflow → insert end-text-line between entries (line-only).
+        const result = splitOverflowingGroup(row.entry, store.translatedLineCharCap);
         if (typeof result === "string") {
           store.statusMessage = result;
         }
@@ -82,6 +99,84 @@
       store.statusMessage = `Split failed for #${row.id}: ${err}`;
     }
     working = false;
+  }
+
+  /** Paginate a single over-long box — clone the box-transition bridge every
+   *  maxLinesPerBox lines so it splits into multiple boxes. */
+  async function handlePaginateBox(box: BoxOverflow) {
+    const tab = store.activeTab;
+    if (!tab || working) return;
+    const startEntry = tab.entries[box.index];
+    if (!startEntry) return;
+    working = true;
+    const result = await paginateBox(startEntry, store.maxLinesPerBox);
+    if (typeof result === "string") store.statusMessage = result;
+    tab.entries = [...tab.entries]; // nudge reactivity after in-place inserts
+    tab.isDirty = true;
+    working = false;
+  }
+
+  /** Paginate every over-long box in one pass. Works back-to-front so earlier
+   *  box indices stay valid as inserts happen. */
+  async function handlePaginateAll() {
+    const tab = store.activeTab;
+    if (!tab || working) return;
+    const tooLong = boxOverflows.filter((b) => b.tooManyLines);
+    if (tooLong.length === 0) {
+      store.statusMessage = "No boxes exceed the line limit.";
+      return;
+    }
+    store.captureBulkUndo("Paginate boxes", [tab]);
+    working = true;
+    let done = 0;
+    for (const box of [...tooLong].sort((a, b) => b.index - a.index)) {
+      const startEntry = tab.entries[box.index];
+      if (!startEntry) continue;
+      const result = await paginateBox(startEntry, store.maxLinesPerBox);
+      if (typeof result === "number" && result > 0) done++;
+    }
+    tab.entries = [...tab.entries];
+    tab.isDirty = true;
+    working = false;
+    store.statusMessage = `Paginated ${done} box(es) into multiple boxes`;
+  }
+
+  /** Global paginate: split over-long boxes into multiple boxes across EVERY
+   *  open tab (the companion to global line-split, post-import). */
+  async function handlePaginateAllTabs() {
+    if (working) return;
+    store.captureBulkUndo("Paginate — all tabs", [...store.tabs]);
+    working = true;
+    progress = { current: 0, total: store.tabs.length, action: "Paginating all tabs" };
+    const { bulkPaginateAllTabs } = await import("../lib/actions");
+    const r = await bulkPaginateAllTabs((current, total, name) => {
+      progress = { current, total, action: `Paginating ${name}` };
+    });
+    working = false;
+    progress = null;
+    if (store.activeTab) store.activeTab.entries = [...store.activeTab.entries]; // nudge
+    const parts = [`${r.paginated} box(es) across ${r.tabsProcessed} tab(s)`];
+    if (r.errors.length > 0) parts.push(`${r.errors.length} issue(s)`);
+    store.statusMessage = `Paginate all tabs — ${parts.join(", ")}`;
+  }
+
+  /** Global split: run the line-split across EVERY open tab in one go (the
+   *  post-CC-import workflow — no need to visit each tab). */
+  async function handleAutoSplitAllTabs() {
+    if (working) return;
+    store.captureBulkUndo("Split lines — all tabs", [...store.tabs]);
+    working = true;
+    progress = { current: 0, total: store.tabs.length, action: "Splitting all tabs" };
+    const { bulkAutoSplitAllTabs } = await import("../lib/actions");
+    const r = await bulkAutoSplitAllTabs((current, total, name) => {
+      progress = { current, total, action: `Splitting ${name}` };
+    });
+    working = false;
+    progress = null;
+    if (store.activeTab) store.activeTab.entries = [...store.activeTab.entries]; // nudge
+    const parts = [`${r.split} fixed across ${r.tabsProcessed} tab(s)`];
+    if (r.failed > 0) parts.push(`${r.failed} failed`);
+    store.statusMessage = `Split all tabs — ${parts.join(", ")}`;
   }
 
   /** Bulk split: sequential pass through every splittable overflowing row.
@@ -96,6 +191,7 @@
       store.statusMessage = "Nothing to auto-split.";
       return;
     }
+    store.captureBulkUndo("Split lines", [tab]);
 
     working = true;
     progress = { current: 0, total: candidateCount, action: "Splitting" };
@@ -259,15 +355,53 @@
       <button class="close-btn" onclick={onClose}>×</button>
     </header>
 
+    {#if store.tabs.length > 1 && (globalOverflowCount > 0 || globalBoxOverflowCount > 0)}
+      <div class="global-bar">
+        <span>
+          Across all {store.tabs.length} tabs:
+          {#if globalOverflowCount > 0}<strong>{globalOverflowCount}</strong> over line cap{/if}{#if globalOverflowCount > 0 && globalBoxOverflowCount > 0}, {/if}{#if globalBoxOverflowCount > 0}<strong>{globalBoxOverflowCount}</strong> box{globalBoxOverflowCount === 1 ? "" : "es"} over limit{/if}
+        </span>
+        <div class="global-btns">
+          {#if globalOverflowCount > 0}
+            <button
+              class="btn split"
+              onclick={handleAutoSplitAllTabs}
+              disabled={working || !canAutoSplit}
+              title={!canAutoSplit ? "Set a per-line character cap first" : "Run the line-split across every open tab (post-import workflow)"}
+            >
+              Split lines — all tabs
+            </button>
+          {/if}
+          {#if globalBoxOverflowCount > 0}
+            <button
+              class="btn split"
+              onclick={handlePaginateAllTabs}
+              disabled={working}
+              title="Paginate over-long boxes into multiple boxes across every open tab (needs a box-transition bridge per BIN)"
+            >
+              Paginate — all tabs
+            </button>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
     {#if boxOverflows.length > 0}
       <div class="box-section">
         <div class="box-section-head">
           ⚠ <strong>{boxOverflows.length}</strong> text box{boxOverflows.length === 1 ? "" : "es"}
-          exceed the per-box limits — these won't render fully in-game. Jump in and shorten or merge a line.
+          exceed the per-box limits — extra lines render off-screen in-game.
+          {#if boxOverflows.some((b) => b.tooManyLines) && canAddBoxes}
+            <button class="paginate-all" onclick={handlePaginateAll} disabled={working} title="Split every over-long box into multiple boxes (clones the box-transition bridge; adds a click per box)">
+              Paginate all
+            </button>
+          {:else if boxOverflows.some((b) => b.tooManyLines) && !canAddBoxes}
+            <span class="no-bridge">No box-transition bridge in this BIN — can't add boxes; shorten the line instead.</span>
+          {/if}
         </div>
         <div class="box-list">
           {#each boxOverflows as box (box.id)}
-            <button class="box-row" onclick={() => jumpToBox(box)} title={`Go to this box (starts at row #${box.id})`}>
+            <div class="box-row">
               <span class="box-badges">
                 {#if box.tooManyLines}
                   <span class="box-badge bad">{box.lines} lines &gt; {box.maxLines} max</span>
@@ -276,8 +410,11 @@
                   <span class="box-badge bad">{box.totalChars}/{box.totalCap} chars</span>
                 {/if}
               </span>
-              <span class="box-preview">{truncate(box.preview, 90)}</span>
-            </button>
+              <button class="box-preview-btn" onclick={() => jumpToBox(box)} title={`Go to this box (starts at row #${box.id})`}>{truncate(box.preview, 78)}</button>
+              {#if box.tooManyLines && canAddBoxes}
+                <button class="row-btn" onclick={() => handlePaginateBox(box)} disabled={working} title="Split this box into multiple boxes every {store.maxLinesPerBox} lines (clones the box-transition bridge)">Paginate</button>
+              {/if}
+            </div>
           {/each}
         </div>
       </div>
@@ -294,14 +431,12 @@
     {:else}
       <div class="summary">
         <strong>{overflows.length}</strong> row{overflows.length === 1 ? "" : "s"} exceed the {store.translatedLineCharCap}-char line cap.
-        {#if !canAddBoxes}
-          <div class="warning">⚠ No textbox bridge in this BIN — long lines still wrap within one box, but any text exceeding one box ({store.maxLinesPerBox} lines) can't spill into a new box and must be shortened.</div>
-        {/if}
+        <div class="warning">Tip: "Split lines" wraps within one box ({store.maxLinesPerBox} lines); content beyond that needs "Paginate" (in the box section above, adds a click per box) — the engine won't paginate line breaks on its own.</div>
       </div>
 
       <div class="bulk-actions">
-        <button class="btn split" onclick={handleAutoSplitAll} disabled={working || !canAutoSplit} title={!canAutoSplit ? "Set a per-line character cap first" : "Free, local — wraps lines and (where supported) splits into multiple boxes"}>
-          Auto-split all (free)
+        <button class="btn split" onclick={handleAutoSplitAll} disabled={working || !canAutoSplit} title={!canAutoSplit ? "Set a per-line character cap first" : "Free, local — wraps overflowing rows into line breaks only (use per-row 'New box' to add a text box)"}>
+          Split lines (all, free)
         </button>
         <button class="btn optimize" onclick={handleOptimizeAll} disabled={working || !store.apiKeyConfigured} title={!store.apiKeyConfigured ? "API key not configured" : "Sequential calls, billed to your API key"}>
           Optimize all (Claude API)
@@ -351,14 +486,12 @@
                     disabled={working || row.isContinuation || !row.splittable || !canAutoSplit}
                     title={
                       row.isContinuation ? "Already a continuation row" :
-                      !row.splittable ? "Cannot auto-split this row" :
+                      !row.splittable ? "Cannot split this row" :
                       !canAutoSplit ? "Set a per-line character cap first" :
-                      row.individualLength > row.cap ? "Wrap or split text into multiple lines/boxes" :
-                      row.partOfGroup ? "Insert end-text-line to break the group into multiple display lines" :
-                      "Split"
+                      "Wrap the overflow into multiple display lines (line breaks only — no new box)"
                     }
                   >
-                    Split
+                    Split lines
                   </button>
                   <button class="row-btn" onclick={() => handleOptimizeRow(row)} disabled={working || !store.apiKeyConfigured}>
                     Optimize
@@ -453,17 +586,10 @@
   }
   .box-row {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 10px;
     width: 100%;
-    text-align: left;
-    background: transparent;
-    border: none;
-    border-radius: 3px;
-    color: #d0d0e0;
-    font: inherit;
-    padding: 5px 8px;
-    cursor: pointer;
+    padding: 4px 8px;
   }
   .box-row:hover { background: #3a2424; }
   .box-badges { flex-shrink: 0; display: flex; gap: 4px; }
@@ -476,14 +602,35 @@
     white-space: nowrap;
   }
   .box-badge.bad { background: #5a2a2a; color: #f0a070; }
-  .box-preview {
+  .box-preview-btn {
+    flex: 1;
+    min-width: 0;
+    text-align: left;
+    background: none;
+    border: none;
+    padding: 0;
     color: #b0b0c8;
+    font: inherit;
     font-size: 0.78rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+    cursor: pointer;
   }
+  .box-preview-btn:hover { color: #8ab4f8; text-decoration: underline; }
+  .paginate-all {
+    margin-left: 8px;
+    padding: 3px 10px;
+    border: 1px solid #6c9bd2;
+    border-radius: 3px;
+    background: #1a1a3e;
+    color: #8ab4f8;
+    cursor: pointer;
+    font-size: 0.75rem;
+  }
+  .paginate-all:hover:not(:disabled) { background: #2a2a5e; }
+  .paginate-all:disabled { opacity: 0.4; cursor: not-allowed; }
+  .no-bridge { margin-left: 8px; color: #f0a070; font-size: 0.78rem; }
 
   .summary {
     padding: 12px 20px;
@@ -501,6 +648,20 @@
     color: #f0a070;
     font-size: 0.8rem;
   }
+
+  .global-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 20px;
+    background: #16213e;
+    border-bottom: 1px solid #2a2a4a;
+    font-size: 0.85rem;
+    color: #c0c0e0;
+  }
+  .global-bar strong { color: #f0a070; }
+  .global-btns { display: flex; gap: 8px; flex-shrink: 0; }
 
   .bulk-actions {
     padding: 10px 20px;

@@ -799,10 +799,20 @@ export async function doLoadParenteEntries(files: ParenteGameFile[]): Promise<vo
       tab.binPath = null;
       tab.projectPath = null; // no project persistence for parente tabs (yet)
       const speakers: Record<string, { source_type: number; source_raw_data: number; literal_name: string | null }> = {};
+      const cast: { pointer: number; name: string }[] = [];
+      const seenNames = new Set<string>();
       for (const [ordinal, name] of load.speakers) {
         speakers[String(ordinal)] = { source_type: 0, source_raw_data: 0, literal_name: name };
+        // Build a per-scene cast list for the Characters panel. Parente has no
+        // numeric character IDs — speakers come from `-- Name --` comments — so
+        // we list the distinct speaker names (pointer is just a display index).
+        if (name && !seenNames.has(name)) {
+          seenNames.add(name);
+          cast.push({ pointer: cast.length + 1, name });
+        }
       }
       tab.rowSpeakers = speakers;
+      tab.characters = cast;
       // Restore any previously-saved translations for this scene, then mark
       // clean (loading + restoring isn't an unsaved edit).
       await applyParenteProject(tab);
@@ -856,12 +866,24 @@ export async function doExportParenteTab(_tab: TabState): Promise<boolean> {
     return false;
   }
 
-  const patchDir = primaryArc.slice(0, primaryArc.lastIndexOf("/"));
+  // Default the save dialog to a WRITABLE location, not the game's
+  // admin-protected Archives folder. Prefer the last folder the user exported
+  // to; otherwise just a bare filename (dialog opens in its writable default).
+  const defaultPath = store.lastParenteExportDir
+    ? `${store.lastParenteExportDir}/ver999.arc`
+    : "ver999.arc";
   const outputPath = await save({
     filters: [{ name: "Eushully Archive", extensions: ["arc"] }],
-    defaultPath: `${patchDir}/ver999.arc`,
+    defaultPath,
   });
   if (!outputPath) return false;
+
+  // Remember the chosen folder for next time.
+  const outDir = outputPath.replace(/\\/g, "/").replace(/\/[^/]*$/, "");
+  if (outDir) {
+    store.lastParenteExportDir = outDir;
+    void import("./settings").then((m) => m.persistAllSettingsDebounced());
+  }
 
   try {
     store.statusMessage = `Building English patch from ${primaryArc.split("/").pop()}…`;
@@ -1066,8 +1088,10 @@ export async function doExportAllBins(): Promise<number> {
     try {
       const outPath = `${outputDir}/${tab.sourceBinFilename.replace(/\.BIN$/i, "_translated.BIN")}`;
       store.statusMessage = `Exporting ${tab.sourceBinFilename}...`;
-      const originalEntries = tab.entries.filter((e) => e.instruction_index >= 0);
-      await exportBin(tab.id, outPath, originalEntries, tab.insertedInstructions);
+      // Pass FULL entries (incl. negative-index continuation rows): exportBin's
+      // resolveInsertionsForExport needs them for insertion ordering (_visualOrder)
+      // and continuation-row text sync. Rust's apply_changes skips negatives.
+      await exportBin(tab.id, outPath, tab.entries, tab.insertedInstructions);
       exportedCount++;
     } catch (err) {
       store.statusMessage = `Error exporting ${tab.sourceBinFilename}: ${err}`;
@@ -1150,8 +1174,9 @@ export async function doExportBin(): Promise<boolean> {
           if (!outputPath) { resolve(false); return; }
 
           store.statusMessage = "Exporting BIN...";
-          const originalEntries = tab.entries.filter((e) => e.instruction_index >= 0);
-          await exportBin(tab.id, outputPath, originalEntries, tab.insertedInstructions);
+          // Full entries (incl. negative continuation rows) — see exportBin note;
+          // resolveInsertionsForExport needs them for ordering + text sync.
+          await exportBin(tab.id, outputPath, tab.entries, tab.insertedInstructions);
           store.statusMessage = `Exported to ${outputPath.replace(/\\/g, "/").split("/").pop()}`;
           resolve(true);
         } catch (err) {
@@ -1487,11 +1512,7 @@ export async function bulkAutoSplitActiveTab(
         // Group overflow — process once per group (splitOverflowingGroup is
         // idempotent: returns "not over the line cap" when already handled).
         if (groupsHandled.has(row.id)) continue;
-        const result = await splitOverflowingGroup(
-          current,
-          store.translatedLineCharCap,
-          store.maxLinesPerBox,
-        );
+        const result = splitOverflowingGroup(current, store.translatedLineCharCap);
         if (typeof result === "string") {
           if (!result.includes("not over the line cap")) {
             out.failed++;
@@ -1509,6 +1530,77 @@ export async function bulkAutoSplitActiveTab(
   }
   if (out.split > 0) tab.isDirty = true;
   return out;
+}
+
+/**
+ * Run the line-split across EVERY open tab (the global version of
+ * `bulkAutoSplitActiveTab`). Auto-split uses per-tab Rust state keyed by the
+ * active tab, so we transiently switch the active tab to each, then restore.
+ * Returns aggregated totals.
+ */
+export async function bulkAutoSplitAllTabs(
+  onProgress?: (current: number, total: number, tabName: string) => void,
+): Promise<{ split: number; failed: number; tabsProcessed: number; errors: string[] }> {
+  const agg = { split: 0, failed: 0, tabsProcessed: 0, errors: [] as string[] };
+  if (store.translatedLineCharCap <= 0) return agg;
+  const prevActiveIndex = store.activeTabIndex;
+  const tabs = [...store.tabs];
+  for (let i = 0; i < tabs.length; i++) {
+    const t = tabs[i];
+    const tabIndex = store.tabs.indexOf(t);
+    if (tabIndex < 0) continue;
+    store.activeTabIndex = tabIndex;
+    onProgress?.(i + 1, tabs.length, t.sourceBinFilename || `Tab ${i + 1}`);
+    const r = await bulkAutoSplitActiveTab();
+    t.entries = [...t.entries]; // nudge reactivity after in-place inserts
+    agg.split += r.split;
+    agg.failed += r.failed;
+    agg.tabsProcessed++;
+    for (const e of r.errors) if (agg.errors.length < 5) agg.errors.push(`${t.sourceBinFilename}: ${e}`);
+  }
+  store.activeTabIndex = prevActiveIndex;
+  return agg;
+}
+
+/**
+ * Paginate every over-long box across ALL open tabs (the global version of the
+ * Overflow dialog's per-tab "Paginate all"). For each tab, finds boxes that
+ * exceed `maxLinesPerBox` and splits them into multiple boxes. Like the split
+ * action, this switches the active tab transiently (paginateBox uses per-tab
+ * state) and restores it. Returns aggregated totals.
+ */
+export async function bulkPaginateAllTabs(
+  onProgress?: (current: number, total: number, tabName: string) => void,
+): Promise<{ paginated: number; tabsProcessed: number; errors: string[] }> {
+  const agg = { paginated: 0, tabsProcessed: 0, errors: [] as string[] };
+  if (store.maxLinesPerBox < 1) return agg;
+  const { findBoxOverflows } = await import("./overflow");
+  const { paginateBox } = await import("./insertions");
+  const prevActiveIndex = store.activeTabIndex;
+  const tabs = [...store.tabs];
+  for (let i = 0; i < tabs.length; i++) {
+    const t = tabs[i];
+    const tabIndex = store.tabs.indexOf(t);
+    if (tabIndex < 0) continue;
+    store.activeTabIndex = tabIndex; // paginateBox operates on the active tab
+    onProgress?.(i + 1, tabs.length, t.sourceBinFilename || `Tab ${i + 1}`);
+    const boxes = findBoxOverflows(t.entries, store.translatedCharCap, store.maxLinesPerBox)
+      .filter((b) => b.tooManyLines)
+      .sort((a, b) => b.index - a.index); // back-to-front so indices stay valid
+    for (const box of boxes) {
+      const startEntry = t.entries[box.index];
+      if (!startEntry) continue;
+      const r = await paginateBox(startEntry, store.maxLinesPerBox);
+      if (typeof r === "number" && r > 0) agg.paginated++;
+      else if (typeof r === "string" && !r.includes("already fits")) {
+        if (agg.errors.length < 5) agg.errors.push(`${t.sourceBinFilename}: ${r}`);
+      }
+    }
+    t.entries = [...t.entries]; // nudge reactivity after in-place inserts
+    agg.tabsProcessed++;
+  }
+  store.activeTabIndex = prevActiveIndex;
+  return agg;
 }
 
 export async function doImportTranslations(): Promise<boolean> {

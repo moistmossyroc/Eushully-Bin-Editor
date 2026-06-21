@@ -27,6 +27,7 @@ export async function persistAllSettings(): Promise<void> {
       contextBlocks: store.contextBlocks,
       autoSplitEnabled: store.autoSplitEnabled,
       autoSplitOnImport: store.autoSplitOnImport,
+      lastParenteExportDir: store.lastParenteExportDir,
       apiProvider: store.apiProvider,
       customEndpoint: store.customEndpoint,
       lastAnthropicModel: store.activeTab?.anthropicModel ?? store.lastAnthropicModel,

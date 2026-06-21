@@ -15,6 +15,7 @@
   import GlossaryReviewDialog from "./components/GlossaryReviewDialog.svelte";
   import ImportModeDialog from "./components/ImportModeDialog.svelte";
   import OverflowReviewDialog from "./components/OverflowReviewDialog.svelte";
+  import GlossaryConsistencyDialog from "./components/GlossaryConsistencyDialog.svelte";
   import OmittedCellsDialog from "./components/OmittedCellsDialog.svelte";
   import ParenteFilePickerDialog from "./components/ParenteFilePickerDialog.svelte";
   import TranslationStatusDialog from "./components/TranslationStatusDialog.svelte";
@@ -75,8 +76,15 @@
     // identity changes from quick close+open of the same path.
     const _ids = store.tabs.map((t) => t.id);
     void _ids;
+    // Snapshot the BIN path, not the project path. Every opened BIN gets an
+    // *intended* projectPath immediately, but the .json only exists on disk once
+    // the tab is edited/saved. Recording projectPath would make untouched tabs
+    // point at a nonexistent .json and silently drop on restore. Loading the
+    // .bin instead auto-restores its project when one exists (see doLoadBin), so
+    // both edited and untouched tabs come back. Parente tabs have neither path
+    // and are (still) not session-restorable.
     const paths = store.tabs
-      .map((t) => t.projectPath || t.binPath)
+      .map((t) => t.binPath || t.projectPath)
       .filter((p): p is string => !!p);
     // Avoid spurious writes when nothing actually changed.
     const cur = store.lastSessionPaths;
@@ -124,6 +132,7 @@
       if (typeof settings.contextBlocks === "number") store.contextBlocks = settings.contextBlocks;
       if (typeof settings.autoSplitEnabled === "boolean") store.autoSplitEnabled = settings.autoSplitEnabled;
       if (typeof settings.autoSplitOnImport === "boolean") store.autoSplitOnImport = settings.autoSplitOnImport;
+      if (typeof settings.lastParenteExportDir === "string") store.lastParenteExportDir = settings.lastParenteExportDir;
       // Provider config — persisted in settings.json so it survives app restarts
       // (Rust state is in-memory only). We still push it to Rust below so
       // translation commands see the right provider on this session.
@@ -449,6 +458,21 @@
     <OverflowReviewDialog onClose={() => (store.overflowReviewDialogOpen = false)} />
   {/if}
 
+  {#if store.glossaryConsistencyOpen && store.activeTab}
+    <GlossaryConsistencyDialog onClose={() => (store.glossaryConsistencyOpen = false)} />
+  {/if}
+
+  {#if store.bulkUndo}
+    <div class="bulk-undo-pill">
+      <span class="bu-label">{store.bulkUndo.label} applied</span>
+      <button
+        class="bu-undo"
+        onclick={() => { const l = store.restoreBulkUndo(); store.statusMessage = l ? `Undid: ${l}` : ""; }}
+      >Undo</button>
+      <button class="bu-dismiss" title="Dismiss" onclick={() => store.clearBulkUndo()}>×</button>
+    </div>
+  {/if}
+
   {#if store.omittedCellsDialogOpen && store.activeTab}
     <OmittedCellsDialog onClose={() => (store.omittedCellsDialogOpen = false)} />
   {/if}
@@ -543,6 +567,45 @@
 </main>
 
 <style>
+  /* Floating one-click undo for bulk operations (split/paginate/replace). */
+  .bulk-undo-pill {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 8px 14px;
+    background: #20203a;
+    border: 1px solid #4a4a7a;
+    border-radius: 999px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+    font-size: 0.82rem;
+    color: #d0d0e8;
+  }
+  .bulk-undo-pill .bu-undo {
+    padding: 4px 14px;
+    border: 1px solid #6c9bd2;
+    border-radius: 999px;
+    background: #2a3a6e;
+    color: #cfe0ff;
+    cursor: pointer;
+    font-size: 0.8rem;
+  }
+  .bulk-undo-pill .bu-undo:hover { background: #3a4a8e; }
+  .bulk-undo-pill .bu-dismiss {
+    background: none;
+    border: none;
+    color: #9a9ac0;
+    font-size: 1.1rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+  }
+  .bulk-undo-pill .bu-dismiss:hover { color: #fff; }
+
   /* Unified scrollbar styling across the entire app. Defined here once with
    * :global so every scrollable element matches the dark theme — replaces
    * the per-component duplicates that had drifted slightly out of sync. */

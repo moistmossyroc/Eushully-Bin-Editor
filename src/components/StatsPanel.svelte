@@ -32,10 +32,14 @@
   let perTab = $derived.by<PerTab[]>(() => {
     const lineCap = store.translatedLineCharCap;
     return store.tabs.map((tab, ti) => {
+      // Parente (Unity-era) rows aren't AGE opcodes — they carry block labels,
+      // not show-text/furigana/comment — so the EDITABLE label filter would
+      // skip them all. For those tabs every non-context row is translatable.
+      const isParente = tab.format === "parente";
       let total = 0, done = 0;
       for (const e of tab.entries) {
         if (e.deleted || e.is_context_row || e.omit_export) continue;
-        if (!EDITABLE.has(e.label)) continue;
+        if (!isParente && !EDITABLE.has(e.label)) continue;
         if (!hasTranslatableContent(e.original_text)) continue;
         total++;
         if (e.translated_text.trim().length > 0) done++;
@@ -91,6 +95,39 @@
   function tabClick(tabIndex: number) {
     store.switchTab(tabIndex);
   }
+
+  /** Whether a row counts as an untranslated translatable row (matches the
+   *  per-tab `translated/total` calc above). */
+  function isUntranslatedRow(tab: (typeof store.tabs)[number], e: (typeof tab.entries)[number]): boolean {
+    if (e.deleted || e.is_context_row || e.omit_export) return false;
+    if (tab.format !== "parente" && !EDITABLE.has(e.label)) return false;
+    if (!hasTranslatableContent(e.original_text)) return false;
+    return e.translated_text.trim().length === 0;
+  }
+
+  /** Jump to the next untranslated row across ALL tabs, cycling from the current
+   *  cursor. Makes tracking down the last stragglers a single repeated click. */
+  function jumpNextUntranslated() {
+    const cur = store.activeTabIndex;
+    const curRow = store.activeTab?.selectedRowIndex ?? -1;
+    let firstOverall: { ti: number; ri: number } | null = null;
+    let nextAfter: { ti: number; ri: number } | null = null;
+    outer: for (let ti = 0; ti < store.tabs.length; ti++) {
+      const tab = store.tabs[ti];
+      for (let ri = 0; ri < tab.entries.length; ri++) {
+        if (!isUntranslatedRow(tab, tab.entries[ri])) continue;
+        if (!firstOverall) firstOverall = { ti, ri };
+        if (ti > cur || (ti === cur && ri > curRow)) { nextAfter = { ti, ri }; break outer; }
+      }
+    }
+    const target = nextAfter ?? firstOverall;
+    if (!target) { store.statusMessage = "No untranslated rows remaining."; return; }
+    if (target.ti !== store.activeTabIndex) store.switchTab(target.ti);
+    const tab = store.tabs[target.ti];
+    tab.selectedRowIndex = target.ri;
+    store.pendingScrollRequest = { tabId: tab.id, rowIndex: target.ri, nonce: Date.now() };
+    store.statusMessage = `Untranslated row in ${tab.sourceBinFilename || "tab"}`;
+  }
 </script>
 
 {#if store.statsPanelOpen}
@@ -117,6 +154,16 @@
           <span class="big-label">{overall.translated.toLocaleString()} / {overall.total.toLocaleString()} translatable rows</span>
         </div>
         <div class="bar"><div class="bar-fill" style="width: {overall.pct}%"></div></div>
+
+        {#if overall.total - overall.translated > 0}
+          <button
+            class="find-untranslated"
+            onclick={jumpNextUntranslated}
+            title="Jump to the next untranslated row — cycles across all open tabs"
+          >
+            Find next untranslated <span class="count">({(overall.total - overall.translated).toLocaleString()} left)</span> →
+          </button>
+        {/if}
 
         <div class="mini-grid">
           <div class="mini">
@@ -169,6 +216,10 @@
             <div class="mini-bar"><div class="mini-bar-fill" style="width: {t.pct}%"></div></div>
             <div class="tab-row-meta">
               <span>{t.translated}/{t.total} rows</span>
+              {#if t.total - t.translated > 0}
+                <span class="dot-sep">·</span>
+                <span class="untrans">{t.total - t.translated} left</span>
+              {/if}
               {#if t.charactersTotal > 0}
                 <span class="dot-sep">·</span>
                 <span>{t.charactersResolved}/{t.charactersTotal} chars</span>
@@ -271,6 +322,23 @@
     background: linear-gradient(90deg, #6c9bd2, #8ab4f8);
     transition: width 0.3s;
   }
+
+  .find-untranslated {
+    display: block;
+    width: calc(100% - 28px);
+    margin: 0 14px 10px 14px;
+    padding: 6px 10px;
+    background: #2a2240;
+    border: 1px solid #5a4a7a;
+    border-radius: 4px;
+    color: #d0b8f0;
+    font-size: 0.78rem;
+    cursor: pointer;
+    text-align: center;
+  }
+  .find-untranslated:hover { background: #3a2f55; }
+  .find-untranslated .count { color: #a890c8; }
+  .untrans { color: #d07a7a; }
 
   .mini-grid {
     display: grid;

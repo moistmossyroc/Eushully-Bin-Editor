@@ -228,6 +228,31 @@ pub async fn export_bin(
     let output_data = write_bin(&parsed_bin.header, &modified_instructions)
         .map_err(|e| format!("Failed to write BIN: {}", e))?;
 
+    // Export guardrail: the produced bytes MUST re-parse to the same instruction
+    // count. A parse failure or a count mismatch means the stream is misaligned
+    // (corruption that would break the file in-game) — abort BEFORE touching disk
+    // so a bad export can never overwrite a good BIN or its backup. The identity
+    // round-trip test proves a valid export always matches, so this won't
+    // false-positive on legitimate writes.
+    match parse_bin(&output_data) {
+        Ok(reparsed) => {
+            if reparsed.instructions.len() != modified_instructions.len() {
+                return Err(format!(
+                    "Export aborted — internal corruption check failed: wrote {} instructions but read back {}. \
+                     No file written. Please report this (the BIN would not render correctly in-game).",
+                    modified_instructions.len(),
+                    reparsed.instructions.len()
+                ));
+            }
+        }
+        Err(e) => {
+            return Err(format!(
+                "Export aborted — the result does not re-parse ({e}). No file written. \
+                 This indicates a corruption bug; the original BIN is untouched."
+            ));
+        }
+    }
+
     // Pre-write backup: if the output path already exists (i.e. we're about
     // to overwrite a real BIN, not creating a new one), copy it to a sibling
     // `<name>.bak` first. Only one rolling backup is kept — enough to recover
@@ -1274,34 +1299,20 @@ pub async fn auto_split_entry(
     if line_char_cap == 0 {
         return Err("Per-line character cap must be set for auto-split".into());
     }
+    // block_char_cap / max_lines_per_box are no longer used here: auto-split is
+    // now LINE-ONLY. Adding text boxes is a separate, explicit user action
+    // (insertTextBoxBridge), so we never split into multiple boxes — we wrap the
+    // whole overflow into a single run of end-text-line-separated lines and let
+    // the engine paginate (Sankai auto-advances boxes; other engines keep one
+    // box and the user bridges manually where needed).
+    let _ = (block_char_cap, max_lines_per_box);
 
-    // Explicit max-lines-per-box always wins. Fallback to block_cap/line_cap
-    // ratio for backward compat with older frontend versions that don't pass it.
-    let lines_per_box = if max_lines_per_box > 0 {
-        max_lines_per_box
-    } else if block_char_cap > 0 && line_char_cap > 0 {
-        (block_char_cap / line_char_cap).max(1)
-    } else {
-        3
-    };
-
-    let wrap = crate::editor::wrap::wrap_english(&translated_text, line_char_cap, lines_per_box);
+    // u32::MAX lines-per-box → wrap_english never starts a new box → single box.
+    let wrap = crate::editor::wrap::wrap_english(&translated_text, line_char_cap, u32::MAX);
 
     // Empty wrap (no text at all) — nothing to do.
     if wrap.boxes.is_empty() {
         return Err("No text to split".into());
-    }
-
-    // A bridge is only needed to open ADDITIONAL text boxes. A single-box wrap
-    // just inserts line breaks (end-text-line) and needs no bridge — so only
-    // require a usable bridge when the wrap spilled into more than one box.
-    // This lets bridge-less BINs still wrap long lines within their one box.
-    if wrap.boxes.len() > 1
-        && matches!(template.quality, crate::editor::bridge::TemplateQuality::Unavailable)
-    {
-        return Err(
-            "This translation needs an extra text box, but this BIN has no usable bridge template. Shorten it to fit one box.".into(),
-        );
     }
 
     // If wrap produced exactly one box with one line AND that line matches
@@ -2388,6 +2399,237 @@ pub async fn get_bridge_clone(
     // when speaker_arg_positions is empty (which it currently is in v1).
     let cloned = crate::editor::bridge::clone_bridge(template, 0, None);
     Ok(cloned.iter().map(crate::editor::bridge::SerializedInstruction::from).collect())
+}
+
+/// Extract the speaker / character-setup block from the transition that
+/// precedes the box containing `entry_index`. In Sankai/AGE the name plate +
+/// color are established per-box by the voice/character block (0x2F7 …
+/// lookup-array … 0x2FF … play-voice 0xC4). Cloning that whole block into a
+/// continuation box re-asserts the speaker so a paginated box keeps the right
+/// name/color. (The block's non-conditional path sets the voice key to 0, so the
+/// replayed voice is typically silent.)
+///
+/// `entry_index` must be an ORIGINAL (parse-time) instruction index — the first
+/// show-text of the box being split. Returns the setup opcodes in order, or an
+/// empty Vec if none are found (caller falls back to narrator).
+#[tauri::command]
+pub async fn get_speaker_setup(
+    tab_id: String,
+    entry_index: usize,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::editor::bridge::SerializedInstruction>, String> {
+    let tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+    let parsed = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
+    let ins = &parsed.instructions;
+    if entry_index >= ins.len() {
+        return Ok(Vec::new());
+    }
+    // The box opens at the nearest new-textbox-open (0x1F5) before the entry.
+    let box_open = match (0..entry_index).rev().find(|&i| ins[i].opcode == 0x1F5) {
+        Some(b) => b,
+        None => return Ok(Vec::new()),
+    };
+    // The transition begins after the previous box's wait-for-input (0x72).
+    let start = (0..box_open)
+        .rev()
+        .find(|&i| ins[i].opcode == 0x72)
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    // The character block establishes name plate + color + portrait. It STARTS
+    // at 0x1CF (display character/face) or the first 0x2F7 — whichever comes
+    // first — and runs to the box-open. Collect it as a CONTIGUOUS run, dropping
+    // control-flow (jcc/jmp/call/ret/call-script — wrong absolute targets when
+    // cloned) AND play-voice (0xC4), which crashes when cloned and is the audio
+    // we don't want to replay anyway.
+    let blk_start = match (start..box_open).find(|&i| ins[i].opcode == 0x1CF || ins[i].opcode == 0x2F7) {
+        Some(b) => b,
+        None => return Ok(Vec::new()),
+    };
+    const SKIP: &[u32] = &[
+        0xA0 /*jcc*/, 0x8C /*jmp*/, 0x8F /*call*/, 0x05 /*ret*/, 0x03 /*call-script*/, 0xC4 /*play-voice*/,
+    ];
+    let out: Vec<_> = ins[blk_start..box_open]
+        .iter()
+        .filter(|i| !SKIP.contains(&i.opcode))
+        .map(crate::editor::bridge::SerializedInstruction::from)
+        .collect();
+    Ok(out)
+}
+
+/// One term to send to the Claude CLI for glossary translation.
+#[derive(serde::Deserialize)]
+pub struct GlossaryCliEntry {
+    pub term: String,
+    #[serde(default)]
+    pub examples: Vec<String>,
+    #[serde(default)]
+    pub suggestion: String,
+}
+
+/// One translated term read back from the CLI's `glossary-out.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GlossaryCliResult {
+    pub term: String,
+    #[serde(default)]
+    pub translation: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// The Eushully-world brief + task rules the CLI Claude reads (`PROMPT.md`).
+const GLOSSARY_CLI_PROMPT: &str = r#"# Eushully glossary translation
+
+You are finalizing **glossary terms** — proper nouns, character / place names,
+items, skills, and lore words — for a game by **Eushully**, a Japanese
+high-fantasy SRPG / visual-novel studio (their titles include Madou Koukaku,
+Sankai Ou no Yubiwa, Fuukan no Grasesta, Yamiyo no Parente, Kamidori Alchemy
+Meister, Soukoku no Arterial, and others). Eushully games share a loosely
+connected fantasy setting and recurring naming conventions: Western-style
+fantasy names written in katakana, plus coined kanji compounds for skills and
+lore. Your translations should fit that world, stay consistent with established
+fan translations where they exist, and stay consistent within this game.
+
+## Input
+`glossary.json` — a list of terms. Each has:
+- `term` — the original Japanese.
+- `examples` — in-game lines where it appears (use them for context, gender, role).
+- `suggestion` — an optional starting guess (may be empty or rough).
+
+## Task
+For each term, decide the best English rendering:
+- Render **katakana** names to their intended **Western form** (the actual name
+  behind the kana), not a literal kana transliteration.
+- **Localize coined kanji** terms meaningfully (skills, titles, lore) — not
+  word-for-word.
+- Preserve **title / honorific** nuance where relevant.
+- Keep **related terms consistent** (same root → same rendering).
+- Prefer established **Eushully fan-translation** spellings when a term is known.
+
+If a term is genuinely ambiguous (multiple valid readings / localizations),
+present 2–3 options with a one-line rationale and ask before finalizing.
+Otherwise go with your best call. You may discuss any term with the user.
+
+## Output
+When finalized, write **`glossary-out.json`** in this folder as a JSON array:
+
+```json
+[ { "term": "<original>", "translation": "<english>", "notes": "<short rationale or alternatives>" } ]
+```
+
+Write it as your LAST step — the editor watches for this file and auto-imports
+it once it appears. Include every term you were given.
+"#;
+
+/// Export the selected glossary terms to a self-contained `glossary-cli/` folder
+/// (glossary.json + PROMPT.md + interactive `claude` launcher + allowlist) so the
+/// user can translate them on their Claude subscription (no API billing) and the
+/// editor can auto-import the results. Optionally launches the launcher.
+/// Returns the absolute path of the created folder.
+#[tauri::command]
+pub async fn export_glossary_cli(
+    out_dir: String,
+    entries: Vec<GlossaryCliEntry>,
+    launch: bool,
+) -> Result<String, String> {
+    let folder = std::path::Path::new(&out_dir).join("glossary-cli");
+    std::fs::create_dir_all(&folder).map_err(|e| format!("Failed to create folder: {}", e))?;
+    // Clear any stale results from a previous run so the editor's watcher only
+    // fires on THIS session's output.
+    let _ = std::fs::remove_file(folder.join("glossary-out.json"));
+
+    // glossary.json (input)
+    let terms: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| serde_json::json!({ "term": e.term, "examples": e.examples, "suggestion": e.suggestion }))
+        .collect();
+    let glossary = serde_json::json!({ "terms": terms });
+    std::fs::write(
+        folder.join("glossary.json"),
+        serde_json::to_string_pretty(&glossary).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write glossary.json: {}", e))?;
+
+    // PROMPT.md (Eushully brief)
+    std::fs::write(folder.join("PROMPT.md"), GLOSSARY_CLI_PROMPT)
+        .map_err(|e| format!("Failed to write PROMPT.md: {}", e))?;
+
+    // .claude/settings.local.json — pre-authorize file read/write so the session
+    // doesn't prompt for each glossary.json read / glossary-out.json write.
+    let claude_dir = folder.join(".claude");
+    std::fs::create_dir_all(&claude_dir).map_err(|e| format!("Failed to create .claude: {}", e))?;
+    let settings = r#"{
+  "permissions": {
+    "allow": ["Read", "Write", "Edit", "Glob", "Grep"],
+    "deny": []
+  }
+}
+"#;
+    std::fs::write(claude_dir.join("settings.local.json"), settings)
+        .map_err(|e| format!("Failed to write settings.local.json: {}", e))?;
+
+    // Interactive launchers. The initial message points Claude at the task; the
+    // user can then discuss before it writes glossary-out.json.
+    let msg = "Read PROMPT.md and glossary.json in this folder, then translate the terms per the instructions. Discuss any ambiguous term with me first; otherwise use your best judgment. Write the final results to glossary-out.json as your last step.";
+    let bat = format!(
+        "@echo off\r\n\
+where claude >nul 2>nul || ( echo Claude Code CLI not found on PATH. Install from https://claude.com/code && pause && exit /b 1 )\r\n\
+echo Translating glossary terms with Claude (PROMPT.md + glossary.json)...\r\n\
+claude --permission-mode acceptEdits \"{0}\"\r\n",
+        msg
+    );
+    std::fs::write(folder.join("translate.bat"), bat)
+        .map_err(|e| format!("Failed to write translate.bat: {}", e))?;
+    let sh = format!(
+        "#!/usr/bin/env bash\nset -e\n\
+if ! command -v claude >/dev/null 2>&1; then echo \"Claude Code CLI not found on PATH.\"; exit 1; fi\n\
+echo \"Translating glossary terms with Claude (PROMPT.md + glossary.json)...\"\n\
+claude --permission-mode acceptEdits \"{0}\"\n",
+        msg
+    );
+    std::fs::write(folder.join("translate.sh"), sh)
+        .map_err(|e| format!("Failed to write translate.sh: {}", e))?;
+
+    if launch {
+        // Open the launcher in a new console window (best-effort; the folder is
+        // created regardless so the user can run it manually if this fails).
+        #[cfg(target_os = "windows")]
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", "translate.bat"])
+            .current_dir(&folder)
+            .spawn();
+    }
+
+    Ok(folder.to_string_lossy().to_string())
+}
+
+/// Read the CLI's `glossary-out.json` from a `glossary-cli/` folder, if present
+/// and valid. Returns None when the file is missing or not yet valid JSON (a
+/// half-written file), so the frontend's poll can simply retry.
+#[tauri::command]
+pub async fn read_glossary_cli_results(
+    folder: String,
+) -> Result<Option<Vec<GlossaryCliResult>>, String> {
+    let path = std::path::Path::new(&folder).join("glossary-out.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    // Accept either a bare array or { "results": [...] }.
+    if let Ok(v) = serde_json::from_str::<Vec<GlossaryCliResult>>(&raw) {
+        return Ok(Some(v));
+    }
+    #[derive(serde::Deserialize)]
+    struct Wrap {
+        results: Vec<GlossaryCliResult>,
+    }
+    if let Ok(w) = serde_json::from_str::<Wrap>(&raw) {
+        return Ok(Some(w.results));
+    }
+    Ok(None) // present but not valid yet — let the poll retry
 }
 
 /// Export a glossary to a JSON file.

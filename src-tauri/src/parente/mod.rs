@@ -38,13 +38,50 @@ fn is_scene_entry(e: &archive::ArcEntry) -> bool {
     name_l.ends_with(".txt") && path_l.contains("/src")
 }
 
-/// Count translatable strings in one scene entry, or `None` if it can't be
-/// decoded as a Lua scene (not a TextAsset, etc.).
-fn scene_string_count(arc_data: &[u8], e: &archive::ArcEntry) -> Option<usize> {
+/// High-signal explicit vocabulary used to flag adult scenes. These terms
+/// essentially only appear in H-content, so a small count cleanly separates
+/// adult scenes from the rest (Parente's H-dialogue is vocabulary-rich; in a
+/// scan the lowest adult scene scored ~18 and the highest non-adult ~3, so the
+/// threshold below has wide margin). Matched as substrings of dialogue text.
+const EXPLICIT_TERMS: &[&str] = &[
+    "ちんぽ","ちんちん","肉棒","おちんぽ","ペニス","亀頭","陰茎","男根",
+    "まんこ","おまんこ","膣","陰核","クリトリス","陰唇","秘部","蜜壺","媚肉",
+    "おっぱい","乳首","乳房","巨乳","乳輪",
+    "射精","精液","精子","中出し","ザーメン","ぶっかけ",
+    "愛液","絶頂","アクメ","潮吹",
+    "挿入","ピストン","性交","セックス","陵辱","輪姦","姦",
+    "勃起","オナニー","自慰","フェラ","クンニ","騎乗位","正常位","後背位",
+    "舐め","しゃぶ","喘","淫","卑猥","発情","媚薬","絶倫","膣内",
+];
+/// Total explicit-term hits at/above which a scene is flagged adult.
+const ADULT_THRESHOLD: usize = 5;
+
+/// Total explicit-term occurrences across a scene's parsed dialogue.
+fn adult_score(strings: &[script::ParenteString]) -> usize {
+    let mut n = 0;
+    for s in strings {
+        for t in EXPLICIT_TERMS {
+            if s.text.contains(t) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// (translatable string count, adult-flag) for one decoded scene's text.
+fn scene_stats_from_text(text: &str) -> (usize, bool) {
+    let strings = script::parse_script(text);
+    (strings.len(), adult_score(&strings) >= ADULT_THRESHOLD)
+}
+
+/// Count translatable strings + adult flag for one scene entry, or `None` if it
+/// can't be decoded as a Lua scene (not a TextAsset, etc.).
+fn scene_stats(arc_data: &[u8], e: &archive::ArcEntry) -> Option<(usize, bool)> {
     let raw = archive::entry_data(arc_data, e).ok()?;
     let b = bundle::unpack_bundle(raw).ok()?;
     let text = serialized::read_textasset_text(&b.blob).ok()?;
-    Some(script::parse_script(&text).len())
+    Some(scene_stats_from_text(&text))
 }
 
 /// List the scene files inside an `.arc` that actually contain dialogue.
@@ -63,8 +100,8 @@ pub fn list_arc_scene_files(arc_path: &str) -> Result<Vec<ParenteGameFile>, Stri
         if !is_scene_entry(e) {
             continue;
         }
-        match scene_string_count(&data, e) {
-            Some(count) if count > 0 => out.push(ParenteGameFile {
+        match scene_stats(&data, e) {
+            Some((count, adult)) if count > 0 => out.push(ParenteGameFile {
                 arc_path: arc_path.to_string(),
                 source: source.clone(),
                 name: e.name.clone(),
@@ -72,6 +109,7 @@ pub fn list_arc_scene_files(arc_path: &str) -> Result<Vec<ParenteGameFile>, Stri
                 offset: e.offset,
                 size: e.size,
                 string_count: count,
+                adult,
             }),
             _ => {}
         }
@@ -204,6 +242,8 @@ pub struct ParenteGameFile {
     pub offset: u64,
     pub size: u64,
     pub string_count: usize,
+    /// Heuristic flag: scene contains adult content (explicit-vocab scan).
+    pub adult: bool,
 }
 
 /// Locate the `Archives` directory from whatever folder the user dropped (the
@@ -304,10 +344,10 @@ pub fn list_game_scene_files(dropped_dir: &str) -> Result<Vec<ParenteGameFile>, 
             Ok(b) => b,
             Err(_) => continue,
         };
-        let count = match bundle::unpack_bundle(&raw)
+        let (count, adult) = match bundle::unpack_bundle(&raw)
             .and_then(|b| serialized::read_textasset_text(&b.blob))
         {
-            Ok(text) => script::parse_script(&text).len(),
+            Ok(text) => scene_stats_from_text(&text),
             Err(_) => continue,
         };
         if count > 0 {
@@ -319,6 +359,7 @@ pub fn list_game_scene_files(dropped_dir: &str) -> Result<Vec<ParenteGameFile>, 
                 offset: w.offset,
                 size: w.size,
                 string_count: count,
+                adult,
             });
         }
     }
@@ -599,7 +640,6 @@ pub fn export_english(primary_arc: &str, files: &[ParentePatchFile], out_path: &
         let raw = archive::read_entry_at(&a, o, s)?;
         out_files.push(archive::PackFile { name: "systemex.txt".into(), path: "/src/sys".into(), data: rebundle(&raw, english_patch_systemex)? });
     }
-
     // Enable the in-config language buttons (native persistent toggle). The
     // prefab lives in a base archive; pull it, flip the buttons, and add it so
     // our copy overrides. Non-fatal if absent (just no in-game toggle then).

@@ -475,55 +475,174 @@ function findEndTextLineTemplate(): {
   };
 }
 
-/**
- * Count how many display lines are already present in the current text box
- * starting at the group's start position. Walks backward from `groupStartIdx`
- * looking for a box boundary (wait-for-input or new-box-open bridge opcode),
- * counting each end-text-line opcode encountered along the way (each ETL = 1
- * completed line). The group itself starts the next line (count + 1).
- */
-function countLinesAlreadyInBox(groupStartIdx: number): number {
-  const tab = store.activeTab;
-  if (!tab) return 0;
-  const OP_NEW_BOX_OPEN = 0x1f5;
-  const BOX_BOUNDARY_LABELS = new Set(["wait-for-input"]);
+/** Opcodes for the native AGE text-box break. */
+const OP_WAIT_FOR_INPUT = 0x72;
+const OP_END_TEXT_LINE = 0x6f;
+const OP_NEW_BOX_OPEN = 0x1f5;
 
-  let etlCount = 0;
-  for (let i = groupStartIdx - 1; i >= 0; i--) {
-    const e = tab.entries[i];
-    if (e.deleted) continue;
-    if (e.opcode === OP_NEW_BOX_OPEN) break; // bridge to new box — stop counting
-    if (BOX_BOUNDARY_LABELS.has(e.label)) break;
-    if (e.label === "end-text-line") etlCount++;
+/**
+ * Insert a text-box BREAK after `entry` so the text that follows renders in a
+ * NEW box. Takes the pre-fetched `bridge` clone (the BIN's box-transition: it
+ * carries the engine "render/advance box" call and ends in new-box-open 0x1F5)
+ * and the source box's `speakerSetup` opcodes (which re-assert the name plate +
+ * color on the new box — Sankai establishes the speaker per-box, so a
+ * continuation box would otherwise fall back to narrator).
+ *
+ * Layout produced (matching the original order — setup BEFORE the box-open):
+ *   entry, wait-for-input, end-text-line(close), <bridge middle incl 0x186ba>,
+ *   <speakerSetup>, new-box-open(0x1F5), next show-text
+ *
+ * Reuses an existing line-break 0x6F after `entry` as the close (skips the
+ * bridge's leading 0x6F) to avoid a blank first line. Returns null on success.
+ */
+export function insertTextBoxBridge(
+  entry: DialogueEntry,
+  bridge: SerializedInstruction[],
+  speakerSetup: SerializedInstruction[],
+): string | null {
+  const tab = store.activeTab;
+  if (!tab) return "No active tab.";
+  if (!bridge || bridge.length === 0) return "No usable textbox bridge in this BIN.";
+
+  const idx = tab.entries.findIndex((e) => e.instruction_index === entry.instruction_index);
+  if (idx === -1) return "Entry not found.";
+  const next = tab.entries[idx + 1];
+
+  const argsOf = (bi: SerializedInstruction): SerializedArg[] =>
+    bi.arguments.map((a) => ({ arg_type: a.arg_type, raw_value: a.raw_data, string_value: a.decoded_string }));
+  const ins = (i: number, bi: SerializedInstruction) =>
+    insertInstructionVisually(i, bi.label, bi.opcode, argsOf(bi), true);
+
+  // The bridge's last instruction is the box-open (0x1F5); speaker setup must
+  // go right before it. Split the bridge into [middle…] + open.
+  const open = bridge[bridge.length - 1];
+  const middleEnd = bridge.length - 1;
+
+  // 1. wait-for-input (the click) immediately after the entry.
+  let lastIdx = insertInstructionVisually(
+    entry.instruction_index, "wait-for-input", OP_WAIT_FOR_INPUT, [{ arg_type: 0, raw_value: 0 }], true,
+  );
+
+  // 2. Bridge middle (close + render-box call …). Reuse an existing line-break
+  //    0x6F as the close when present (skip the bridge's leading 0x6F).
+  let bridgeStart = 0;
+  if (next != null && next.opcode === OP_END_TEXT_LINE && bridge[0].opcode === OP_END_TEXT_LINE) {
+    bridgeStart = 1;
+    lastIdx = next.instruction_index; // anchor the rest after the existing 0x6F
   }
-  return etlCount;
+  for (let k = bridgeStart; k < middleEnd; k++) lastIdx = ins(lastIdx, bridge[k]);
+
+  // 3. Speaker/character setup (re-assert name plate + color), before the open.
+  for (const s of speakerSetup) lastIdx = ins(lastIdx, s);
+
+  // 4. The box-open (0x1F5) — the next existing show-text renders in a fresh box.
+  ins(lastIdx, open);
+
+  tab.isDirty = true;
+  store.statusMessage = "Inserted box break — following text starts a new box (click to advance)";
+  return null;
 }
 
 /**
- * For a line group whose combined length exceeds the cap, insert
- * `end-text-line` opcodes between entries to split the group into multiple
- * display lines. If the resulting line count would exceed
- * `store.maxLinesPerBox`, insert a **bridge** (new text box) instead of an
- * end-text-line at that boundary, so the overflow continues in a new box.
+ * Paginate an over-long text box: insert a native box break (wait-for-input +
+ * end-text-line) after every `maxLinesPerBox`-th display line, so a box that
+ * wrapped past its line limit splits into multiple boxes the player clicks
+ * through (mirroring how the original script paginates long speech).
  *
- * Greedy algorithm:
- *   1. Walk through the group accumulating per-line length.
- *   2. When the next entry would overflow the current line, mark a break
- *      before it.
- *   3. When breaks would push the box past max-lines-per-box, mark that
- *      break as a "bridge break" (insert bridge instead of ETL).
+ * `boxStartEntry` is the box's first dialogue entry (from `findBoxOverflows`).
+ * Display lines are counted the same way as the box-overflow detector: a run of
+ * non-empty show-text/display-furigana is one line; `end-text-line` ends it.
  *
- * Returns the number of insertions made, or an error string.
+ * Returns the number of box breaks inserted, or an error string.
  */
-export async function splitOverflowingGroup(
+export async function paginateBox(boxStartEntry: DialogueEntry, maxLinesPerBox: number): Promise<string | number> {
+  const tab = store.activeTab;
+  if (!tab) return "No active tab.";
+  if (maxLinesPerBox < 1) return "Max lines per box must be ≥ 1.";
+
+  const startIdx = tab.entries.indexOf(boxStartEntry);
+  if (startIdx === -1) return "Box start not found.";
+
+  // Walk the box, recording the LAST content entry of each completed line.
+  const lineLastEntry: DialogueEntry[] = [];
+  let curLast: DialogueEntry | null = null;
+  for (let i = startIdx; i < tab.entries.length; i++) {
+    const e = tab.entries[i];
+    if (e.deleted) continue;
+    if (e.label === "wait-for-input" || e.opcode === OP_NEW_BOX_OPEN) break; // box end
+    if (e.label === "end-text-line") {
+      if (curLast) { lineLastEntry.push(curLast); curLast = null; }
+      continue;
+    }
+    if (e.label === "show-text" || e.label === "display-furigana") {
+      if (e.translated_text.trim() === "") continue;
+      curLast = e;
+    }
+  }
+  if (curLast) lineLastEntry.push(curLast); // trailing line (no 0x6F before box end)
+
+  // Balanced distribution: split into the MINIMUM number of boxes, with lines
+  // spread as evenly as possible — so 4 lines/3-max → 2+2 (not 3+1), 7 → 3+2+2,
+  // never an orphan single-line box. Each box stays within maxLinesPerBox.
+  const total = lineLastEntry.length;
+  const numBoxes = Math.ceil(total / maxLinesPerBox);
+  const breakAfter: DialogueEntry[] = [];
+  if (numBoxes > 1) {
+    const base = Math.floor(total / numBoxes);
+    const rem = total % numBoxes; // first `rem` boxes get one extra line
+    let cum = 0;
+    for (let b = 0; b < numBoxes - 1; b++) {
+      cum += base + (b < rem ? 1 : 0);
+      breakAfter.push(lineLastEntry[cum - 1]); // break after this box's last line
+    }
+  }
+  if (breakAfter.length === 0) return "Box already fits the line limit.";
+
+  // Fetch the box-transition bridge (carries the engine box-advance call) once.
+  let bridge: SerializedInstruction[];
+  try {
+    bridge = await getBridgeClone(tab.id);
+  } catch (err) {
+    return `No usable textbox bridge in this BIN: ${err}`;
+  }
+  // Speaker carry-over to continuation boxes is NOT possible: in Sankai the
+  // name plate + color + portrait are all established per-box by the voice
+  // (play-voice) block, which crashes when cloned and sets nothing without the
+  // voice. So continuation boxes render in narrator color (text is correct).
+  // (`getSpeakerSetup`/`get_speaker_setup` are kept but unused — see the
+  // sankai_line_break_handling memory for the full investigation.)
+  const speakerSetup: SerializedInstruction[] = [];
+
+  // Insert in REVERSE so earlier entries' positions stay valid.
+  for (const e of [...breakAfter].reverse()) {
+    const err = insertTextBoxBridge(e, bridge, speakerSetup);
+    if (typeof err === "string") return err; // bridge unavailable etc.
+  }
+  tab.isDirty = true;
+  store.statusMessage = `Paginated box into ${breakAfter.length + 1} boxes`;
+  return breakAfter.length;
+}
+
+/**
+ * For a line group whose combined length exceeds the per-line cap, insert
+ * `end-text-line` opcodes between entries to split the group into multiple
+ * display LINES. This is **line-only**: it never opens a new text box — adding
+ * a box is the separate, explicit `insertTextBoxBridge` action. (Engines like
+ * Sankai paginate a long run of lines themselves; where an engine needs a hard
+ * box break, the user inserts a bridge manually.)
+ *
+ * Greedy: walk the group accumulating per-line length; when the next entry
+ * would overflow the current line, mark a break before it.
+ *
+ * Returns the number of line breaks inserted, or an error string.
+ */
+export function splitOverflowingGroup(
   groupMember: DialogueEntry,
   lineCharCap: number,
-  maxLinesPerBox: number,
-): Promise<string | number> {
+): string | number {
   const tab = store.activeTab;
   if (!tab) return "No active tab.";
   if (lineCharCap <= 0) return "No line cap set.";
-  if (maxLinesPerBox < 1) return "Max lines per box must be ≥ 1.";
 
   const memberIdx = tab.entries.indexOf(groupMember);
   if (memberIdx === -1) return "Group member entry not found.";
@@ -551,117 +670,50 @@ export async function splitOverflowingGroup(
     return "No end-text-line opcode found in this BIN to use as a template.";
   }
 
-  // Plan breaks: { beforeId, kind: 'etl' | 'bridge' }
-  // The group becomes its OWN first line. Existing lines in this box (from
-  // earlier ETLs) count toward the per-box limit too.
-  const linesAlreadyInBox = countLinesAlreadyInBox(start);
-  type Break = { beforeId: number; kind: "etl" | "bridge" };
-  const breaks: Break[] = [];
-
+  // Plan line breaks: the instruction_index of each entry that should start a
+  // new display line (line-only — never a box bridge).
+  const breakBeforeIds: number[] = [];
   let runningLen = 0;
-  let currentBoxLines = linesAlreadyInBox + 1; // group starts a new line in this box
-
   for (let i = 0; i < groupEntries.length; i++) {
-    const e = groupEntries[i];
-    const len = singleEntryVisibleLength(e);
+    const len = singleEntryVisibleLength(groupEntries[i]);
     if (i === 0) {
       runningLen = len;
       continue;
     }
     if (runningLen + len > lineCharCap) {
-      // Need a break before this entry. Decide ETL or bridge based on box capacity.
-      if (currentBoxLines + 1 > maxLinesPerBox) {
-        breaks.push({ beforeId: e.instruction_index, kind: "bridge" });
-        currentBoxLines = 1; // new box, this entry starts line 1
-      } else {
-        breaks.push({ beforeId: e.instruction_index, kind: "etl" });
-        currentBoxLines++;
-      }
+      breakBeforeIds.push(groupEntries[i].instruction_index);
       runningLen = len;
     } else {
       runningLen += len;
     }
   }
 
-  if (breaks.length === 0) {
+  if (breakBeforeIds.length === 0) {
     return "Could not find a valid split point (one entry alone exceeds the cap).";
   }
 
-  // If any break is a bridge, fetch the bridge clone template up front.
-  let bridgeInstrs: SerializedInstruction[] | null = null;
-  if (breaks.some((b) => b.kind === "bridge")) {
-    try {
-      bridgeInstrs = await getBridgeClone(tab.id);
-    } catch (err) {
-      return `Need to bridge into a new box but bridge template unavailable: ${err}`;
-    }
-  }
-
-  // Apply breaks in REVERSE order so earlier insertion indices stay stable.
+  // Insert ETLs in REVERSE order so earlier insertion indices stay stable.
   let inserted = 0;
-  for (const brk of [...breaks].reverse()) {
-    const beforeIdx = tab.entries.findIndex(
-      (e) => e.instruction_index === brk.beforeId,
-    );
+  for (const beforeId of [...breakBeforeIds].reverse()) {
+    const beforeIdx = tab.entries.findIndex((e) => e.instruction_index === beforeId);
     if (beforeIdx <= 0) continue;
     const prevEntry = tab.entries[beforeIdx - 1];
-
-    if (brk.kind === "etl") {
-      const etlArgs: SerializedArg[] = etlTemplate.arguments.map((a) => ({
-        arg_type: a.arg_type,
-        raw_value: a.raw_data,
-        string_value: a.decoded_string,
-      }));
-      insertInstructionVisually(
-        prevEntry.instruction_index,
-        etlTemplate.label,
-        etlTemplate.opcode,
-        etlArgs,
-        true,
-      );
-      inserted++;
-    } else {
-      // Bridge: first close the prior line with an ETL, then insert the
-      // bridge instruction sequence. Inserts go in order; after each one,
-      // the previous index for the next insert is the latest inserted entry.
-      let lastInsertedIdx = prevEntry.instruction_index;
-      const etlArgs: SerializedArg[] = etlTemplate.arguments.map((a) => ({
-        arg_type: a.arg_type,
-        raw_value: a.raw_data,
-        string_value: a.decoded_string,
-      }));
-      lastInsertedIdx = insertInstructionVisually(
-        lastInsertedIdx,
-        etlTemplate.label,
-        etlTemplate.opcode,
-        etlArgs,
-        true,
-      );
-      inserted++;
-      for (const bi of bridgeInstrs!) {
-        const args: SerializedArg[] = bi.arguments.map((a) => ({
-          arg_type: a.arg_type,
-          raw_value: a.raw_data,
-          string_value: a.decoded_string,
-        }));
-        lastInsertedIdx = insertInstructionVisually(
-          lastInsertedIdx,
-          bi.label,
-          bi.opcode,
-          args,
-          true,
-        );
-        inserted++;
-      }
-    }
+    const etlArgs: SerializedArg[] = etlTemplate.arguments.map((a) => ({
+      arg_type: a.arg_type,
+      raw_value: a.raw_data,
+      string_value: a.decoded_string,
+    }));
+    insertInstructionVisually(
+      prevEntry.instruction_index,
+      etlTemplate.label,
+      etlTemplate.opcode,
+      etlArgs,
+      true,
+    );
+    inserted++;
   }
 
   tab.isDirty = true;
-  const etlCount = breaks.filter((b) => b.kind === "etl").length;
-  const bridgeCount = breaks.filter((b) => b.kind === "bridge").length;
-  const parts: string[] = [];
-  if (etlCount > 0) parts.push(`${etlCount} line break(s)`);
-  if (bridgeCount > 0) parts.push(`${bridgeCount} new box(es)`);
-  store.statusMessage = `Group split: inserted ${parts.join(" + ")}`;
+  store.statusMessage = `Group split: inserted ${inserted} line break(s)`;
   return inserted;
 }
