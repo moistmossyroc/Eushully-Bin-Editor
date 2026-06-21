@@ -2401,62 +2401,6 @@ pub async fn get_bridge_clone(
     Ok(cloned.iter().map(crate::editor::bridge::SerializedInstruction::from).collect())
 }
 
-/// Extract the speaker / character-setup block from the transition that
-/// precedes the box containing `entry_index`. In Sankai/AGE the name plate +
-/// color are established per-box by the voice/character block (0x2F7 …
-/// lookup-array … 0x2FF … play-voice 0xC4). Cloning that whole block into a
-/// continuation box re-asserts the speaker so a paginated box keeps the right
-/// name/color. (The block's non-conditional path sets the voice key to 0, so the
-/// replayed voice is typically silent.)
-///
-/// `entry_index` must be an ORIGINAL (parse-time) instruction index — the first
-/// show-text of the box being split. Returns the setup opcodes in order, or an
-/// empty Vec if none are found (caller falls back to narrator).
-#[tauri::command]
-pub async fn get_speaker_setup(
-    tab_id: String,
-    entry_index: usize,
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::editor::bridge::SerializedInstruction>, String> {
-    let tabs = state.tabs.lock().unwrap();
-    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
-    let parsed = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
-    let ins = &parsed.instructions;
-    if entry_index >= ins.len() {
-        return Ok(Vec::new());
-    }
-    // The box opens at the nearest new-textbox-open (0x1F5) before the entry.
-    let box_open = match (0..entry_index).rev().find(|&i| ins[i].opcode == 0x1F5) {
-        Some(b) => b,
-        None => return Ok(Vec::new()),
-    };
-    // The transition begins after the previous box's wait-for-input (0x72).
-    let start = (0..box_open)
-        .rev()
-        .find(|&i| ins[i].opcode == 0x72)
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    // The character block establishes name plate + color + portrait. It STARTS
-    // at 0x1CF (display character/face) or the first 0x2F7 — whichever comes
-    // first — and runs to the box-open. Collect it as a CONTIGUOUS run, dropping
-    // control-flow (jcc/jmp/call/ret/call-script — wrong absolute targets when
-    // cloned) AND play-voice (0xC4), which crashes when cloned and is the audio
-    // we don't want to replay anyway.
-    let blk_start = match (start..box_open).find(|&i| ins[i].opcode == 0x1CF || ins[i].opcode == 0x2F7) {
-        Some(b) => b,
-        None => return Ok(Vec::new()),
-    };
-    const SKIP: &[u32] = &[
-        0xA0 /*jcc*/, 0x8C /*jmp*/, 0x8F /*call*/, 0x05 /*ret*/, 0x03 /*call-script*/, 0xC4 /*play-voice*/,
-    ];
-    let out: Vec<_> = ins[blk_start..box_open]
-        .iter()
-        .filter(|i| !SKIP.contains(&i.opcode))
-        .map(crate::editor::bridge::SerializedInstruction::from)
-        .collect();
-    Ok(out)
-}
-
 /// One term to send to the Claude CLI for glossary translation.
 #[derive(serde::Deserialize)]
 pub struct GlossaryCliEntry {

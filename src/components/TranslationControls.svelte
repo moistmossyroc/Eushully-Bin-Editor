@@ -598,6 +598,13 @@
         >
           Glossary check
         </button>
+        <button
+          class="ctrl-btn"
+          onclick={() => (store.glossaryAutoApplyOpen = true)}
+          title="Review safe glossary substitutions: fill exact-term rows + replace Japanese terms that leaked into the English. Nothing applies until you confirm."
+        >
+          Glossary auto-apply
+        </button>
       {/if}
 
       {#if emptyStats.eligible > 0}

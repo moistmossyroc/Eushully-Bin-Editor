@@ -1682,6 +1682,18 @@ export async function doImportTranslations(): Promise<boolean> {
       }
     }
 
+    // Nudge (never auto-applied): surface safe glossary substitutions for review.
+    if (store.mergedGlossary.some((g) => g.english.trim())) {
+      const { findGlossaryAutoApply } = await import("./glossaryAutoApply");
+      const candidates = findGlossaryAutoApply(tab.entries, store.mergedGlossary);
+      if (candidates.length > 0) {
+        const { toastInfo } = await import("./toast");
+        toastInfo(
+          `${candidates.length} glossary auto-fix${candidates.length === 1 ? "" : "es"} available — open "Glossary auto-apply" to review.`,
+        );
+      }
+    }
+
     return true;
   } catch (err) {
     store.statusMessage = `Import failed: ${err}`;

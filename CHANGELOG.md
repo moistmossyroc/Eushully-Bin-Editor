@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.0 — 2026-06-21
+
+### Added — glossary
+- **Glossary auto-apply (reviewable).** Proposes only *safe, deterministic*
+  substitutions — filling an untranslated row whose original is exactly a
+  glossary term, and replacing a Japanese term that leaked verbatim into the
+  English — and lets you review/deselect each one before applying. Nothing is
+  ever applied silently; the whole batch is one-click undoable. After a CC
+  import, a toast points you to any available fixes.
+
+### Changed — tests / quality
+- **Engine-specific round-trip tests** that need no game data: synthetic
+  SYS3 / SYS4 / SYS5 BINs validate the parse↔write codec + the insertion-ordering
+  contract on every machine (CI, clean clones), not just where a real BIN sits.
+- Game-data-dependent tests now **skip cleanly** when their BIN is absent instead
+  of failing, so `cargo test` is green on a fresh checkout.
+
+### Removed
+- Dead speaker-setup carry-over code path (unused after the Sankai continuation
+  work settled on narrator-colored continuation boxes).
+
 ## 1.1.0 — 2026-06-20
 
 ### Fixed

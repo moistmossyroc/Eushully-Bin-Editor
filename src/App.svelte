@@ -16,6 +16,7 @@
   import ImportModeDialog from "./components/ImportModeDialog.svelte";
   import OverflowReviewDialog from "./components/OverflowReviewDialog.svelte";
   import GlossaryConsistencyDialog from "./components/GlossaryConsistencyDialog.svelte";
+  import GlossaryAutoApplyDialog from "./components/GlossaryAutoApplyDialog.svelte";
   import OmittedCellsDialog from "./components/OmittedCellsDialog.svelte";
   import ParenteFilePickerDialog from "./components/ParenteFilePickerDialog.svelte";
   import TranslationStatusDialog from "./components/TranslationStatusDialog.svelte";
@@ -460,6 +461,10 @@
 
   {#if store.glossaryConsistencyOpen && store.activeTab}
     <GlossaryConsistencyDialog onClose={() => (store.glossaryConsistencyOpen = false)} />
+  {/if}
+
+  {#if store.glossaryAutoApplyOpen && store.activeTab}
+    <GlossaryAutoApplyDialog onClose={() => (store.glossaryAutoApplyOpen = false)} />
   {/if}
 
   {#if store.bulkUndo}

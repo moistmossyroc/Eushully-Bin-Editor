@@ -1144,6 +1144,12 @@ mod tests {
             Err(_) => { println!("SC0000.BIN not found"); return; }
         };
         let parsed = parse_bin(&data).unwrap();
+        // A different SC0000.BIN (e.g. the SYS4 Sankai file) may sit on the
+        // search path — only the SYS5 detection assertions apply to a SYS5 file.
+        if parsed.header.sys_version != 5 {
+            println!("SC0000.BIN found is SYS{} not SYS5 — skipping", parsed.header.sys_version);
+            return;
+        }
 
         // New lookup-array based detection
         let lookup = detect_speaker_lookup_array(&parsed.instructions);

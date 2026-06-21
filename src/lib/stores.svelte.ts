@@ -401,6 +401,9 @@ class AppStore {
   /** Whether the glossary-consistency review dialog is open */
   glossaryConsistencyOpen = $state(false);
 
+  /** Whether the glossary auto-apply review dialog is open */
+  glossaryAutoApplyOpen = $state(false);
+
   /** One-level undo for bulk operations (replace-all, split/paginate across
    *  tabs). Snapshots the affected tabs before the op; a floating Undo pill
    *  restores it. Replaced by the next bulk op or cleared on use. */

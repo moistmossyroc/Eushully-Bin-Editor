@@ -609,8 +609,6 @@ export async function paginateBox(boxStartEntry: DialogueEntry, maxLinesPerBox: 
   // name plate + color + portrait are all established per-box by the voice
   // (play-voice) block, which crashes when cloned and sets nothing without the
   // voice. So continuation boxes render in narrator color (text is correct).
-  // (`getSpeakerSetup`/`get_speaker_setup` are kept but unused — see the
-  // sankai_line_break_handling memory for the full investigation.)
   const speakerSetup: SerializedInstruction[] = [];
 
   // Insert in REVERSE so earlier entries' positions stay valid.

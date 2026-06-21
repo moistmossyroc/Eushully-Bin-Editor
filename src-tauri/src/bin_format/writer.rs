@@ -271,12 +271,16 @@ mod tests {
     use crate::bin_format::parser::parse_bin;
     use std::path::Path;
 
-    fn load_test_bin(name: &str) -> Vec<u8> {
+    /// Load a real game BIN sitting next to the project, or `None` if absent.
+    /// Game-data tests skip cleanly when missing so `cargo test` is green on
+    /// clean clones / CI (the engine-specific coverage lives in the synthetic
+    /// `tests/engine_roundtrip.rs`, which needs no game data).
+    fn load_test_bin(name: &str) -> Option<Vec<u8>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .join(name);
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Could not read test file: {:?}", path))
+        std::fs::read(&path).ok()
     }
 
     #[test]
@@ -304,7 +308,7 @@ mod tests {
 
     #[test]
     fn dump_show_text_arg0_distribution() {
-        let data = load_test_bin("SC1310.BIN");
+        let Some(data) = load_test_bin("SC1310.BIN") else { return };
         let parsed = parse_bin(&data).unwrap();
         let mut counts: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
         for i in &parsed.instructions {
@@ -320,7 +324,7 @@ mod tests {
     #[test]
     fn dump_context_around_show_text_sys4() {
         use crate::bin_format::opcodes::definition_for_opcode;
-        let data = load_test_bin("SC1310.BIN");
+        let Some(data) = load_test_bin("SC1310.BIN") else { return };
         let parsed = parse_bin(&data).unwrap();
         // Find first show-text and dump 10 instructions before it
         let st_idx = parsed.instructions.iter().position(|i| i.opcode == 0x6E && !i.arguments.is_empty() && i.arguments.iter().any(|a| a.decoded_string.is_some())).unwrap();
@@ -338,7 +342,7 @@ mod tests {
 
     #[test]
     fn dump_show_text_args_sys4() {
-        let data = load_test_bin("SC1310.BIN");
+        let Some(data) = load_test_bin("SC1310.BIN") else { return };
         let parsed = parse_bin(&data).unwrap();
         let shows: Vec<_> = parsed.instructions.iter().filter(|i| i.opcode == 0x6E).take(5).collect();
         for (i, st) in shows.iter().enumerate() {
@@ -357,7 +361,7 @@ mod tests {
     #[test]
     fn test_insert_bridge_clone_roundtrip_sys4() {
         use crate::editor::bridge::{detect_bridge_template, clone_bridge, TemplateQuality};
-        let data = load_test_bin("SC1310.BIN");
+        let Some(data) = load_test_bin("SC1310.BIN") else { return };
         let mut parsed = parse_bin(&data).unwrap();
         let template = detect_bridge_template(&parsed.instructions, 4);
         if !matches!(template.quality, TemplateQuality::Clean | TemplateQuality::Degraded) {
@@ -379,7 +383,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_sys4() {
-        let original = load_test_bin("SC1310.BIN");
+        let Some(original) = load_test_bin("SC1310.BIN") else { return };
         let parsed = parse_bin(&original).expect("Failed to parse");
         let written = write_bin(&parsed.header, &parsed.instructions).expect("Failed to write");
         assert_eq!(
@@ -394,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_sys5() {
-        let original = load_test_bin("SC2230.BIN");
+        let Some(original) = load_test_bin("SC2230.BIN") else { return };
         let parsed = parse_bin(&original).expect("Failed to parse");
         let written = write_bin(&parsed.header, &parsed.instructions).expect("Failed to write");
         assert_eq!(

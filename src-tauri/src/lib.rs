@@ -61,7 +61,6 @@ pub fn run() {
             commands::export_for_translation,
             commands::import_translations,
             commands::get_bridge_clone,
-            commands::get_speaker_setup,
             commands::export_glossary_cli,
             commands::read_glossary_cli_results,
             commands::lookup_character_names_for_pointers,
@@ -98,18 +97,18 @@ mod test_show_text_decode {
     use crate::bin_format::parser::parse_bin;
     use std::path::Path;
     
-    fn load_test_bin(name: &str) -> Vec<u8> {
+    fn load_test_bin(name: &str) -> Option<Vec<u8>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .join(name);
-        std::fs::read(&path).unwrap_or_else(|_| panic!("Could not read test file: {:?}", path))
+        std::fs::read(&path).ok()
     }
-    
+
     #[test]
     fn test_print_decoded_show_text() {
         println!("\n=== SC1310.BIN - Decoded show-text Instructions ===\n");
-        let data = load_test_bin("SC1310.BIN");
+        let Some(data) = load_test_bin("SC1310.BIN") else { return };
         let parsed = parse_bin(&data).expect("Failed to parse SC1310.BIN");
         
         let show_text_instrs: Vec<_> = parsed.instructions

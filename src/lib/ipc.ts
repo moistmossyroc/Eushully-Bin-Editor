@@ -440,13 +440,6 @@ export function getBridgeClone(tabId: string): Promise<import("./types").Seriali
   return invoke<import("./types").SerializedInstruction[]>("get_bridge_clone", { tabId });
 }
 
-/** Fetch the speaker/character-setup opcodes for the box at `entryIndex` (an
- *  original instruction index). Cloned into a paginated continuation box to
- *  re-assert the speaker name plate + color (no play-voice, so no audio). */
-export function getSpeakerSetup(tabId: string, entryIndex: number): Promise<import("./types").SerializedInstruction[]> {
-  return invoke<import("./types").SerializedInstruction[]>("get_speaker_setup", { tabId, entryIndex });
-}
-
 /** A term to send to the Claude CLI for glossary translation. */
 export interface GlossaryCliEntry { term: string; examples: string[]; suggestion: string }
 /** A translated term read back from the CLI's glossary-out.json. */
