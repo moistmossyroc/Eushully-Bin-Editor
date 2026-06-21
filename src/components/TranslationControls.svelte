@@ -13,7 +13,7 @@
   import { applySplitPlan, isAutoSplitContinuation } from "../lib/insertions";
   import { findOverflows, findBoxOverflows, EDITABLE_OVERFLOW_LABELS } from "../lib/overflow";
   import { toastWarn } from "../lib/toast";
-  import { computeEmptyStats, bulkSetOmitExport, isStructuralOnly } from "../lib/exportOmit";
+  import { computeEmptyStats, isStructuralOnly } from "../lib/exportOmit";
   import { furiganaDisplayLength, stripQuoteBrackets } from "../lib/types";
   import type { TranslationProgress, DialogueEntry, GlossaryEntry } from "../lib/types";
   import OverwriteConfirmDialog from "./OverwriteConfirmDialog.svelte";
@@ -153,23 +153,8 @@
   let showOverwriteDialog = $state(false);
   let overwriteCounts = $state({ user: 0, claude: 0, empty: 0 });
 
-  /** Stats for eligible empty cells, used to drive the toggle button. */
+  /** Stats for eligible empty cells, used to label the Export Review button. */
   let emptyStats = $derived(computeEmptyStats(store.activeTab));
-
-  /** Toggle button state — true when ALL eligible empties are omitted. */
-  let allEmptiesOmitted = $derived(
-    emptyStats.eligible > 0 && emptyStats.omitted === emptyStats.eligible,
-  );
-
-  /** Single-click toggle: flips all eligible empty cells to the opposite state.
-   *  Bias toward omit — if currently mixed or all included, click → omit all. */
-  function handleToggleEmpties() {
-    const value = !allEmptiesOmitted;
-    const changed = bulkSetOmitExport(store.activeTab, value);
-    store.statusMessage = value
-      ? `Omitted ${changed} empty cell(s) from export.`
-      : `Re-included ${changed} empty cell(s) in export.`;
-  }
 
   /** Format token count with K/M suffix */
   function formatTokens(n: number): string {
@@ -591,22 +576,13 @@
       {/if}
 
 
-      {#if emptyStats.eligible > 0}
+      {#if emptyStats.eligible > 0 || emptyStats.omitted > 0}
         <button
           class="ctrl-btn empty-cells"
-          class:active={allEmptiesOmitted}
-          onclick={handleToggleEmpties}
-          oncontextmenu={(e) => { e.preventDefault(); store.omittedCellsDialogOpen = true; }}
-          title={(allEmptiesOmitted
-            ? `All ${emptyStats.eligible} empty cell(s) are currently OMITTED from export. Click to re-include (original Japanese will render in-game).`
-            : `${emptyStats.eligible - emptyStats.omitted} of ${emptyStats.eligible} empty cell(s) will export their original Japanese. Click to OMIT all (BIN gets empty strings — game renders nothing).`)
-            + ` — Right-click to view omitted cells & rescan.`}
+          onclick={() => (store.omittedCellsDialogOpen = true)}
+          title={`Export Review — toggle omit per row with notes & context, across all tabs. Currently ${emptyStats.omitted} omitted, ${emptyStats.eligible - emptyStats.omitted} empty cell(s) would export their original Japanese.`}
         >
-          {#if allEmptiesOmitted}
-            Empty cells omitted ({emptyStats.eligible})
-          {:else}
-            Omit empty cells ({emptyStats.eligible - emptyStats.omitted})
-          {/if}
+          Export review ({emptyStats.eligible})
         </button>
       {/if}
     {:else if isRunning}

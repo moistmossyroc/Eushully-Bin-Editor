@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { open, ask } from "@tauri-apps/plugin-dialog";
+  import { open } from "@tauri-apps/plugin-dialog";
   import { store } from "../lib/stores.svelte";
+  import { confirmDialog } from "../lib/confirm";
   import { scanBinForCharacters } from "../lib/ipc";
   import type { CharacterEntry } from "../lib/types";
   import ResizeHandle from "./ResizeHandle.svelte";
@@ -53,10 +54,12 @@
     // Ask whether to apply globally when multiple tabs are open
     let applyGlobally = false;
     if (store.tabs.length > 1) {
-      applyGlobally = await ask(
-        "Apply scanned character names to all open tabs, or only the current tab?",
-        { title: "Apply to all tabs?", kind: "info", okLabel: "All Tabs", cancelLabel: "Current Only" }
-      );
+      applyGlobally = await confirmDialog({
+        title: "Apply to all tabs?",
+        message: "Apply scanned character names to all open tabs, or only the current tab?",
+        confirmLabel: "All Tabs",
+        cancelLabel: "Current Only",
+      });
     }
 
     // Scan all selected BIN files and collect results

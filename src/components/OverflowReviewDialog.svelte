@@ -1,5 +1,6 @@
 <script lang="ts">
   import { store } from "../lib/stores.svelte";
+  import { confirmDialog } from "../lib/confirm";
   import { findOverflows, findBoxOverflows, entryDisplayLength, type OverflowRow, type BoxOverflow } from "../lib/overflow";
   import { autoSplitEntry, optimizeEntry } from "../lib/ipc";
   import { applySplitPlan, splitOverflowingGroup, paginateBox } from "../lib/insertions";
@@ -243,10 +244,13 @@
       store.statusMessage = "Nothing to optimize.";
       return;
     }
-    const ok = confirm(
-      `Optimize ${toFix.length} overflowing rows via Claude API?\n\n` +
-      `Each row uses one API call. This will be billed to your API key.`,
-    );
+    const ok = await confirmDialog({
+      title: "Optimize via Claude API",
+      confirmLabel: "Optimize",
+      message:
+        `Optimize ${toFix.length} overflowing rows via Claude API?\n\n` +
+        `Each row uses one API call. This will be billed to your API key.`,
+    });
     if (!ok) return;
 
     working = true;

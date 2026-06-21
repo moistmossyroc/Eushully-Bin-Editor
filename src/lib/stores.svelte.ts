@@ -317,6 +317,14 @@ class AppStore {
   /** Whether the omitted-cells dialog is open (lists omit_export rows + rescan). */
   omittedCellsDialogOpen = $state(false);
 
+  /** Persisted Export Review view state — scope/filter + scroll offset — so the
+   *  dialog resumes exactly where the user left off when reopened. */
+  exportReview = $state<{
+    scope: "all" | "tab";
+    filter: "needs" | "omitted" | "included" | "all";
+    scrollTop: number;
+  }>({ scope: "all", filter: "needs", scrollTop: 0 });
+
   /** Pending Parente scene picker. Set after listing a single .arc or a whole
    *  game folder; the dialog lets the user choose which scenes to load as tabs.
    *  `gameDir` is set in game-folder mode so export can target the Patch folder. */

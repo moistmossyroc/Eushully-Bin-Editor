@@ -48,7 +48,16 @@ export function hasTranslatableContent(text: string): boolean {
  *  Includes: editable rows whose translated_text is empty OR whose omit_export
  *  is already true (e.g. group-translated siblings).
  *  Excludes: deleted, context, non-editable, and translated rows (no checkbox). */
-function isEligible(e: DialogueEntry): boolean {
+/** An editable text row (show-text / display-furigana / comment) carrying real
+ *  content — the universe the Export Review can show under "All editable". */
+export function isEditableRow(e: DialogueEntry): boolean {
+  if (e.deleted || e.is_context_row) return false;
+  if (!EDITABLE_LABELS.has(e.label)) return false;
+  if (isStructuralOnly(e.original_text)) return false;
+  return true;
+}
+
+export function isOmitEligible(e: DialogueEntry): boolean {
   if (e.deleted || e.is_context_row) return false;
   if (!EDITABLE_LABELS.has(e.label)) return false;
   // Structural-only rows (brackets, empty, etc.) are not translatable content
@@ -72,7 +81,7 @@ export function computeEmptyStats(tab: TabState | null | undefined): EmptyStats 
   let eligible = 0;
   let omitted = 0;
   for (const e of tab.entries) {
-    if (!isEligible(e)) continue;
+    if (!isOmitEligible(e)) continue;
     eligible++;
     if (e.omit_export === true) omitted++;
   }
@@ -87,7 +96,7 @@ export function bulkSetOmitExport(tab: TabState | null | undefined, value: boole
   if (!tab) return 0;
   let changed = 0;
   const next = tab.entries.map((e) => {
-    if (!isEligible(e)) return e;
+    if (!isOmitEligible(e)) return e;
     if ((e.omit_export === true) === value) return e;
     changed++;
     return { ...e, omit_export: value };

@@ -14,6 +14,7 @@
   import type { DialogueEntry } from "../lib/types";
   import ResizeHandle from "./ResizeHandle.svelte";
   import { persistAllSettingsDebounced } from "../lib/settings";
+  import { confirmDialog } from "../lib/confirm";
 
   interface Result {
     tabIndex: number;
@@ -133,23 +134,29 @@
 
   let selectedCount = $derived(selectedIds.size);
 
-  function performReplace() {
+  async function performReplace() {
     if (!query.trim() || selectedCount === 0) return;
-    const confirmed = confirm(
-      `Replace "${query}" with "${replaceWith}" in ${selectedCount} location(s) across ${grouped.length} tab(s)?\n\n` +
-      `This cannot be undone in bulk — only the editor's per-cell history applies.`,
-    );
+    const confirmed = await confirmDialog({
+      title: "Replace selected",
+      message:
+        `Replace "${query}" with "${replaceWith}" in ${selectedCount} location(s) across ${grouped.length} tab(s)?\n\n` +
+        `Applied as one bulk action — undo it all at once with the Undo pill.`,
+      confirmLabel: "Replace",
+    });
     if (!confirmed) return;
     applyReplace(results.filter((r) => selectedIds.has(rowKey(r))));
   }
 
   /** One-click replace across EVERY match (all tabs), no per-result selection. */
-  function performReplaceAll() {
+  async function performReplaceAll() {
     if (!query.trim() || results.length === 0) return;
-    const confirmed = confirm(
-      `Replace "${query}" with "${replaceWith}" in ALL ${results.length} match(es) across ${grouped.length} tab(s)?\n\n` +
-      `This cannot be undone in bulk — only the editor's per-cell history applies.`,
-    );
+    const confirmed = await confirmDialog({
+      title: "Replace all",
+      message:
+        `Replace "${query}" with "${replaceWith}" in ALL ${results.length} match(es) across ${grouped.length} tab(s)?\n\n` +
+        `Applied as one bulk action — undo it all at once with the Undo pill.`,
+      confirmLabel: "Replace all",
+    });
     if (!confirmed) return;
     applyReplace(results);
   }

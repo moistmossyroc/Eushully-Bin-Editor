@@ -1,5 +1,6 @@
-import { open, ask, save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { readDir, exists as fsExists } from "@tauri-apps/plugin-fs";
+import { confirmDialog } from "./confirm";
 import type { TabState } from "./stores.svelte";
 import {
   loadBin,
@@ -431,10 +432,11 @@ export async function doLoadBin(filePath: string): Promise<void> {
       fetchBridgeQuality(tab);
 
       if (!hashMatches) {
-        const proceed = await ask(
-          `The BIN file hash does not match the saved project for ${binFilename}. This may be a different version. Continue anyway?`,
-          { title: "Hash mismatch", kind: "warning" }
-        );
+        const proceed = await confirmDialog({
+          title: "Hash mismatch",
+          confirmLabel: "Continue",
+          message: `The BIN file hash does not match the saved project for ${binFilename}. This may be a different version. Continue anyway?`,
+        });
         if (!proceed) {
           store.statusMessage = "Cancelled — hash mismatch";
           const tabIndex = store.tabs.indexOf(tab);
@@ -631,10 +633,11 @@ export async function doLoadProject(filePath: string): Promise<void> {
     fetchBridgeQuality(tab);
 
     if (!hashMatches) {
-      const proceed = await ask(
-        "The BIN file hash does not match the project. This may be a different version. Continue anyway?",
-        { title: "Hash mismatch", kind: "warning" }
-      );
+      const proceed = await confirmDialog({
+        title: "Hash mismatch",
+        confirmLabel: "Continue",
+        message: "The BIN file hash does not match the project. This may be a different version. Continue anyway?",
+      });
       if (!proceed) {
         store.statusMessage = "Cancelled — hash mismatch";
         const tabIndex = store.tabs.indexOf(tab);
@@ -972,10 +975,11 @@ export async function doLoadProjectFolders(): Promise<void> {
       const hashMatches = await loadBinForProject(tab.id, binFilePath, project.source_bin_sha256);
       fetchBridgeQuality(tab);
       if (!hashMatches) {
-        const proceed = await ask(
-          `BIN hash mismatch for ${project.source_bin_filename}. Continue?`,
-          { title: "Hash mismatch", kind: "warning" }
-        );
+        const proceed = await confirmDialog({
+          title: "Hash mismatch",
+          confirmLabel: "Continue",
+          message: `BIN hash mismatch for ${project.source_bin_filename}. Continue?`,
+        });
         if (!proceed) {
           const tabIndex = store.tabs.indexOf(tab);
           if (tabIndex !== -1) store.closeTab(tabIndex);
@@ -1630,13 +1634,16 @@ export async function doImportTranslations(): Promise<boolean> {
     if (result.hash_mismatch) {
       const expected = result.source_bin || "(unknown)";
       const current = tab.sourceBinFilename || "(none loaded)";
-      const proceed = await ask(
-        `The translation file was exported from a different BIN.\n\n` +
-        `  Translation file source: ${expected}\n` +
-        `  Currently loaded BIN:    ${current}\n\n` +
-        `Applying anyway risks corrupting unrelated rows. Proceed?`,
-        { title: "BIN mismatch — proceed with caution", kind: "warning" },
-      );
+      const proceed = await confirmDialog({
+        title: "BIN mismatch — proceed with caution",
+        danger: true,
+        confirmLabel: "Proceed anyway",
+        message:
+          `The translation file was exported from a different BIN.\n\n` +
+          `  Translation file source: ${expected}\n` +
+          `  Currently loaded BIN:    ${current}\n\n` +
+          `Applying anyway risks corrupting unrelated rows. Proceed?`,
+      });
       if (!proceed) {
         store.statusMessage = "Import canceled.";
         return false;

@@ -17,6 +17,7 @@
     type BackupDiff,
   } from "../lib/ipc";
   import { store } from "../lib/stores.svelte";
+  import { confirmDialog } from "../lib/confirm";
 
   interface Props {
     /** Path to the live project JSON (the autosave target). */
@@ -72,11 +73,15 @@
 
   async function handleRestore() {
     if (!selectedBackup) return;
-    const ok = confirm(
-      `Revert ${binFilename} to backup #${selectedBackup.depth} (${formatTime(selectedBackup.modified_ms)})?\n\n` +
-      `This overwrites your current project JSON. ${diff ? `${diff.translated_diff_count + diff.omit_diff_count} entries will change.` : ""}\n\n` +
-      `Your current state will be lost (the next autosave will create a fresh .bak1, but the version before that revert won't be in the chain).`,
-    );
+    const ok = await confirmDialog({
+      title: "Restore backup",
+      danger: true,
+      confirmLabel: "Restore",
+      message:
+        `Revert ${binFilename} to backup #${selectedBackup.depth} (${formatTime(selectedBackup.modified_ms)})?\n\n` +
+        `This overwrites your current project JSON. ${diff ? `${diff.translated_diff_count + diff.omit_diff_count} entries will change.` : ""}\n\n` +
+        `Your current state will be lost (the next autosave will create a fresh .bak1, but the version before that revert won't be in the chain).`,
+    });
     if (!ok) return;
     restoring = true;
     restoreError = null;

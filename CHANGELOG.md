@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.2 — 2026-06-21
+
+### Added — Export Review (was "Omit empty cells")
+- The button now opens a full **Export Review** dialog instead of a one-shot bulk
+  toggle. Across the active tab or **all open tabs** (grouped by tab):
+  - Per-row **red/blue Export toggle** (same control as the editor) — blue =
+    will export, red = omitted — for at-a-glance scanning.
+  - Filter chips: **Needs review · Omitted · Included · All editable**, with counts.
+  - A dedicated **notes column** (notes often say whether a row should be omitted).
+  - Click the original to **expand surrounding context**; double-click it, or click
+    the translation, to **jump to the row**.
+  - **Omit all / Include all** for the current view (one bulk-undo).
+  - Remembers scope/filter/scroll so reopening **resumes where you left off**.
+
+### Fixed
+- **Glossary panel:** editing an entry while a filter was active made it vanish
+  mid-edit (it stopped matching). The edited row now stays put until you finish
+  (click away / Update / Enter / Escape).
+- **Find & Replace:** the confirm popup didn't block, so the replace could fire
+  before you answered. Now uses the awaited themed dialog, and its message
+  correctly notes the action is bulk-undoable.
+
+### Changed — polish
+- **All confirmation popups are now themed** (no more OS-native dialogs):
+  Replace/Replace-all, Restore backup, Clear glossary, Optimize via API,
+  Enable auto-split, BIN-hash/translation mismatch warnings, and "apply character
+  names to all tabs." Consistent dark styling, proper line breaks, danger
+  styling on destructive actions.
+
 ## 1.3.1 — 2026-06-21
 
 ### Added — glossary consistency review

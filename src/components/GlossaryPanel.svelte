@@ -1,6 +1,7 @@
 <script lang="ts">
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { store } from "../lib/stores.svelte";
+  import { confirmDialog } from "../lib/confirm";
   import { exportGlossary, importGlossary, saveFolderGlossary, openFolderInExplorer, fileExists } from "../lib/ipc";
   import { toastInfo, toastError } from "../lib/toast";
   import { clampToViewport } from "../lib/clampMenu";
@@ -120,18 +121,25 @@
   let filteredGlossary = $derived.by(() => {
     let items = glossaryArray.map((g, idx) => ({ entry: g, realIndex: idx }));
 
+    // The row currently being edited is always kept, even if the user's edit
+    // makes it stop matching the active filters — otherwise it would vanish from
+    // under the cursor mid-edit. It re-filters once editing ends (closeEditor
+    // clears editingIndex on click-away / Update / Enter / Escape).
+    const keep = (realIndex: number) => realIndex === editingIndex;
+
     if (categoryFilter) {
-      items = items.filter(({ entry }) => (entry.category || "general") === categoryFilter);
+      items = items.filter(({ entry, realIndex }) => keep(realIndex) || (entry.category || "general") === categoryFilter);
     }
 
     if (showDuplicatesOnly) {
-      items = items.filter(({ entry }) => duplicateKeys.has(entry.japanese));
+      items = items.filter(({ entry, realIndex }) => keep(realIndex) || duplicateKeys.has(entry.japanese));
     }
 
     if (filterText.trim()) {
       const lower = filterText.toLowerCase();
       items = items.filter(
-        ({ entry: g }) =>
+        ({ entry: g, realIndex }) =>
+          keep(realIndex) ||
           g.japanese.toLowerCase().includes(lower) ||
           g.english.toLowerCase().includes(lower) ||
           g.category.toLowerCase().includes(lower) ||
@@ -140,7 +148,7 @@
     }
 
     if (hideUnused) {
-      items = items.filter(({ entry }) => (usageCounts.get(entry.japanese) ?? 0) > 0);
+      items = items.filter(({ entry, realIndex }) => keep(realIndex) || (usageCounts.get(entry.japanese) ?? 0) > 0);
     }
 
     if (frozenOrder) {
@@ -399,12 +407,16 @@
     }
   }
 
-  function handleClearAll() {
+  async function handleClearAll() {
     if (glossaryArray.length === 0) return;
     const label = activeView === "global" ? "global" : "project";
-    if (!confirm(`Clear all ${glossaryArray.length} entries from the ${label} glossary? This cannot be undone.`)) {
-      return;
-    }
+    const ok = await confirmDialog({
+      title: "Clear glossary",
+      danger: true,
+      confirmLabel: "Clear all",
+      message: `Clear all ${glossaryArray.length} entries from the ${label} glossary? This cannot be undone.`,
+    });
+    if (!ok) return;
     if (activeView === "global") {
       store.globalGlossary = [];
     } else if (store.activeTab) {

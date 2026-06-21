@@ -3,6 +3,7 @@
   import { persistAllSettings } from "../lib/settings";
   import { store } from "../lib/stores.svelte";
   import { fetchAvailableModels } from "../lib/ipc";
+  import { confirmDialog } from "../lib/confirm";
   import { onMount } from "svelte";
   import ModelCombobox from "./ModelCombobox.svelte";
 
@@ -526,16 +527,18 @@
           <input
             type="checkbox"
             bind:checked={store.autoSplitEnabled}
-            onchange={(e) => {
+            onchange={async (e) => {
               if ((e.target as HTMLInputElement).checked) {
-                const ok = confirm(
-                  "Auto-split inserts new dialog-box rows (shown as #-1, #-2, …) when a translation exceeds the character cap. " +
-                  "This can be useful for keeping in-game text within bounds, but it can also produce surprising row layouts " +
-                  "and occasionally interact badly with block-mode live translation — especially on non-Anthropic providers " +
-                  "(Mistral, OpenAI, etc.).\n\n" +
-                  "Recommended only for fine-tuned passes after the initial translation completes. Leave OFF for the first pass.\n\n" +
-                  "Enable auto-split?"
-                );
+                const ok = await confirmDialog({
+                  title: "Enable auto-split?",
+                  confirmLabel: "Enable",
+                  message:
+                    "Auto-split inserts new dialog-box rows (shown as #-1, #-2, …) when a translation exceeds the character cap. " +
+                    "This can be useful for keeping in-game text within bounds, but it can also produce surprising row layouts " +
+                    "and occasionally interact badly with block-mode live translation — especially on non-Anthropic providers " +
+                    "(Mistral, OpenAI, etc.).\n\n" +
+                    "Recommended only for fine-tuned passes after the initial translation completes. Leave OFF for the first pass.",
+                });
                 if (!ok) {
                   store.autoSplitEnabled = false;
                   return;

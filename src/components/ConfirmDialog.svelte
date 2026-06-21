@@ -74,6 +74,7 @@
     color: #c0c0e0;
     font-size: 0.88rem;
     line-height: 1.5;
+    white-space: pre-line; /* honor \n / \n\n in messages */
   }
   footer {
     padding: 12px 16px;
