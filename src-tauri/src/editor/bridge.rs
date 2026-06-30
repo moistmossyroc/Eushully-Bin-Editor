@@ -90,11 +90,17 @@ fn find_bridge_candidates(instructions: &[Instruction]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Return true if the window contains exactly one `OP_NEW_BOX_OPEN` and that
-/// opcode is the last instruction.
+/// Return true if the window contains at least one `OP_NEW_BOX_OPEN` and the
+/// window's last instruction is one.
+///
+/// Earlier this required *exactly* one `0x1F5`, which rejected builds that emit
+/// two per transition (e.g. Megami Zero v415: a close-box `0x1F5` followed by an
+/// open-box `0x1F5` around a `call`). We only need the bridge to *terminate* the
+/// box, so the count constraint is relaxed to "≥1, ending in one". This is
+/// additive — windows that already qualified still do, so clean-bridge games are
+/// unaffected (Pass 1 still selects their branch-free template first).
 fn has_terminal_new_box_open(window: &[Instruction]) -> bool {
-    let count = window.iter().filter(|i| i.opcode == OP_NEW_BOX_OPEN).count();
-    if count != 1 {
+    if !window.iter().any(|i| i.opcode == OP_NEW_BOX_OPEN) {
         return false;
     }
     matches!(window.last(), Some(last) if last.opcode == OP_NEW_BOX_OPEN)

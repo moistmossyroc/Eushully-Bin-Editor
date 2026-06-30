@@ -7,11 +7,16 @@
    * ways: edit the translation inline, or jump to the row in its tab.
    */
   import { store } from "../lib/stores.svelte";
-  import { findGlossaryInconsistenciesAllTabs } from "../lib/glossaryCheck";
+  import {
+    findGlossaryInconsistenciesAllTabs,
+    findUiAbbreviationsInDialogue,
+    type AbbreviationHit,
+  } from "../lib/glossaryCheck";
   import { isKatakanaTerm } from "../lib/jpMatch";
   import { toastInfo } from "../lib/toast";
 
   type Filter = "all" | "katakana" | "other";
+  type View = "consistency" | "abbrev";
 
   interface Props { onClose: () => void; }
   let { onClose }: Props = $props();
@@ -81,6 +86,45 @@
 
   let totalRows = $derived(groups.reduce((n, g) => n + g.rows.length, 0));
   let termCount = $derived(new Set(filteredFlags.map((f) => f.term)).size);
+
+  // Which check is shown. The abbreviation pass works even with no glossary
+  // (UI_ABBREVIATIONS is built-in), so the toggle is always available.
+  let view = $state<View>("consistency");
+
+  // ── UI-abbreviation leak pass (advisory) ──────────────────────────────────
+  // Scans OPEN dialogue BINs for stat-screen abbreviations (ATK/DEF/HP…) that
+  // leaked into prose. Suggestions only — nothing is changed automatically.
+  let abbrevHits = $derived.by<AbbreviationHit[]>(() =>
+    findUiAbbreviationsInDialogue(
+      store.tabs.map((t, i) => ({
+        id: t.id,
+        name: t.sourceBinFilename,
+        index: i,
+        entries: t.entries,
+        glossary: t.glossary,
+      })),
+      store.globalGlossary,
+    ),
+  );
+
+  interface AbbrevGroup {
+    tabId: string;
+    tabIndex: number;
+    file: string;
+    hits: AbbreviationHit[];
+  }
+  let abbrevGroups = $derived.by<AbbrevGroup[]>(() => {
+    const byTab = new Map<string, AbbrevGroup>();
+    for (const h of abbrevHits) {
+      let g = byTab.get(h.tabId);
+      if (!g) {
+        g = { tabId: h.tabId, tabIndex: h.tabIndex, file: h.file || "Untitled", hits: [] };
+        byTab.set(h.tabId, g);
+      }
+      g.hits.push(h);
+    }
+    return [...byTab.values()].sort((a, b) => a.tabIndex - b.tabIndex);
+  });
 
   // Inline-edit drafts keyed by `${tabIndex}|${rowId}`.
   let drafts = $state<Record<string, string>>({});
@@ -167,6 +211,19 @@
     onClose();
   }
 
+  /** Jump to an abbreviation hit's row — same mechanism as jumpTo (switch tab,
+   *  select by stable instruction_index, request a scroll), then close. */
+  function jumpToAbbrev(h: AbbreviationHit) {
+    const tab = store.tabs[h.tabIndex];
+    if (!tab) return;
+    store.switchTab(h.tabIndex);
+    const idx = tab.entries.findIndex((e) => e.instruction_index === h.instruction_index);
+    const target = idx >= 0 ? idx : h.rowIndex;
+    tab.selectedRowIndex = target;
+    store.pendingScrollRequest = { tabId: tab.id, rowIndex: target, nonce: Date.now() };
+    onClose();
+  }
+
   function truncate(s: string, n: number): string {
     return s.length <= n ? s : s.slice(0, n) + "…";
   }
@@ -177,10 +234,18 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="dialog" onclick={(e) => e.stopPropagation()}>
     <header>
-      <h2>Glossary Consistency — all tabs</h2>
+      <h2>Glossary Check — all tabs</h2>
       <button class="close-btn" onclick={onClose}>×</button>
     </header>
 
+    <div class="view-bar">
+      <button class="vbtn" class:active={view === "consistency"} onclick={() => (view = "consistency")}>Consistency</button>
+      <button class="vbtn" class:active={view === "abbrev"} onclick={() => (view = "abbrev")}>
+        Abbreviations in dialogue{abbrevHits.length > 0 ? ` (${abbrevHits.length})` : ""}
+      </button>
+    </div>
+
+    {#if view === "consistency"}
     {#if !hasGlossary}
       <div class="empty">No glossary entries with English renderings yet — add some to check consistency.</div>
     {:else if flags.length === 0}
@@ -231,13 +296,44 @@
       </div>
       {/if}
     {/if}
+    {:else}
+      <!-- Abbreviations-in-dialogue pass — advisory only, no auto-change. -->
+      {#if abbrevHits.length === 0}
+        <div class="empty">No UI abbreviations found in dialogue — looks clean.</div>
+      {:else}
+        <div class="summary">
+          <strong>{abbrevHits.length}</strong> possible UI abbreviation{abbrevHits.length === 1 ? "" : "s"}
+          in dialogue across <strong>{abbrevGroups.length}</strong> file{abbrevGroups.length === 1 ? "" : "s"}.
+          These abbreviations appear in dialogue and may be UI terms that leaked in — consider spelling them
+          out (e.g. "ATK" → "attack power"). Suggestions only; nothing is changed automatically.
+        </div>
+        <div class="scroll">
+          {#each abbrevGroups as g (g.tabId)}
+            <div class="tab-section">
+              <div class="tab-head">{g.file} <span class="tab-count">{g.hits.length}</span></div>
+              {#each g.hits as h (h.instruction_index + "|" + h.term)}
+                <div class="row">
+                  <div class="abbrev-row">
+                    <div class="abbrev-main">
+                      <span class="chip"><span class="en">{h.term}</span></span>
+                      <span class="orig" title={h.snippet}>{truncate(h.snippet, 160)}</span>
+                    </div>
+                    <button class="open" onclick={() => jumpToAbbrev(h)} title="Open this row in the editor">Open row →</button>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    {/if}
 
     <footer>
-      {#if pendingCount > 0}
+      {#if view === "consistency" && pendingCount > 0}
         <span class="pending-note">{pendingCount} edited, not yet applied</span>
       {/if}
       <button class="btn" onclick={onClose}>Close</button>
-      {#if flags.length > 0}
+      {#if view === "consistency" && flags.length > 0}
         <button class="btn primary" disabled={pendingCount === 0} onclick={applyAll}>
           Apply all edits ({pendingCount})
         </button>
@@ -266,6 +362,13 @@
   .empty { padding: 32px 24px; text-align: center; color: #a0a0c0; font-size: 0.9rem; }
   .summary { padding: 12px 20px; font-size: 0.85rem; color: #c0c0e0; border-bottom: 1px solid #2a2a4a; }
   .summary strong { color: #f0a070; }
+  .view-bar { display: flex; gap: 6px; padding: 10px 20px; border-bottom: 1px solid #2a2a4a; }
+  .vbtn { padding: 4px 14px; border: 1px solid #34345a; border-radius: 6px; background: #16162e; color: #b0b0d0; cursor: pointer; font-size: 0.82rem; }
+  .vbtn:hover { background: #22224a; }
+  .vbtn.active { background: #2a3a6e; border-color: #6c9bd2; color: #cfe0ff; }
+  .abbrev-row { display: flex; align-items: center; gap: 10px; }
+  .abbrev-main { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
+  .abbrev-main .orig { margin-bottom: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .filter-bar { display: flex; align-items: center; gap: 6px; padding: 10px 20px; border-bottom: 1px solid #2a2a4a; }
   .flabel { color: #8a8aae; font-size: 0.8rem; margin-right: 2px; }
   .fbtn { padding: 3px 12px; border: 1px solid #34345a; border-radius: 999px; background: #16162e; color: #b0b0d0; cursor: pointer; font-size: 0.78rem; }

@@ -254,6 +254,17 @@
    *  in one session. Cleared when the dialog closes. */
   let added = $state<Set<string>>(new Set());
 
+  /** Per-term English the user typed inline before adding. Falls back to any
+   *  AI suggestion so the field is pre-filled when one exists. */
+  let drafts = $state<Map<string, string>>(new Map());
+  function draftFor(term: string): string {
+    return drafts.get(term) ?? suggestions.get(term) ?? "";
+  }
+  function setDraft(term: string, value: string) {
+    drafts.set(term, value);
+    drafts = new Map(drafts);
+  }
+
   function addOne(term: string) {
     if (added.has(term)) return;
     const target = getTargetGlossary();
@@ -263,8 +274,8 @@
       added = new Set(added);
       return;
     }
-    // Carry any suggested translation (offline hit or provider result).
-    const english = suggestions.get(term) ?? "";
+    // Use the inline-typed English (or any suggestion it was pre-filled from).
+    const english = draftFor(term).trim();
     target.push({ japanese: term, english, notes: "", category: "" });
     // Global glossary persists to settings; project rides tab.isDirty.
     if (activeView === "global") persistAllSettingsDebounced();
@@ -488,6 +499,15 @@
           {#if added.has(c.term)}
             <span class="added">✓ added</span>
           {:else}
+            <input
+              class="en-input"
+              placeholder="English…"
+              value={draftFor(c.term)}
+              oninput={(e) => setDraft(c.term, e.currentTarget.value)}
+              onclick={(e) => e.stopPropagation()}
+              onkeydown={(e) => { if (e.key === "Enter") addOne(c.term); }}
+              title="Type the English translation, then Add (or press Enter)"
+            />
             <button class="add-btn" onclick={() => addOne(c.term)}>Add</button>
           {/if}
         </div>
@@ -764,6 +784,19 @@
     font-size: 0.7rem;
     color: #6a6a8a;
     font-style: italic;
+  }
+  .en-input {
+    width: 160px;
+    background: #0f0f20;
+    border: 1px solid #3a3a5a;
+    color: #d8d8f0;
+    border-radius: 3px;
+    font-size: 0.75rem;
+    padding: 3px 7px;
+  }
+  .en-input:focus {
+    outline: none;
+    border-color: #8ab4f8;
   }
   .add-btn {
     background: #1a1a3e;

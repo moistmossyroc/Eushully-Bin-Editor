@@ -26,6 +26,7 @@
     {
       title: "Global",
       shortcuts: [
+        { keys: ["F1"], description: "Open the Help Center" },
         { keys: ["?"], description: "Open this shortcuts dialog" },
         { keys: ["Ctrl", "Shift", "F"], description: "Toggle Global Search panel" },
         { keys: ["Esc"], description: "Close active dialog / overlay" },

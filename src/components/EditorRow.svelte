@@ -8,6 +8,7 @@
   import { confirmDialog } from "../lib/confirm";
   import { clampToViewport } from "../lib/clampMenu";
   import { toastError } from "../lib/toast";
+  import { isNameItemFile } from "../lib/fileCategory";
 
   interface Props {
     entry: DialogueEntry;
@@ -18,19 +19,28 @@
 
   let { entry, index, onInsertInstruction, lineGroupCount }: Props = $props();
 
-  /** Only these labels allow editing the translated text column */
+  /** Labels that always allow editing the translated text column. `set-string`
+   *  is intentionally NOT here — it's the structural speaker slot in scene/UI
+   *  BINs (editing it breaks the 【name】 rendering) and is only unlocked in
+   *  character/item NAME files where it IS the translatable name table. */
   const EDITABLE_LABELS = new Set([
     "show-text",
     "display-furigana",
     "comment",
-    "set-string",
     "draw-string",
   ]);
 
   /** Parente (Unity Lua) tabs: every extracted row is a translatable string
    *  literal, regardless of its enclosing-function label. */
   let isParente = $derived(store.activeTab?.format === "parente");
-  let isTranslatable = $derived(isParente || EDITABLE_LABELS.has(entry.label));
+  /** True when the active tab is a character/item NAME file → `set-string`
+   *  rows are editable (the names are typeable). */
+  let isNameItemTab = $derived(isNameItemFile(store.activeTab?.sourceBinFilename ?? ""));
+  let isTranslatable = $derived(
+    isParente ||
+    EDITABLE_LABELS.has(entry.label) ||
+    (entry.label === "set-string" && isNameItemTab),
+  );
 
   /** Hover state for the 💡 chip's preview popup — shows the full block fill
    *  before the user clicks, so they can verify what will be applied. */

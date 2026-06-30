@@ -1,5 +1,8 @@
 pub mod apply;
+pub mod bilingual;
 pub mod bridge;
+pub mod dual_language;
 pub mod characters;
 pub mod extract;
+pub mod game_profile;
 pub mod wrap;

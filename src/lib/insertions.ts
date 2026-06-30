@@ -439,6 +439,48 @@ export function unsplitContinuation(entry: DialogueEntry): string | null {
   return null;
 }
 
+/**
+ * Revert EVERY auto-split beat in the active tab back to one entry per beat with
+ * its full English restored — the inverse of a bulk auto-split + paginate.
+ *
+ * Loops `unsplitContinuation` (which merges a beat's continuation show-text
+ * lines, their end-text-lines AND box bridges back into the parent and deletes
+ * the synthetic rows) until no auto-split continuation rows remain. Rows that
+ * can't be reverted are recorded and skipped so the loop can't spin forever.
+ *
+ * This is the "revert to original" half of the Re-flow tool: revert here, set
+ * new box caps, then re-split — fixing translations wrapped for the wrong box
+ * geometry without re-translating. Returns how many beats were reverted.
+ */
+export function revertAllAutoSplits(): { reverted: number; errors: string[] } {
+  const tab = store.activeTab;
+  const out = { reverted: 0, errors: [] as string[] };
+  if (!tab) return out;
+
+  // Each call collapses one beat's whole split group, so re-scan after each;
+  // skip rows that fail (tracked by id) instead of retrying them forever.
+  const failed = new Set<number>();
+  const maxIterations = tab.entries.length + 16; // hard backstop
+  for (let guard = 0; guard < maxIterations; guard++) {
+    const cont = tab.entries.find(
+      (e) => isAutoSplitContinuation(e) && !failed.has(e.instruction_index),
+    );
+    if (!cont) break;
+    const err = unsplitContinuation(cont);
+    if (err) {
+      failed.add(cont.instruction_index);
+      if (out.errors.length < 5) out.errors.push(err);
+      continue;
+    }
+    out.reverted++;
+  }
+  if (out.reverted > 0) {
+    tab.isDirty = true;
+    tab.entries = [...tab.entries]; // one reactivity nudge after the in-place merges
+  }
+  return out;
+}
+
 /** Visible display length for a single dialogue entry (furigana-aware, strips 「」). */
 function singleEntryVisibleLength(e: DialogueEntry): number {
   // Pull these helpers from types.ts to avoid a circular import.
@@ -558,7 +600,35 @@ export function insertTextBoxBridge(
 export async function paginateBox(boxStartEntry: DialogueEntry, maxLinesPerBox: number): Promise<string | number> {
   const tab = store.activeTab;
   if (!tab) return "No active tab.";
+  // Fetch the box-transition bridge once, then delegate to the sync core.
+  let bridge: SerializedInstruction[];
+  try {
+    bridge = await getBridgeClone(tab.id);
+  } catch (err) {
+    return `No usable textbox bridge in this BIN: ${err}`;
+  }
+  return paginateBoxWithBridge(boxStartEntry, maxLinesPerBox, bridge);
+}
+
+/**
+ * Sync core of {@link paginateBox}: the caller supplies the box-transition
+ * `bridge` so a bulk pass can fetch it ONCE (getBridgeClone) and paginate many
+ * boxes with no IPC round-trip and no Svelte repaint per box — every insert
+ * coalesces into a single repaint. `speakerSetup` is empty by default: speaker
+ * carry-over to continuation boxes isn't possible (in Sankai the name plate +
+ * color + portrait are established per-box by the voice block, which can't be
+ * cloned), so continuation boxes render in narrator color (text stays correct).
+ */
+export function paginateBoxWithBridge(
+  boxStartEntry: DialogueEntry,
+  maxLinesPerBox: number,
+  bridge: SerializedInstruction[],
+  speakerSetup: SerializedInstruction[] = [],
+): string | number {
+  const tab = store.activeTab;
+  if (!tab) return "No active tab.";
   if (maxLinesPerBox < 1) return "Max lines per box must be ≥ 1.";
+  if (!bridge || bridge.length === 0) return "No usable textbox bridge in this BIN.";
 
   const startIdx = tab.entries.indexOf(boxStartEntry);
   if (startIdx === -1) return "Box start not found.";
@@ -597,19 +667,6 @@ export async function paginateBox(boxStartEntry: DialogueEntry, maxLinesPerBox: 
     }
   }
   if (breakAfter.length === 0) return "Box already fits the line limit.";
-
-  // Fetch the box-transition bridge (carries the engine box-advance call) once.
-  let bridge: SerializedInstruction[];
-  try {
-    bridge = await getBridgeClone(tab.id);
-  } catch (err) {
-    return `No usable textbox bridge in this BIN: ${err}`;
-  }
-  // Speaker carry-over to continuation boxes is NOT possible: in Sankai the
-  // name plate + color + portrait are all established per-box by the voice
-  // (play-voice) block, which crashes when cloned and sets nothing without the
-  // voice. So continuation boxes render in narrator color (text is correct).
-  const speakerSetup: SerializedInstruction[] = [];
 
   // Insert in REVERSE so earlier entries' positions stay valid.
   for (const e of [...breakAfter].reverse()) {

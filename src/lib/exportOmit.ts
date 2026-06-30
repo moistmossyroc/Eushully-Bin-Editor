@@ -1,15 +1,29 @@
 import type { TabState } from "./stores.svelte";
 import type { DialogueEntry } from "./types";
+import { isNameItemFile } from "./fileCategory";
 
 /** Labels eligible for auto-omit / bulk-omit. EXCLUDES `set-string` and
  *  `draw-string` — those populate game-state slots (speaker names, UI labels,
  *  etc.) where emptying them produces visible breakage. Their per-row Export
- *  checkbox still works for explicit user overrides; just not for bulk/auto. */
+ *  checkbox still works for explicit user overrides; just not for bulk/auto.
+ *
+ *  EXCEPTION: in character/item NAME files (CVINIT/CIINIT/… — see
+ *  `isNameItemFile`) the `set-string` writes ARE the translatable name table, so
+ *  they're treated as editable there. `isRowLabelEditable` folds that in. */
 const EDITABLE_LABELS = new Set([
   "show-text",
   "display-furigana",
   "comment",
 ]);
+
+/** Whether a row's label is editable/omit-eligible. `set-string` is unlocked
+ *  ONLY in name/item files; in scene/UI files it stays the protected speaker
+ *  slot. `sourceBinFilename` is the owning tab's BIN filename. */
+function isRowLabelEditable(label: string, sourceBinFilename: string): boolean {
+  if (EDITABLE_LABELS.has(label)) return true;
+  if (label === "set-string" && isNameItemFile(sourceBinFilename)) return true;
+  return false;
+}
 
 /** Returns true when a string is empty or contains only structural markup
  *  (brackets and whitespace, no real translatable content). Used to skip
@@ -50,16 +64,16 @@ export function hasTranslatableContent(text: string): boolean {
  *  Excludes: deleted, context, non-editable, and translated rows (no checkbox). */
 /** An editable text row (show-text / display-furigana / comment) carrying real
  *  content — the universe the Export Review can show under "All editable". */
-export function isEditableRow(e: DialogueEntry): boolean {
+export function isEditableRow(e: DialogueEntry, sourceBinFilename: string): boolean {
   if (e.deleted || e.is_context_row) return false;
-  if (!EDITABLE_LABELS.has(e.label)) return false;
+  if (!isRowLabelEditable(e.label, sourceBinFilename)) return false;
   if (isStructuralOnly(e.original_text)) return false;
   return true;
 }
 
-export function isOmitEligible(e: DialogueEntry): boolean {
+export function isOmitEligible(e: DialogueEntry, sourceBinFilename: string): boolean {
   if (e.deleted || e.is_context_row) return false;
-  if (!EDITABLE_LABELS.has(e.label)) return false;
+  if (!isRowLabelEditable(e.label, sourceBinFilename)) return false;
   // Structural-only rows (brackets, empty, etc.) are not translatable content
   // — omitting them would wipe speaker-name brackets from the BIN.
   if (isStructuralOnly(e.original_text)) return false;
@@ -81,7 +95,7 @@ export function computeEmptyStats(tab: TabState | null | undefined): EmptyStats 
   let eligible = 0;
   let omitted = 0;
   for (const e of tab.entries) {
-    if (!isOmitEligible(e)) continue;
+    if (!isOmitEligible(e, tab.sourceBinFilename)) continue;
     eligible++;
     if (e.omit_export === true) omitted++;
   }
@@ -96,7 +110,7 @@ export function bulkSetOmitExport(tab: TabState | null | undefined, value: boole
   if (!tab) return 0;
   let changed = 0;
   const next = tab.entries.map((e) => {
-    if (!isOmitEligible(e)) return e;
+    if (!isOmitEligible(e, tab.sourceBinFilename)) return e;
     if ((e.omit_export === true) === value) return e;
     changed++;
     return { ...e, omit_export: value };

@@ -9,6 +9,7 @@
   import { path } from "@tauri-apps/api";
   import { openFolderInExplorer } from "../lib/ipc";
   import { toastError } from "../lib/toast";
+  import { store } from "../lib/stores.svelte";
 
   interface Props {
     onClose: () => void;
@@ -77,6 +78,7 @@
   </div>
 
   <footer>
+    <button class="btn" onclick={() => { store.helpOpen = true; onClose(); }}>Open Help Center</button>
     <button class="btn" onclick={onClose}>Close</button>
   </footer>
 </div>

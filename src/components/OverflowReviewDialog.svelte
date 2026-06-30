@@ -1,5 +1,6 @@
 <script lang="ts">
   import { store } from "../lib/stores.svelte";
+  import { tick } from "svelte";
   import { confirmDialog } from "../lib/confirm";
   import { findOverflows, findBoxOverflows, entryDisplayLength, type OverflowRow, type BoxOverflow } from "../lib/overflow";
   import { autoSplitEntry, optimizeEntry } from "../lib/ipc";
@@ -28,7 +29,22 @@
   });
 
   let working = $state(false);
-  let progress = $state<{ current: number; total: number; action: string } | null>(null);
+  let progress = $state<{ current: number; total: number; action: string; cancellable?: boolean } | null>(null);
+
+  // Re-flow inputs — pre-filled from the current caps; the user corrects them to
+  // the game's real box geometry (e.g. 47 × 2) before rebuilding the layout.
+  let reflowLineCap = $state(store.translatedLineCharCap > 0 ? store.translatedLineCharCap : 47);
+  let reflowLinesPerBox = $state(store.maxLinesPerBox > 0 ? store.maxLinesPerBox : 2);
+
+  /** Close the dialog; if a bulk pass is running, request its cancel too so
+   *  closing it doesn't orphan a long run (it stops after the current file). */
+  function handleClose() {
+    if (working) {
+      store.bulkCancelRequested = true;
+      store.statusMessage = "Stopping after the current file…";
+    }
+    onClose();
+  }
 
   // Line-splitting (wrapping within one box) needs only a per-line cap.
   let canAutoSplit = $derived(store.translatedLineCharCap > 0);
@@ -36,6 +52,16 @@
   // carries the engine "advance box" call — so it needs a usable bridge.
   let templateQuality = $derived(store.activeTab?.bridgeTemplateQuality);
   let canAddBoxes = $derived(templateQuality === "clean" || templateQuality === "degraded");
+
+  /** Name of the first OTHER open tab whose bridge we could borrow (donor), or null. */
+  let donorName = $derived.by<string | null>(() => {
+    const a = store.activeTab;
+    const d = store.tabs.find(
+      (t) => t.id !== a?.id && (t.bridgeTemplateQuality === "clean" || t.bridgeTemplateQuality === "degraded"),
+    );
+    return d ? (d.sourceBinFilename || d.id) : null;
+  });
+
 
   /** Total splittable overflowing rows across ALL open tabs (for the global
    *  split action — so the user doesn't have to visit each tab after a CC import). */
@@ -129,17 +155,19 @@
     }
     store.captureBulkUndo("Paginate boxes", [tab]);
     working = true;
-    let done = 0;
-    for (const box of [...tooLong].sort((a, b) => b.index - a.index)) {
-      const startEntry = tab.entries[box.index];
-      if (!startEntry) continue;
-      const result = await paginateBox(startEntry, store.maxLinesPerBox);
-      if (typeof result === "number" && result > 0) done++;
-    }
+    progress = { current: 0, total: 0, action: "Paginating" };
+    await tick();
+    // Delegate to the shared routine — fetches the box bridge once and paginates
+    // synchronously (one repaint) instead of an IPC + repaint per box.
+    const { bulkPaginateActiveTab } = await import("../lib/actions");
+    const r = await bulkPaginateActiveTab();
     tab.entries = [...tab.entries];
     tab.isDirty = true;
     working = false;
-    store.statusMessage = `Paginated ${done} box(es) into multiple boxes`;
+    progress = null;
+    let msg = `Paginated ${r.paginated} box(es) into multiple boxes`;
+    if (r.errors.length > 0) msg += ` (${r.errors.length} issue(s))`;
+    store.statusMessage = msg;
   }
 
   /** Global paginate: split over-long boxes into multiple boxes across EVERY
@@ -148,17 +176,18 @@
     if (working) return;
     store.captureBulkUndo("Paginate — all tabs", [...store.tabs]);
     working = true;
-    progress = { current: 0, total: store.tabs.length, action: "Paginating all tabs" };
+    progress = { current: 0, total: store.tabs.length, action: "Paginating all tabs", cancellable: true };
+    await tick();
     const { bulkPaginateAllTabs } = await import("../lib/actions");
     const r = await bulkPaginateAllTabs((current, total, name) => {
-      progress = { current, total, action: `Paginating ${name}` };
+      progress = { current, total, action: `Paginating ${name}`, cancellable: true };
     });
     working = false;
     progress = null;
     if (store.activeTab) store.activeTab.entries = [...store.activeTab.entries]; // nudge
     const parts = [`${r.paginated} box(es) across ${r.tabsProcessed} tab(s)`];
     if (r.errors.length > 0) parts.push(`${r.errors.length} issue(s)`);
-    store.statusMessage = `Paginate all tabs — ${parts.join(", ")}`;
+    store.statusMessage = `${r.cancelled ? "Paginate STOPPED" : "Paginate all tabs"} — ${parts.join(", ")}`;
   }
 
   /** Global split: run the line-split across EVERY open tab in one go (the
@@ -167,17 +196,67 @@
     if (working) return;
     store.captureBulkUndo("Split lines — all tabs", [...store.tabs]);
     working = true;
-    progress = { current: 0, total: store.tabs.length, action: "Splitting all tabs" };
+    progress = { current: 0, total: store.tabs.length, action: "Splitting all tabs", cancellable: true };
+    await tick();
     const { bulkAutoSplitAllTabs } = await import("../lib/actions");
     const r = await bulkAutoSplitAllTabs((current, total, name) => {
-      progress = { current, total, action: `Splitting ${name}` };
+      progress = { current, total, action: `Splitting ${name}`, cancellable: true };
     });
     working = false;
     progress = null;
     if (store.activeTab) store.activeTab.entries = [...store.activeTab.entries]; // nudge
     const parts = [`${r.split} fixed across ${r.tabsProcessed} tab(s)`];
     if (r.failed > 0) parts.push(`${r.failed} failed`);
-    store.statusMessage = `Split all tabs — ${parts.join(", ")}`;
+    store.statusMessage = `${r.cancelled ? "Split STOPPED" : "Split all tabs"} — ${parts.join(", ")}`;
+  }
+
+  /** Re-flow: revert every existing split, then re-wrap + re-paginate at the
+   *  caps in the re-flow inputs. The fix for translations baked at the wrong box
+   *  geometry (e.g. 50×3 when the game is 47×2) — text is preserved, only the
+   *  line/box layout is rebuilt. `allTabs` does it across every open tab. */
+  async function handleReflow(allTabs: boolean) {
+    if (working) return;
+    const tab = store.activeTab;
+    if (!tab) return;
+    if (reflowLineCap < 1 || reflowLinesPerBox < 1) {
+      store.statusMessage = "Set chars/line and lines/box (both ≥ 1) first.";
+      return;
+    }
+    const scope = allTabs ? `all ${store.tabs.length} open tabs` : "this tab";
+    const ok = await confirmDialog({
+      title: "Re-flow to box caps",
+      confirmLabel: "Re-flow",
+      message:
+        `Revert every existing split in ${scope} and rebuild the layout at ` +
+        `${reflowLineCap} chars/line × ${reflowLinesPerBox} lines/box?\n\n` +
+        `Your translations are preserved — only the line/box wrapping is redone. ` +
+        `This overwrites all current auto-split + pagination (undoable). Export afterward to save to the BIN.`,
+    });
+    if (!ok) return;
+    store.captureBulkUndo(allTabs ? "Re-flow — all tabs" : "Re-flow", allTabs ? [...store.tabs] : [tab]);
+    working = true;
+    progress = { current: 0, total: allTabs ? store.tabs.length : 1, action: "Re-flowing", cancellable: allTabs };
+    await tick(); // paint the progress overlay before the heavy work starts
+    const { reflowActiveTab, reflowAllTabs } = await import("../lib/actions");
+    let msg: string;
+    if (allTabs) {
+      const r = await reflowAllTabs(reflowLineCap, reflowLinesPerBox, (current, total, name) => {
+        progress = { current, total, action: `Re-flowing ${name}`, cancellable: true };
+      });
+      const head = r.cancelled ? "Re-flow STOPPED" : "Re-flow all tabs";
+      msg = `${head} — ${r.reverted} beats reverted, ${r.split} re-wrapped, ${r.paginated} paginated across ${r.tabsProcessed} tab(s)`;
+      if (r.errors.length > 0) msg += ` (${r.errors.length} issue(s), e.g. ${r.errors[0]})`;
+    } else {
+      const r = await reflowActiveTab(reflowLineCap, reflowLinesPerBox);
+      tab.entries = [...tab.entries];
+      tab.isDirty = true;
+      msg = `Re-flow — ${r.reverted} beats reverted, ${r.split} re-wrapped, ${r.paginated} paginated`;
+      if (r.errors.length > 0) msg += ` (e.g. ${r.errors[0]})`;
+    }
+    working = false;
+    progress = null;
+    if (store.activeTab) store.activeTab.entries = [...store.activeTab.entries]; // reactivity nudge
+    store.statusMessage = msg;
   }
 
   /** Bulk split: sequential pass through every splittable overflowing row.
@@ -196,6 +275,7 @@
 
     working = true;
     progress = { current: 0, total: candidateCount, action: "Splitting" };
+    await tick();
     // Delegate to the shared bulk routine (also used by auto-split-on-import).
     const { bulkAutoSplitActiveTab } = await import("../lib/actions");
     const r = await bulkAutoSplitActiveTab((current, total) => {
@@ -350,14 +430,52 @@
   }
 </script>
 
-<div class="dialog-backdrop" onclick={onClose} onkeydown={(e) => e.key === "Escape" && onClose()} role="presentation">
+<div class="dialog-backdrop" onclick={handleClose} onkeydown={(e) => e.key === "Escape" && handleClose()} role="presentation">
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="dialog" onclick={(e) => e.stopPropagation()}>
     <header>
       <h2>Overflow Review</h2>
-      <button class="close-btn" onclick={onClose}>×</button>
+      <button class="close-btn" onclick={handleClose}>×</button>
     </header>
+
+    <div class="reflow-bar">
+      <div class="reflow-head">
+        🔄 <strong>Re-flow to box caps</strong> — rebuild the line/box layout for a corrected box size. Reverts every existing split and re-wraps at the caps below; your translations are preserved.
+      </div>
+      <div class="reflow-controls">
+        <label>Chars/line <input type="number" min="1" max="200" bind:value={reflowLineCap} disabled={working} /></label>
+        <label>Lines/box <input type="number" min="1" max="10" bind:value={reflowLinesPerBox} disabled={working} /></label>
+        <button class="btn split" onclick={() => handleReflow(false)} disabled={working} title="Revert all splits in this tab and re-wrap at the caps above">
+          Re-flow this tab
+        </button>
+        {#if store.tabs.length > 1}
+          <button class="btn split" onclick={() => handleReflow(true)} disabled={working} title="Revert + re-wrap every open tab — fix a whole game's box geometry in one pass">
+            Re-flow all {store.tabs.length} tabs
+          </button>
+        {/if}
+        {#if !canAddBoxes}
+          <span class="no-bridge">No box bridge in this BIN — re-flow wraps lines only (no pagination).</span>
+        {/if}
+      </div>
+    </div>
+
+    {#if progress}
+      <div class="progress">
+        <span class="spinner"></span>
+        <span class="progress-text">{progress.action}…</span>
+        {#if progress.total > 0}<span class="progress-count">{progress.current} / {progress.total}</span>{/if}
+        {#if progress.cancellable}
+          <button
+            class="stop-btn"
+            onclick={() => { store.bulkCancelRequested = true; store.statusMessage = "Stopping after the current file…"; }}
+            disabled={store.bulkCancelRequested}
+          >
+            {store.bulkCancelRequested ? "Stopping…" : "Stop"}
+          </button>
+        {/if}
+      </div>
+    {/if}
 
     {#if store.tabs.length > 1 && (globalOverflowCount > 0 || globalBoxOverflowCount > 0)}
       <div class="global-bar">
@@ -400,7 +518,18 @@
               Paginate all
             </button>
           {:else if boxOverflows.some((b) => b.tooManyLines) && !canAddBoxes}
-            <span class="no-bridge">No box-transition bridge in this BIN — can't add boxes; shorten the line instead.</span>
+            {#if donorName}
+              <button
+                class="paginate-all"
+                onclick={handlePaginateAll}
+                disabled={working}
+                title={`This scene has no box bridge of its own — borrows a call-free box-open from ${donorName} (control-flow stripped; verified safe for event scenes).`}
+              >
+                Paginate all (borrowed from {donorName})
+              </button>
+            {:else}
+              <span class="no-bridge">No box bridge in this scene — open a scene that paginates (e.g. SC0000) in another tab to borrow one.</span>
+            {/if}
           {/if}
         </div>
         <div class="box-list">
@@ -446,12 +575,6 @@
           Optimize all (Claude API)
         </button>
       </div>
-
-      {#if progress}
-        <div class="progress">
-          {progress.action} {progress.current}/{progress.total}…
-        </div>
-      {/if}
 
       <div class="table-scroll">
         <table>
@@ -509,7 +632,7 @@
     {/if}
 
     <footer>
-      <button class="btn cancel" onclick={onClose}>Close</button>
+      <button class="btn cancel" onclick={handleClose}>Close</button>
     </footer>
   </div>
 </div>
@@ -653,6 +776,41 @@
     font-size: 0.8rem;
   }
 
+  .reflow-bar {
+    padding: 10px 20px;
+    background: #16261a;
+    border-bottom: 1px solid #2a4a30;
+  }
+  .reflow-head {
+    font-size: 0.83rem;
+    color: #a0d0a8;
+    line-height: 1.4;
+    margin-bottom: 8px;
+  }
+  .reflow-head strong { color: #b8e8c0; }
+  .reflow-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .reflow-controls label {
+    font-size: 0.8rem;
+    color: #c0c0e0;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .reflow-controls input {
+    width: 56px;
+    padding: 3px 6px;
+    background: #0e1530;
+    border: 1px solid #3a3a5a;
+    border-radius: 3px;
+    color: #e0e0f0;
+    font-size: 0.8rem;
+  }
+
   .global-bar {
     display: flex;
     align-items: center;
@@ -675,12 +833,45 @@
   }
 
   .progress {
-    padding: 8px 20px;
+    padding: 10px 20px;
     color: #8ab4f8;
     font-size: 0.85rem;
     border-bottom: 1px solid #2a2a4a;
     background: #0e1530;
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
+  .progress-text { flex: 1; }
+  .progress-count {
+    color: #b0c4e8;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid #2a3a5e;
+    border-top-color: #8ab4f8;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .stop-btn {
+    padding: 4px 14px;
+    border: 1px solid #d27c7c;
+    border-radius: 4px;
+    background: #2a1414;
+    color: #f0a0a0;
+    cursor: pointer;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+  .stop-btn:hover:not(:disabled) { background: #3a1a1a; }
+  .stop-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .table-scroll {
     flex: 1;

@@ -15,6 +15,17 @@ export function loadBin(tabId: string, path: string): Promise<LoadBinResult> {
   return invoke<LoadBinResult>("load_bin", { tabId, path });
 }
 
+export interface EngineInfo {
+  sys_version: number;
+  engine_version: number;
+  engine_label: string;
+}
+
+/** Engine/build info for an already-loaded tab (project-restore path). */
+export function getEngineInfo(tabId: string): Promise<EngineInfo> {
+  return invoke<EngineInfo>("get_engine_info", { tabId });
+}
+
 /** Load a project JSON file. */
 export function loadProject(path: string): Promise<ProjectFile> {
   return invoke<ProjectFile>("load_project", { path });
@@ -174,6 +185,90 @@ export function exportBin(
     outputPath,
     entries,
     insertedInstructions: resolveInsertionsForExport(insertedInstructions, entries),
+  });
+}
+
+/** One BIN to pack into a .fanpatch: which tab + the name the game requests it by. */
+export interface FanpatchItem {
+  tabId: string;
+  filename: string;
+  entries: DialogueEntry[];
+  insertedInstructions: InsertedInstruction[];
+}
+
+export interface FanpatchResult {
+  written: number;
+  /** "<NAME>: <reason>" per skipped BIN (corruption guard / duplicate). */
+  skipped: string[];
+  /** True if version.dll (the drop-in loader) was written next to the patch. */
+  loader_written: boolean;
+}
+
+/**
+ * Export a `.fanpatch` (a ZIP of translated BINs, flat + request-named) for the
+ * version.dll fanpatch loader. Each item's insertions are resolved for export
+ * exactly like {@link exportBin}, so ordering/continuation text stay correct.
+ */
+export function exportFanpatch(
+  items: FanpatchItem[],
+  outputPath: string,
+  title: string,
+  label: string,
+  uiConfigPath: string
+): Promise<FanpatchResult> {
+  return invoke("export_fanpatch", {
+    items: items.map((it) => ({
+      tabId: it.tabId,
+      filename: it.filename,
+      entries: it.entries,
+      insertedInstructions: resolveInsertionsForExport(it.insertedInstructions, it.entries),
+    })),
+    outputPath,
+    title,
+    label,
+    uiConfigPath,
+  });
+}
+
+/**
+ * Package every file in `sourceDir` (flat) into a `.fanpatch`. `.BIN` files are
+ * validated; other assets pass through. Use to zip an already-translated folder.
+ */
+export function packFanpatchFromDir(
+  sourceDir: string,
+  outputPath: string,
+  title: string,
+  label: string,
+  uiConfigPath: string
+): Promise<FanpatchResult> {
+  return invoke("pack_fanpatch_from_dir", { sourceDir, outputPath, title, label, uiConfigPath });
+}
+
+/**
+ * Build a `.fanpatch` from a folder of translated (English) BINs against their
+ * Japanese originals in `jpDir`. `bilingual=false` = narrator-box repair only;
+ * `bilingual=true` = repair + in-game mid-scene EN↔JP switching. BINs that can't
+ * be paired/aligned ship unchanged (reported in `skipped`).
+ */
+export function packDualLanguageFanpatch(
+  enDir: string,
+  jpDir: string,
+  agfDir: string,
+  bilingual: boolean,
+  outputPath: string,
+  title: string,
+  label: string,
+  uiConfigPath: string
+): Promise<FanpatchResult> {
+  return invoke("pack_dual_language_fanpatch", {
+    enDir,
+    jpDir,
+    agfDir,
+    bilingual,
+    outputPath,
+    title,
+    label,
+    uiConfigPath,
   });
 }
 
@@ -429,6 +524,26 @@ export function autoSplitEntry(
   });
 }
 
+export interface SplitRequest {
+  translated_text: string;
+  entry_index: number;
+}
+
+export interface SplitOutcome {
+  entry_index: number;
+  plan: import("./types").SplitPlan | null;
+  error: string | null;
+}
+
+/** Compute split plans for many overflowing entries in a single round-trip. */
+export function autoSplitEntriesBatch(
+  tabId: string,
+  items: SplitRequest[],
+  lineCharCap: number,
+): Promise<SplitOutcome[]> {
+  return invoke<SplitOutcome[]>("auto_split_entries_batch", { tabId, items, lineCharCap });
+}
+
 /** Get the bridge template quality for a tab's loaded BIN. */
 export function getBridgeTemplateStatus(tabId: string): Promise<string> {
   return invoke<string>("get_bridge_template_status", { tabId });
@@ -488,6 +603,65 @@ export function listInitBinNames(binPaths: string[]): Promise<InitNameCandidate[
 /** Open a folder in the OS-native file explorer. */
 export function openFolderInExplorer(folderPath: string): Promise<void> {
   return invoke<void>("open_folder_in_explorer", { folderPath });
+}
+
+/** An AGE script BIN found by scanning a game folder, classified for the picker. */
+export interface SysBinFile {
+  path: string;
+  filename: string;
+  /** Filename with the `$N$` update-layer prefix stripped. */
+  base_name: string;
+  /** Eushully update layer ($1$/$2$…); 0 = unprefixed. */
+  layer: number;
+  sys_version: number;
+  /** Picker bucket: "names" (character/item name tables) | "sc" (story scenes)
+   *  | "sp" (special scenes) | "ui" (menu/system text) | "other" (everything
+   *  else). */
+  category: string;
+  /** Count of translatable strings (0 ⇒ data BIN; the picker hides these). */
+  string_count: number;
+  /** Dialogue is mostly Latin → likely already-translated / not original. */
+  likely_translated: boolean;
+  size: number;
+  /** Present only for entries packed in a .alf archive (extract on open). */
+  alf_archive_index?: number;
+  alf_offset?: number;
+  alf_length?: number;
+}
+
+/** Scan a folder for AGE script .BIN files (SYS3/4/5) — loose files plus the
+ *  base BINs packed in `.alf` archives (loose overrides archived). `spPrefixes`
+ *  are the filename prefixes that mark special scenes (empty → defaults to SP). */
+export function scanBinFolder(folderPath: string, spPrefixes: string[]): Promise<SysBinFile[]> {
+  return invoke<SysBinFile[]>("scan_bin_folder", { folderPath, spPrefixes });
+}
+
+/** One packed entry to extract. */
+export interface AlfRef {
+  archive_index: number;
+  offset: number;
+  length: number;
+  name: string;
+}
+
+/** Extract packed .alf entries from a game folder into dest as real .BIN files. */
+export function extractAlfToFolder(gameDir: string, destFolder: string, entries: AlfRef[]): Promise<string[]> {
+  return invoke<string[]>("extract_alf_to_folder", { gameDir, destFolder, entries });
+}
+
+/** Whether a path is a directory (backend check — not fs-plugin-scoped). */
+export function pathIsDir(path: string): Promise<boolean> {
+  return invoke<boolean>("path_is_dir", { path });
+}
+
+/** Probe whether a folder can be written to (detects admin-locked game folders). */
+export function isFolderWritable(folderPath: string): Promise<boolean> {
+  return invoke<boolean>("is_folder_writable", { folderPath });
+}
+
+/** Copy files into a destination folder (created if needed); returns new paths. */
+export function copyFilesToFolder(sources: string[], destFolder: string): Promise<string[]> {
+  return invoke<string[]>("copy_files_to_folder", { sources, destFolder });
 }
 
 export interface ProjectBackupInfo {

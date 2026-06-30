@@ -4,6 +4,7 @@
   import { store } from "../lib/stores.svelte";
   import { fetchAvailableModels } from "../lib/ipc";
   import { confirmDialog } from "../lib/confirm";
+  import { open } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
   import ModelCombobox from "./ModelCombobox.svelte";
 
@@ -181,6 +182,19 @@
 
   async function persistSettings() {
     await persistAllSettings();
+  }
+
+  /** Pick a UI translation table file (`fanpatch_ui.txt`) to bundle inside the
+   *  exported `.fanpatch`. Stored as an absolute path on the store. */
+  async function handleBrowseUiConfig() {
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: "Text Files", extensions: ["txt"] }],
+    });
+    if (typeof selected === "string") {
+      store.fanpatchUiConfigPath = selected;
+      await persistSettings();
+    }
   }
 
   async function handleRefreshModels() {
@@ -523,6 +537,42 @@
           fourth line. Default 3 for most Eushully games.
         </p>
 
+        <label class="setting-field">
+          <span>Special-scene file prefix(es)</span>
+          <input
+            type="text"
+            bind:value={store.spScenePrefixes}
+            onchange={persistSettings}
+            placeholder="SP"
+          />
+        </label>
+
+        <p class="setting-hint">
+          Comma-separated filename prefix(es) that group BINs under the
+          <strong>Special scenes (SP)</strong> bucket in the game-folder picker.
+          Default <code>SP</code>. Story scenes (<code>SC…</code>) and UI/system
+          files are detected automatically.
+        </p>
+
+        <label class="setting-field">
+          <span>Remembered workspaces: {Object.keys(store.workspaceFolders).length}</span>
+          <div class="ui-config-row">
+            <button
+              class="refresh-btn"
+              disabled={Object.keys(store.workspaceFolders).length === 0}
+              onclick={() => { store.workspaceFolders = {}; persistSettings(); }}
+              title="Forget all saved game-folder → workspace mappings"
+            >Clear remembered workspace folders</button>
+          </div>
+        </label>
+
+        <p class="setting-hint">
+          When you open an archived game from a read-only folder (e.g. a game in
+          Program Files), the editor remembers the writable workspace you chose
+          and reuses it next time — skipping re-extraction of files already there.
+          Clear this if a mapping points at the wrong or a stale folder.
+        </p>
+
         <label class="setting-field checkbox-field">
           <input
             type="checkbox"
@@ -574,6 +624,64 @@
           overflowing rows are fixed without opening the Overflow dialog per file.
           Requires a per-line cap. Rows that can't be split (no bridge in that
           BIN) are still flagged for manual shortening. Default OFF.
+        </p>
+      </section>
+
+      <section class="setting-group">
+        <h3>Fanpatch title bar</h3>
+
+        <label class="setting-field">
+          <span>Title</span>
+          <input
+            type="text"
+            bind:value={store.fanpatchTitle}
+            onchange={persistSettings}
+            placeholder="Battle Goddess ZERO"
+          />
+        </label>
+
+        <label class="setting-field">
+          <span>Label</span>
+          <input
+            type="text"
+            bind:value={store.fanpatchLabel}
+            onchange={persistSettings}
+            placeholder="Fanpatch v1.0"
+          />
+        </label>
+
+        <p class="setting-hint">
+          Bundled inside the exported <code>.fanpatch</code> as
+          <code>fanpatch_title.txt</code>. The loader shows
+          <em>&lt;title&gt; [&lt;label&gt; - English]</em> in the window title
+          bar. Leave both blank to use the loader's defaults.
+        </p>
+
+        <label class="setting-field">
+          <span>UI translation file</span>
+          <div class="ui-config-row">
+            <input
+              type="text"
+              readonly
+              value={store.fanpatchUiConfigPath}
+              placeholder="(none — optional)"
+              title={store.fanpatchUiConfigPath}
+            />
+            <button class="refresh-btn" onclick={handleBrowseUiConfig}>Browse…</button>
+            {#if store.fanpatchUiConfigPath}
+              <button
+                class="refresh-btn"
+                onclick={() => { store.fanpatchUiConfigPath = ""; persistSettings(); }}
+                title="Don't bundle a UI translation file"
+              >Clear</button>
+            {/if}
+          </div>
+        </label>
+
+        <p class="setting-hint">
+          Optional. Bundled into the <code>.fanpatch</code> as
+          <code>fanpatch_ui.txt</code> — the loader swaps menu/system UI strings
+          with the in-game language toggle. Leave empty to skip.
         </p>
       </section>
       {:else if activeTab === "translation"}
@@ -1075,6 +1183,27 @@
   .apply-all-btn:hover {
     background: #2a3a5e;
     border-color: #4a6a8a;
+  }
+
+  .ui-config-row {
+    display: flex;
+    gap: 6px;
+  }
+
+  .ui-config-row input {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid #3a3a5a;
+    border-radius: 4px;
+    background: #16213e;
+    color: #c0c0e0;
+    font-size: 0.85rem;
+    outline: none;
+    min-width: 0;
+  }
+
+  .ui-config-row input:focus {
+    border-color: #6c9bd2;
   }
 
   .endpoint-row {

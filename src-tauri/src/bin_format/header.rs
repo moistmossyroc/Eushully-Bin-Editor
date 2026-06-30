@@ -31,6 +31,25 @@ pub struct Header {
     pub is_ver5: bool,
     /// Engine version number extracted from signature (3, 4, or 5)
     pub sys_version: u8,
+    /// Full AGE engine build version from the signature digits after "SYS<n>"
+    /// (e.g. `SYS4443` → 443). Distinguishes games/builds within one sys_version:
+    /// 415 = Ikusa Megami Zero, 443 = Madou Koukaku, 448 = Sankai no Yubiwa. Used
+    /// to select per-build handling (speaker/bridge mechanisms differ per build).
+    pub engine_version: u16,
+}
+
+/// Parse the build version from the signature: the run of ASCII digits starting
+/// right after "SYS<n>" (index 4). `SYS4443 ` → 443.
+fn parse_engine_version(signature: &[u8; 8]) -> u16 {
+    let mut v: u16 = 0;
+    for &b in &signature[4..] {
+        if b.is_ascii_digit() {
+            v = v.wrapping_mul(10).wrapping_add((b - b'0') as u16);
+        } else {
+            break;
+        }
+    }
+    v
 }
 
 #[derive(Error, Debug)]
@@ -75,8 +94,10 @@ impl Header {
         let mut signature = [0u8; 8];
         signature.copy_from_slice(&data[0..8]);
         let sys_version = data[3] - b'0'; // '3' -> 3, '4' -> 4
+        let engine_version = parse_engine_version(&signature);
 
         Ok(Header {
+            engine_version,
             binary: BinaryHeader {
                 signature,
                 local_integer_1: read_u32(data, 0x08),
@@ -107,11 +128,13 @@ impl Header {
         for i in 0..8 {
             signature[i] = data[i * 2];
         }
+        let engine_version = parse_engine_version(&signature);
 
         // Fields start at offset 16 (after the 16-byte UTF-16 signature)
         let base = 16;
 
         Ok(Header {
+            engine_version,
             binary: BinaryHeader {
                 signature,
                 local_integer_1: read_u32(data, base),

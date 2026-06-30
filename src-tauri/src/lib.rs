@@ -1,3 +1,4 @@
+pub mod alf;
 pub mod bin_format;
 pub mod claude;
 pub mod commands;
@@ -25,10 +26,14 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::load_bin,
+            commands::get_engine_info,
             commands::load_project,
             commands::load_bin_for_project,
             commands::save_project,
             commands::export_bin,
+            commands::export_fanpatch,
+            commands::pack_fanpatch_from_dir,
+            commands::pack_dual_language_fanpatch,
             commands::set_api_key,
             commands::get_api_key,
             commands::set_provider_config,
@@ -49,6 +54,7 @@ pub fn run() {
             commands::get_bridge_template_status,
             commands::get_split_capability,
             commands::auto_split_entry,
+            commands::auto_split_entries_batch,
             commands::export_glossary,
             commands::import_glossary,
             commands::fetch_available_models,
@@ -67,6 +73,11 @@ pub fn run() {
             commands::list_init_bin_names,
             commands::extract_chinit_id_name_map,
             commands::open_folder_in_explorer,
+            commands::scan_bin_folder,
+            commands::extract_alf_to_folder,
+            commands::path_is_dir,
+            commands::is_folder_writable,
+            commands::copy_files_to_folder,
             commands::relaunch_translation_folder,
             commands::list_project_backups,
             commands::diff_project_backup,

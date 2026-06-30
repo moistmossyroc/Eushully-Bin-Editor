@@ -51,6 +51,10 @@ export interface SerializedArg {
 export interface LoadBinResult {
   entries: DialogueEntry[];
   sys_version: number;
+  /** AGE engine build version from the signature (e.g. 443); 0 if unparsed. */
+  engine_version: number;
+  /** UI label, e.g. "Madou Koukaku · SYS4 (v443)". */
+  engine_label: string;
 }
 
 /** Mirrors Rust ProjectFile */

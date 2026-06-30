@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { pathIsDir } from "./lib/ipc";
   import Toolbar from "./components/Toolbar.svelte";
   import TabBar from "./components/TabBar.svelte";
   import EditorTable from "./components/EditorTable.svelte";
@@ -19,19 +20,21 @@
   import GlossaryAutoApplyDialog from "./components/GlossaryAutoApplyDialog.svelte";
   import OmittedCellsDialog from "./components/OmittedCellsDialog.svelte";
   import ParenteFilePickerDialog from "./components/ParenteFilePickerDialog.svelte";
+  import BinFolderPickerDialog from "./components/BinFolderPickerDialog.svelte";
   import TranslationStatusDialog from "./components/TranslationStatusDialog.svelte";
   import ModelPickerDialog from "./components/ModelPickerDialog.svelte";
   import DialogPreview from "./components/DialogPreview.svelte";
   import LoadingProgress from "./components/LoadingProgress.svelte";
   import BinViewerDialog from "./components/BinViewerDialog.svelte";
   import KeyboardShortcutsDialog from "./components/KeyboardShortcutsDialog.svelte";
+  import HelpDialog from "./components/HelpDialog.svelte";
   import ExportDiffDialog from "./components/ExportDiffDialog.svelte";
   import RestoreSessionDialog from "./components/RestoreSessionDialog.svelte";
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
   import ToastContainer from "./components/ToastContainer.svelte";
   import AutoSplitBadge from "./components/AutoSplitBadge.svelte";
   import { store } from "./lib/stores.svelte";
-  import { doLoadFile, doAutoSaveAll, doRefreshTranslationStatus, doImportSingleFolder, doOpenParenteGameFolder } from "./lib/actions";
+  import { doLoadFile, doAutoSaveAll, doRefreshTranslationStatus, doImportSingleFolder, doOpenParenteGameFolder, doOpenSysGameFolder } from "./lib/actions";
   import { loadSettings, fetchAvailableModels, getProviderConfig, setProviderConfig, getApiKey } from "./lib/ipc";
   import { detectMissingCJKFonts, isFontWarningDismissed, dismissFontWarning } from "./lib/fontCheck";
 
@@ -134,6 +137,11 @@
       if (typeof settings.autoSplitEnabled === "boolean") store.autoSplitEnabled = settings.autoSplitEnabled;
       if (typeof settings.autoSplitOnImport === "boolean") store.autoSplitOnImport = settings.autoSplitOnImport;
       if (typeof settings.lastParenteExportDir === "string") store.lastParenteExportDir = settings.lastParenteExportDir;
+      if (typeof settings.spScenePrefixes === "string") store.spScenePrefixes = settings.spScenePrefixes;
+      if (settings.workspaceFolders && typeof settings.workspaceFolders === "object") store.workspaceFolders = settings.workspaceFolders as Record<string, string>;
+      if (typeof settings.fanpatchTitle === "string") store.fanpatchTitle = settings.fanpatchTitle;
+      if (typeof settings.fanpatchLabel === "string") store.fanpatchLabel = settings.fanpatchLabel;
+      if (typeof settings.fanpatchUiConfigPath === "string") store.fanpatchUiConfigPath = settings.fanpatchUiConfigPath;
       // Provider config — persisted in settings.json so it survives app restarts
       // (Rust state is in-memory only). We still push it to Rust below so
       // translation commands see the right provider on this session.
@@ -271,17 +279,19 @@
           await doLoadFile(files[i]);
         }
         store.loadingProgress = null;
-        // A dropped folder → Parente game-folder mode. Detect "likely folder" by
-        // a basename with no file extension; the backend validates it's actually
-        // a game install (finds the Archives dir) and reports if not.
-        const likelyDirs = others.filter((p) => {
-          const base = p.replace(/\\/g, "/").split("/").pop() || "";
-          return !base.includes(".");
-        });
-        for (const p of likelyDirs) {
-          await doOpenParenteGameFolder(p);
+        // A dropped folder → game-folder mode. Detect folders by actually
+        // stat-ing each path (a name like "11. 戦女神VERITA" contains a dot, so
+        // the old "no extension" guess wrongly rejected it). Try the SYS3/4/5
+        // scan first (loose AGE BINs); fall back to Parente (.arc/UnityFS).
+        const dirs: string[] = [];
+        for (const p of others) {
+          if (await pathIsDir(p)) dirs.push(p);
         }
-        if (files.length === 0 && likelyDirs.length === 0 && paths.length > 0) {
+        for (const p of dirs) {
+          const handledAsSys = await doOpenSysGameFolder(p);
+          if (!handledAsSys) await doOpenParenteGameFolder(p);
+        }
+        if (files.length === 0 && dirs.length === 0 && paths.length > 0) {
           store.statusMessage = "Unsupported drop — drop a .BIN, .json, .arc, or a game folder";
         }
       }
@@ -349,6 +359,12 @@
         e.preventDefault();
         shortcutsDialogOpen = true;
       }
+    }
+
+    // F1 → open the Help Center.
+    if (e.key === "F1") {
+      e.preventDefault();
+      store.helpOpen = true;
     }
   }
 </script>
@@ -484,9 +500,21 @@
 
   {#if store.parenteArcRequest}
     <ParenteFilePickerDialog
-      title={store.parenteArcRequest.title}
-      files={store.parenteArcRequest.files}
+      title={store.parenteArcRequest?.title ?? ""}
+      files={store.parenteArcRequest?.files ?? []}
       onClose={() => (store.parenteArcRequest = null)}
+    />
+  {/if}
+
+  {#if store.sysBinFolderRequest}
+    <!-- The picker's load() nulls these requests via onClose() while still
+         running; `?.`/?? keep the props from throwing on the null transition
+         before Svelte tears this block down (the "reading 'files' of null" bug). -->
+    <BinFolderPickerDialog
+      folder={store.sysBinFolderRequest?.folder ?? ""}
+      files={store.sysBinFolderRequest?.files ?? []}
+      writable={store.sysBinFolderRequest?.writable ?? false}
+      onClose={() => (store.sysBinFolderRequest = null)}
     />
   {/if}
 
@@ -524,6 +552,10 @@
 
   {#if shortcutsDialogOpen}
     <KeyboardShortcutsDialog onClose={() => (shortcutsDialogOpen = false)} />
+  {/if}
+
+  {#if store.helpOpen}
+    <HelpDialog onClose={() => (store.helpOpen = false)} />
   {/if}
 
   <ToastContainer />

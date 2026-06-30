@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.4.0 — 2026-06-29
+
+### Added — archived-game support & staged translation
+- **Load games packed in `.alf` archives** (SYS3/4/5 folder loading + `.alf`
+  reader/writer). Read-only installs (e.g. `Program Files`) extract just the
+  selected scenes + character-name tables into a writable **workspace** you
+  choose — **remembered per game**, and later loads skip re-extracting files
+  already present.
+- **Staged folder picker, five categories** — *Character & item names · Story
+  scenes · Side scenes · UI & system · Other* — names-first, with files that have
+  no translatable text hidden behind a toggle.
+- **Character/item name-table translation** — `set-string` name tables
+  (CVINIT/CIINIT/CNINIT/…) are now editable and exported to CC Translate, which
+  orders name files first so scenes inherit the finalized names.
+- **`.fanpatch` loader configs bundled inside the zip** + in-editor title/label
+  fields (a shipped patch is just `version.dll` + one `.fanpatch`).
+- **UI-abbreviation leak check** under Glossary Check — flags stat abbreviations
+  (ATK/DEF/…) that landed in dialogue prose; glossary pre-fill no longer seeds
+  them into scene translations.
+- **Re-flow to box caps** — rebuild line/box layout at corrected geometry without
+  re-translating; call-free bridge pagination adds text boxes to bridge-less
+  event scenes.
+- **Export popover** (grouped, with descriptions) replacing the export dropdown,
+  and a **special-scene filename-prefix** setting.
+
+### Fixed
+- **Speaker names for SYS5-style ID-register SYS4 games** (e.g. 戦女神VERITA) now
+  resolve (the engine resolves character IDs at runtime; detection now handles
+  the `mov g-int`-before-`lookup-array` ordering).
+- Archived-game loading hardened end-to-end: `.alf` extraction is per-entry
+  best-effort, the workspace source path is captured correctly through dialog
+  close, and load failures surface a clear status instead of failing silently.
+
+### Changed
+- Native UI translation extended (Megami Zero menu / title bar); broader
+  load-flow error surfacing throughout the SYS folder pipeline.
+
 ## 1.3.2 — 2026-06-21
 
 ### Added — Export Review (was "Omit empty cells")

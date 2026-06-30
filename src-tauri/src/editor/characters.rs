@@ -777,6 +777,106 @@ pub fn extract_referenced_speakers_sys5_legacy(
         .collect()
 }
 
+/// Detect the speaker display-slot for SYS4 BINs that set the speaker via the
+/// `set-display-slot` opcode (`0x1D2`) instead of a set-string register — e.g.
+/// Megami Zero, where each dialogue beat is preceded by `0x1D2 [lit SLOT, lit ID]`
+/// and SLOT 2 carries the character ID (resolved to a name via CNINIT/CIINIT).
+///
+/// Generic detection (no per-game constant): among `0x1D2` ops whose slot and
+/// value are both literals, pick the slot that identifies a speaker (non-zero
+/// current value) for the MOST show-text beats and has ≥2 distinct IDs. The name
+/// slot is set before nearly every line, so it dominates portrait/colour slots.
+pub fn detect_speaker_display_slot(instructions: &[Instruction]) -> Option<u32> {
+    use std::collections::HashSet;
+
+    let mut slots: HashSet<u32> = HashSet::new();
+    for ins in instructions {
+        if ins.opcode == 0x1D2
+            && ins.arguments.len() >= 2
+            && ins.arguments[0].arg_type == 0
+            && ins.arguments[1].arg_type == 0
+        {
+            slots.insert(ins.arguments[0].raw_data);
+        }
+    }
+
+    let mut best: Option<(u32, usize)> = None;
+    for &slot in &slots {
+        let mut cur: u32 = 0;
+        let mut hits = 0usize;
+        let mut distinct: HashSet<u32> = HashSet::new();
+        for ins in instructions {
+            if ins.opcode == 0x1D2
+                && ins.arguments.len() >= 2
+                && ins.arguments[0].arg_type == 0
+                && ins.arguments[0].raw_data == slot
+                && ins.arguments[1].arg_type == 0
+            {
+                cur = ins.arguments[1].raw_data;
+                if cur > 0 {
+                    distinct.insert(cur);
+                }
+            } else if ins.opcode == 0x6E && cur > 0 {
+                hits += 1;
+            }
+        }
+        if distinct.len() >= 2 && hits >= 5 && best.map_or(true, |(_, h)| hits > h) {
+            best = Some((slot, hits));
+        }
+    }
+    best.map(|(s, _)| s)
+}
+
+/// Per-show-text speaker for the `0x1D2` display-slot pattern. Tracks the current
+/// literal value written to `slot`; each show-text inherits the most recent
+/// non-zero value as its character ID (0 = narrator/cleared → no badge).
+pub fn extract_row_speakers_1d2(
+    instructions: &[Instruction],
+    slot: u32,
+) -> BTreeMap<usize, SpeakerRef> {
+    let mut result = BTreeMap::new();
+    let mut cur: Option<u32> = None;
+    for (i, ins) in instructions.iter().enumerate() {
+        if ins.opcode == 0x1D2
+            && ins.arguments.len() >= 2
+            && ins.arguments[0].arg_type == 0
+            && ins.arguments[0].raw_data == slot
+            && ins.arguments[1].arg_type == 0
+        {
+            let v = ins.arguments[1].raw_data;
+            cur = if v > 0 { Some(v) } else { None };
+        }
+        if ins.opcode == 0x6E && !ins.arguments.is_empty() {
+            if let Some(id) = cur {
+                result.insert(i, SpeakerRef { source_type: 0, source_raw_data: id, literal_name: None });
+            }
+        }
+    }
+    result
+}
+
+/// Unique character IDs referenced via the `0x1D2` display-slot pattern. Names are
+/// resolved downstream against the init-BIN id→name maps (same as SYS5 IDs).
+pub fn extract_referenced_speakers_1d2(
+    instructions: &[Instruction],
+    slot: u32,
+) -> Vec<CharacterEntry> {
+    use std::collections::BTreeSet;
+    let mut ids = BTreeSet::new();
+    for ins in instructions {
+        if ins.opcode == 0x1D2
+            && ins.arguments.len() >= 2
+            && ins.arguments[0].arg_type == 0
+            && ins.arguments[0].raw_data == slot
+            && ins.arguments[1].arg_type == 0
+            && ins.arguments[1].raw_data > 0
+        {
+            ids.insert(ins.arguments[1].raw_data);
+        }
+    }
+    ids.into_iter().map(|id| CharacterEntry { pointer: id, name: String::new() }).collect()
+}
+
 /// Check if a SYS3 show-text instruction is a speaker name.
 ///
 /// Returns true if the text looks like a name: short, no sentence punctuation,

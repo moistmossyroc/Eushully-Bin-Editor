@@ -55,12 +55,12 @@
     return store.tabs.map((tab, index) => ({ tab, index }));
   }
 
-  function matches(e: DialogueEntry, omitted: boolean, f: Filter): boolean {
+  function matches(e: DialogueEntry, omitted: boolean, f: Filter, fileName: string): boolean {
     if (e.deleted || e.is_context_row) return false;
     if (f === "omitted") return omitted;
-    if (f === "included") return isEditableRow(e) && !omitted;
-    if (f === "needs") return omitted || (isOmitEligible(e) && !omitted);
-    return isEditableRow(e) || omitted; // "all"
+    if (f === "included") return isEditableRow(e, fileName) && !omitted;
+    if (f === "needs") return omitted || (isOmitEligible(e, fileName) && !omitted);
+    return isEditableRow(e, fileName) || omitted; // "all"
   }
 
   let groups = $derived.by<TabGroup[]>(() => {
@@ -71,7 +71,7 @@
       for (let i = 0; i < tab.entries.length; i++) {
         const e = tab.entries[i];
         const omitted = e.omit_export === true;
-        if (!matches(e, omitted, filter)) continue;
+        if (!matches(e, omitted, filter, tab.sourceBinFilename)) continue;
         rows.push({
           rowIndex: i,
           rowId: e.instruction_index,
@@ -102,10 +102,10 @@
       for (const e of tab.entries) {
         if (e.deleted || e.is_context_row) continue;
         const om = e.omit_export === true;
-        const editable = isEditableRow(e);
+        const editable = isEditableRow(e, tab.sourceBinFilename);
         if (om) omitted++;
         if (editable && !om) included++;
-        if (om || (isOmitEligible(e) && !om)) needs++;
+        if (om || (isOmitEligible(e, tab.sourceBinFilename) && !om)) needs++;
         if (editable || om) all++;
       }
     }

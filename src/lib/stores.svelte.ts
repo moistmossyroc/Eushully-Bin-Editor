@@ -41,6 +41,10 @@ export class TabState {
 
   /** Engine version number (3, 4, or 5) */
   sysVersion = $state(4);
+  /** AGE build version from the signature (e.g. 443); 0 if unknown. */
+  engineVersion = $state(0);
+  /** Engine indicator label, e.g. "Madou Koukaku · SYS4 (v443)". */
+  engineLabel = $state("");
 
   /** File format this tab represents. "bin" = classic AGE binary BIN; "parente"
    *  = Unity-era Lua scene script extracted from an .arc. Gates format-specific
@@ -144,6 +148,8 @@ export class TabState {
     this.projectPath = null;
     this.sourceBinFilename = "";
     this.sysVersion = 4;
+    this.engineVersion = 0;
+    this.engineLabel = "";
     this.sourceBinHash = "";
     this.isDirty = false;
     this.selectedRowIndex = null;
@@ -282,6 +288,28 @@ class AppStore {
    *  folder (which the user usually can't write to without elevation). */
   lastParenteExportDir = $state<string | null>(null);
 
+  /** Comma-separated filename prefix(es) that mark "special scene" BINs in the
+   *  game-folder picker (the SP category). Passed (split + trimmed) to
+   *  `scan_bin_folder`; empty falls back to "SP" on the Rust side. */
+  spScenePrefixes = $state("SP");
+
+  /** Remembered translation workspace per game folder. Key = normalized source
+   *  game-folder path (backslashes→"/", no trailing slash), value = the writable
+   *  workspace folder the user picked. Lets `doSetupWorkspaceAndOpen` reuse the
+   *  same workspace and skip re-extraction across sessions for archived games
+   *  loaded from read-only folders (e.g. VERITA in Program Files). Persisted. */
+  workspaceFolders = $state<Record<string, string>>({});
+
+  /** Fanpatch title-bar customization, bundled INSIDE the exported `.fanpatch`
+   *  as `fanpatch_title.txt`. Title = the game's English name; label = the patch
+   *  label (e.g. a version). Empty = the loader falls back to its own defaults. */
+  fanpatchTitle = $state("");
+  fanpatchLabel = $state("");
+
+  /** Optional path to a UI translation table file, bundled into the `.fanpatch`
+   *  as `fanpatch_ui.txt` when set. Empty = not bundled. */
+  fanpatchUiConfigPath = $state("");
+
   /** Whether the characters panel is visible */
   charactersPanelOpen = $state(false);
 
@@ -334,6 +362,15 @@ class AppStore {
     gameDir?: string;
   } | null>(null);
 
+  /** Pending SYS3/4/5 folder picker — set after scanning a game folder for
+   *  .BIN files; rendered by BinFolderPickerDialog. `writable` is false for
+   *  admin-locked folders → the picker offers a writable workspace on open. */
+  sysBinFolderRequest = $state<{
+    folder: string;
+    files: import("./ipc").SysBinFile[];
+    writable: boolean;
+  } | null>(null);
+
   /** Pending "jump to instruction in BIN Viewer" request — set by EditorRow's
    *  context menu, consumed by BinViewerDialog after it loads/becomes visible.
    *  Nonce ensures repeat clicks on the same instruction re-fire the jump. */
@@ -375,6 +412,14 @@ class AppStore {
 
   /** Whether the settings dialog is open */
   settingsDialogOpen = $state(false);
+  /** Cooperative cancel flag for long bulk passes (re-flow / split / paginate
+   *  across all tabs). The all-tabs loops check it between tabs and stop early;
+   *  the progress UI's Cancel button sets it. Reset to false at each run's start. */
+  bulkCancelRequested = $state(false);
+  /** Help Center dialog open state. */
+  helpOpen = $state(false);
+  /** Currently selected Help section id (set by deep-link `?` buttons + nav). */
+  helpSection = $state("getting-started");
 
   /** Whether the BIN viewer dialog is open */
   binViewerOpen = $state(false);

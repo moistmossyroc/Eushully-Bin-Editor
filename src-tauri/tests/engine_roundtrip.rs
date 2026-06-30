@@ -43,6 +43,7 @@ fn synthetic_header(sys_version: u8) -> Header {
         length: if is_ver5 { 0x44 } else { 0x3C },
         is_ver5,
         sys_version,
+        engine_version: 0,
     }
 }
 

@@ -1,10 +1,10 @@
-use crate::bin_format::parser::parse_bin;
+use crate::bin_format::parser::{parse_bin, ParsedBin};
 use crate::bin_format::writer::write_bin;
 use crate::claude::client::{ApiProvider, ClaudeClient};
 use crate::claude::prompt::TranslationOptions;
 use crate::claude::session::{SessionControl, TranslationSession};
 use crate::editor::apply::apply_changes;
-use crate::editor::characters::{extract_all_character_definitions, extract_ciinit_character_names, extract_referenced_speakers, detect_speaker_register, extract_row_speakers, detect_speaker_lookup_array, detect_speaker_id_variable, extract_referenced_speakers_sys5, extract_row_speakers_sys5, extract_referenced_speakers_sys5_legacy, extract_row_speakers_sys5_legacy, extract_referenced_speakers_sys3, extract_row_speakers_sys3};
+use crate::editor::characters::{extract_all_character_definitions, extract_ciinit_character_names, extract_referenced_speakers, detect_speaker_register, extract_row_speakers, detect_speaker_lookup_array, detect_speaker_id_variable, extract_referenced_speakers_sys5, extract_row_speakers_sys5, extract_referenced_speakers_sys5_legacy, extract_row_speakers_sys5_legacy, extract_referenced_speakers_sys3, extract_row_speakers_sys3, detect_speaker_display_slot, extract_referenced_speakers_1d2, extract_row_speakers_1d2};
 use crate::editor::extract::{extract_dialogue, DialogueEntry};
 use crate::project::io::{load_project as load_project_file, save_project as save_project_file};
 use crate::project::types::{CharacterEntry, GlossaryEntry, InsertedInstruction, ProjectFile};
@@ -72,6 +72,10 @@ fn create_client(state: &AppState, model: String) -> Result<ClaudeClient, String
 pub struct LoadBinResult {
     pub entries: Vec<DialogueEntry>,
     pub sys_version: u8,
+    /// AGE engine build version from the signature (e.g. 443). 0 if unparsed.
+    pub engine_version: u16,
+    /// UI label: "Madou Koukaku · SYS4 (v443)" (game name when the build is known).
+    pub engine_label: String,
 }
 
 /// Load a BIN file and extract dialogue entries.
@@ -87,6 +91,8 @@ pub async fn load_bin(
 
     let entries = extract_dialogue(&parsed.instructions);
     let sys_version = parsed.header.sys_version;
+    let engine_version = parsed.header.engine_version;
+    let engine_label = crate::editor::game_profile::engine_label(sys_version, engine_version);
 
     let bridge = crate::editor::bridge::detect_bridge_template(
         &parsed.instructions,
@@ -102,7 +108,29 @@ pub async fn load_bin(
     tab.bridge_template = Some(bridge);
     tab.parsed_bin = Some(parsed);
 
-    Ok(LoadBinResult { entries, sys_version })
+    Ok(LoadBinResult { entries, sys_version, engine_version, engine_label })
+}
+
+#[derive(serde::Serialize)]
+pub struct EngineInfo {
+    pub sys_version: u8,
+    pub engine_version: u16,
+    pub engine_label: String,
+}
+
+/// Engine/build info for an already-loaded tab — used by the project-restore path
+/// (which loads the BIN via `load_bin_for_project` and so doesn't get a
+/// `LoadBinResult`) to populate the UI engine indicator.
+#[tauri::command]
+pub async fn get_engine_info(tab_id: String, state: State<'_, AppState>) -> Result<EngineInfo, String> {
+    let tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+    let h = &tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?.header;
+    Ok(EngineInfo {
+        sys_version: h.sys_version,
+        engine_version: h.engine_version,
+        engine_label: crate::editor::game_profile::engine_label(h.sys_version, h.engine_version),
+    })
 }
 
 /// Load a project JSON file. Returns the project data.
@@ -220,38 +248,9 @@ pub async fn export_bin(
     let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
     let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
 
-    // Apply changes to the instruction list
-    let modified_instructions =
-        apply_changes(&parsed_bin.instructions, &entries, &inserted_instructions);
-
-    // Write the modified BIN
-    let output_data = write_bin(&parsed_bin.header, &modified_instructions)
-        .map_err(|e| format!("Failed to write BIN: {}", e))?;
-
-    // Export guardrail: the produced bytes MUST re-parse to the same instruction
-    // count. A parse failure or a count mismatch means the stream is misaligned
-    // (corruption that would break the file in-game) — abort BEFORE touching disk
-    // so a bad export can never overwrite a good BIN or its backup. The identity
-    // round-trip test proves a valid export always matches, so this won't
-    // false-positive on legitimate writes.
-    match parse_bin(&output_data) {
-        Ok(reparsed) => {
-            if reparsed.instructions.len() != modified_instructions.len() {
-                return Err(format!(
-                    "Export aborted — internal corruption check failed: wrote {} instructions but read back {}. \
-                     No file written. Please report this (the BIN would not render correctly in-game).",
-                    modified_instructions.len(),
-                    reparsed.instructions.len()
-                ));
-            }
-        }
-        Err(e) => {
-            return Err(format!(
-                "Export aborted — the result does not re-parse ({e}). No file written. \
-                 This indicates a corruption bug; the original BIN is untouched."
-            ));
-        }
-    }
+    // Build the translated bytes with the corruption guardrail (see helper).
+    let output_data = build_translated_bin(parsed_bin, &entries, &inserted_instructions)
+        .map_err(|e| format!("Export aborted — {e}. No file written (the original BIN is untouched)."))?;
 
     // Pre-write backup: if the output path already exists (i.e. we're about
     // to overwrite a real BIN, not creating a new one), copy it to a sibling
@@ -279,6 +278,426 @@ pub async fn export_bin(
         .map_err(|e| format!("Failed to write output file: {}", e))?;
 
     Ok(())
+}
+
+/// Build a translated BIN's bytes from a parsed BIN + edits, applying the SAME
+/// re-parse corruption guardrail `export_bin` uses: the bytes must re-parse to an
+/// identical instruction count or this returns an error instead of corrupt data.
+/// Shared by single-file export and `.fanpatch` export so the guardrail can never
+/// diverge between them.
+fn build_translated_bin(
+    parsed_bin: &ParsedBin,
+    entries: &[DialogueEntry],
+    inserted_instructions: &[InsertedInstruction],
+) -> Result<Vec<u8>, String> {
+    let modified = apply_changes(&parsed_bin.instructions, entries, inserted_instructions);
+    let bytes = write_bin(&parsed_bin.header, &modified)
+        .map_err(|e| format!("failed to write BIN: {e}"))?;
+    match parse_bin(&bytes) {
+        Ok(reparsed) => {
+            if reparsed.instructions.len() != modified.len() {
+                return Err(format!(
+                    "internal corruption check failed: wrote {} instructions but read back {} \
+                     (the BIN would not render correctly in-game)",
+                    modified.len(),
+                    reparsed.instructions.len()
+                ));
+            }
+        }
+        Err(e) => return Err(format!("the result does not re-parse ({e}) — corruption bug")),
+    }
+    Ok(bytes)
+}
+
+/// One BIN to pack into a `.fanpatch`: the tab to build from + the request-name
+/// the game opens it by (zipped uppercased to match the loader's normalisation).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FanpatchItem {
+    pub tab_id: String,
+    pub filename: String,
+    pub entries: Vec<DialogueEntry>,
+    pub inserted_instructions: Vec<InsertedInstruction>,
+}
+
+#[derive(serde::Serialize)]
+pub struct FanpatchResult {
+    pub written: usize,
+    /// "<NAME>: <reason>" for each BIN that was skipped (corruption guard, dup, etc.).
+    pub skipped: Vec<String>,
+    /// True if version.dll was written next to the patch (the drop-in loader).
+    pub loader_written: bool,
+}
+
+/// The fanpatch loader, bundled so an exported `.fanpatch` is a complete drop-in
+/// (the user never has to hunt for version.dll). Silent unless an `agepatch.trace`
+/// marker is present; Ctrl+Shift+L toggles EN/JP in-game.
+///
+/// `version.dll` is a prebuilt binary kept OUT of the public source repo; build.rs
+/// sets the `has_bundled_loader` cfg only when it's present. A public-repo build
+/// has no DLL, so this is an empty slice and `write_loader_package` skips writing
+/// it (the rest of the package — README/config — is still produced).
+#[cfg(has_bundled_loader)]
+const BUNDLED_LOADER_DLL: &[u8] = include_bytes!("../assets/version.dll");
+#[cfg(not(has_bundled_loader))]
+const BUNDLED_LOADER_DLL: &[u8] = &[];
+
+const FANPATCH_README: &str = "\
+Eushully Fanpatch — install
+===========================
+
+1. Copy version.dll AND the .fanpatch file(s) into your game folder
+   (the folder containing the game's .exe / AGE.EXE).
+2. Launch the game. The translation loads automatically — no loose files.
+
+Language toggle: press the ` (backtick) key in-game to switch English <-> Japanese
+(applies to the next line/scene loaded). The window title bar shows the current
+language, e.g. \"... [Fanpatch - English]\".
+
+Multiple patches load alphabetically; later wins on conflicts. Prefix to order:
+  01_english.fanpatch, 02_uncensor.fanpatch, ...
+
+Uninstall: delete version.dll and the .fanpatch file(s). The base game is
+completely untouched.
+";
+
+/// Write the bundled loader (version.dll) + a README next to the exported patch
+/// so it's a complete drop-in package. Non-fatal: failure (e.g. file locked) is
+/// reported but never aborts the export — the .fanpatch is the primary artifact.
+fn write_loader_package(output_path: &str) -> bool {
+    let dir = std::path::Path::new(output_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Empty in a public/source build without version.dll → skip the DLL (report
+    // it as not written) but still drop the README/config below.
+    let dll_ok = !BUNDLED_LOADER_DLL.is_empty()
+        && std::fs::write(dir.join("version.dll"), BUNDLED_LOADER_DLL).is_ok();
+    let _ = std::fs::write(dir.join("README - fanpatch install.txt"), FANPATCH_README);
+    // Optional title-bar customization template (commented out → no effect until
+    // the user edits it). The loader reads the first non-# line as the game name.
+    let title_tpl = "# Optional title-bar customization (UTF-8). Remove the leading '#' to enable.\r\n\
+# Result shown in the title bar: <title> [<label> - English] / [<label> - \u{65E5}\u{672C}\u{8A9E}]\r\n\
+#\r\n\
+#   title = the game name (optional; defaults to the game's own title)\r\n\
+#   label = the patch label, e.g. a version (optional; defaults to \"Fanpatch\")\r\n\
+#\r\n\
+# Example (great for partial releases — version is visible in screenshots):\r\n\
+# title = Sankai no Yubiwa - Ring of the Sea King\r\n\
+# label = Fanpatch v0.9\r\n";
+    let title_path = dir.join("fanpatch_title.txt");
+    if !title_path.exists() {
+        let _ = std::fs::write(title_path, title_tpl);
+    }
+    dll_ok
+}
+
+/// Bundle the loader's runtime config files INSIDE the `.fanpatch` zip so a
+/// shipped patch is just `version.dll` + one `.fanpatch` (no loose config files
+/// to hunt for). The loader reads `fanpatch_title.txt` (title/label for the
+/// window title bar) and `fanpatch_ui.txt` (UI translation table) from inside
+/// the zip. Both are optional:
+/// - `fanpatch_title.txt` is written only when a title or label is supplied.
+/// - `fanpatch_ui.txt` is written only when `ui_config_path` is set AND readable
+///   (a missing/unreadable file is silently skipped — non-fatal, the rest of the
+///   patch still ships).
+fn bundle_loader_configs<W: std::io::Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    opts: zip::write::SimpleFileOptions,
+    title: &str,
+    label: &str,
+    ui_config_path: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let title = title.trim();
+    let label = label.trim();
+    if !title.is_empty() || !label.is_empty() {
+        let mut contents = String::new();
+        if !title.is_empty() {
+            contents.push_str(&format!("title = {title}\r\n"));
+        }
+        if !label.is_empty() {
+            contents.push_str(&format!("label = {label}\r\n"));
+        }
+        zip.start_file("fanpatch_title.txt", opts)
+            .map_err(|e| format!("zip entry fanpatch_title.txt: {e}"))?;
+        zip.write_all(contents.as_bytes())
+            .map_err(|e| format!("zip write fanpatch_title.txt: {e}"))?;
+    }
+
+    let ui_config_path = ui_config_path.trim();
+    if !ui_config_path.is_empty() {
+        if let Ok(bytes) = std::fs::read(ui_config_path) {
+            zip.start_file("fanpatch_ui.txt", opts)
+                .map_err(|e| format!("zip entry fanpatch_ui.txt: {e}"))?;
+            zip.write_all(&bytes)
+                .map_err(|e| format!("zip write fanpatch_ui.txt: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Export a `.fanpatch` (a ZIP of translated BINs, flat, request-named) for the
+/// version.dll fanpatch loader. Each BIN is built with the corruption guardrail;
+/// any that fail are skipped (reported) rather than poisoning the whole patch.
+#[tauri::command]
+pub async fn export_fanpatch(
+    items: Vec<FanpatchItem>,
+    output_path: String,
+    title: String,
+    label: String,
+    ui_config_path: String,
+    state: State<'_, AppState>,
+) -> Result<FanpatchResult, String> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create {output_path}: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let tabs = state.tabs.lock().unwrap();
+    let mut written = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for item in &items {
+        // Request-name = basename, uppercased (mirrors the loader's NormalizeA).
+        let name = item
+            .filename
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&item.filename)
+            .to_uppercase();
+
+        let Some(tab) = tabs.get(&item.tab_id) else {
+            skipped.push(format!("{name}: tab not found"));
+            continue;
+        };
+        let Some(parsed) = tab.parsed_bin.as_ref() else {
+            skipped.push(format!("{name}: no BIN loaded"));
+            continue;
+        };
+        match build_translated_bin(parsed, &item.entries, &item.inserted_instructions) {
+            Ok(bytes) => {
+                if !seen.insert(name.clone()) {
+                    skipped.push(format!("{name}: duplicate name (kept first)"));
+                    continue;
+                }
+                zip.start_file(&name, opts)
+                    .map_err(|e| format!("zip entry {name}: {e}"))?;
+                zip.write_all(&bytes)
+                    .map_err(|e| format!("zip write {name}: {e}"))?;
+                written += 1;
+            }
+            Err(e) => skipped.push(format!("{name}: {e}")),
+        }
+    }
+    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path)?;
+    zip.finish()
+        .map_err(|e| format!("Failed to finalize fanpatch: {e}"))?;
+
+    let loader_written = write_loader_package(&output_path);
+    Ok(FanpatchResult { written, skipped, loader_written })
+}
+
+/// Package every file in `source_dir` (flat, non-recursive) into a `.fanpatch`,
+/// names uppercased to match the loader. `.BIN` files are validated (must parse)
+/// so a corrupt BIN can't silently ship; non-BIN assets (images, etc.) pass
+/// through untouched. Use this to zip an already-translated folder of BINs.
+#[tauri::command]
+pub async fn pack_fanpatch_from_dir(
+    source_dir: String,
+    output_path: String,
+    title: String,
+    label: String,
+    ui_config_path: String,
+) -> Result<FanpatchResult, String> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create {output_path}: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let mut written = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let dir = std::fs::read_dir(&source_dir)
+        .map_err(|e| format!("Failed to read {source_dir}: {e}"))?;
+    for entry in dir.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let name = fname.to_uppercase();
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(e) => {
+                skipped.push(format!("{name}: read error ({e})"));
+                continue;
+            }
+        };
+        // Guard .BIN assets: a non-parsing BIN would crash the game in-engine.
+        if name.ends_with(".BIN") && parse_bin(&bytes).is_err() {
+            skipped.push(format!("{name}: not a valid BIN (skipped)"));
+            continue;
+        }
+        if !seen.insert(name.clone()) {
+            skipped.push(format!("{name}: duplicate name (kept first)"));
+            continue;
+        }
+        zip.start_file(&name, opts)
+            .map_err(|e| format!("zip entry {name}: {e}"))?;
+        zip.write_all(&bytes)
+            .map_err(|e| format!("zip write {name}: {e}"))?;
+        written += 1;
+    }
+    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path)?;
+    zip.finish()
+        .map_err(|e| format!("Failed to finalize fanpatch: {e}"))?;
+
+    let loader_written = write_loader_package(&output_path);
+    Ok(FanpatchResult { written, skipped, loader_written })
+}
+
+/// Build a `.fanpatch` from a folder of translated (English) BINs, applying the
+/// dual-language pipeline against the matching Japanese originals in `jp_dir`:
+/// - `bilingual=false`: narrator-box repair only (continuation boxes regain the
+///   speaker's portrait/name/color).
+/// - `bilingual=true`: repair + bilingual (each scene switches EN↔JP mid-scene via
+///   the loader's backtick).
+/// For each EN BIN, the JP original is `jp_dir/<same name>`. BINs that can't be
+/// paired or don't align cleanly are shipped unchanged (reported in `skipped`).
+#[tauri::command]
+pub async fn pack_dual_language_fanpatch(
+    en_dir: String,
+    jp_dir: String,
+    agf_dir: String,
+    bilingual: bool,
+    output_path: String,
+    title: String,
+    label: String,
+    ui_config_path: String,
+) -> Result<FanpatchResult, String> {
+    use crate::editor::dual_language;
+    use std::io::Write;
+
+    let file = std::fs::File::create(&output_path)
+        .map_err(|e| format!("Failed to create {output_path}: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    let mut written = 0usize;
+    let mut processed = 0usize; // BINs that got repaired/bilingual
+    let mut skipped: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let dir = std::fs::read_dir(&en_dir).map_err(|e| format!("Failed to read {en_dir}: {e}"))?;
+    for entry in dir.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(fname) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let name = fname.to_uppercase();
+        let Ok(en_bytes) = std::fs::read(&p) else {
+            skipped.push(format!("{name}: read error"));
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            skipped.push(format!("{name}: duplicate name (kept first)"));
+            continue;
+        }
+
+        // Non-BIN assets ship as-is; BINs go through the pipeline.
+        let out_bytes = if name.ends_with(".BIN") {
+            match parse_bin(&en_bytes) {
+                Ok(en) => {
+                    let jp_path = std::path::Path::new(&jp_dir).join(fname);
+                    match std::fs::read(&jp_path).ok().and_then(|d| parse_bin(&d).ok()) {
+                        Some(jp) => {
+                            let result = if bilingual {
+                                dual_language::make_bilingual(&en, &jp)
+                            } else {
+                                dual_language::make_repaired(&en, &jp)
+                            };
+                            match result {
+                                Ok(b) => {
+                                    processed += 1;
+                                    b
+                                }
+                                Err(reason) => {
+                                    skipped.push(format!("{name}: shipped as-is ({reason})"));
+                                    en_bytes
+                                }
+                            }
+                        }
+                        None => {
+                            skipped.push(format!("{name}: no JP original in jp_dir — shipped as-is"));
+                            en_bytes
+                        }
+                    }
+                }
+                Err(_) => {
+                    skipped.push(format!("{name}: not a valid BIN (skipped)"));
+                    continue;
+                }
+            }
+        } else {
+            en_bytes
+        };
+
+        zip.start_file(&name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
+        zip.write_all(&out_bytes).map_err(|e| format!("zip write {name}: {e}"))?;
+        written += 1;
+    }
+
+    // Optionally bundle translated assets (AGF UI/CG images, etc.) as gated files:
+    // the loader serves them in English and falls through to the original (.alf) in
+    // Japanese, so the whole UI flips with the language.
+    let mut assets = 0usize;
+    if !agf_dir.trim().is_empty() {
+        if let Ok(adir) = std::fs::read_dir(&agf_dir) {
+            for entry in adir.flatten() {
+                let p = entry.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let Some(fname) = p.file_name().and_then(|n| n.to_str()) else { continue };
+                let name = fname.to_uppercase();
+                if !seen.insert(name.clone()) {
+                    skipped.push(format!("{name}: duplicate name (kept first)"));
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&p) else {
+                    skipped.push(format!("{name}: read error"));
+                    continue;
+                };
+                zip.start_file(&name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
+                zip.write_all(&bytes).map_err(|e| format!("zip write {name}: {e}"))?;
+                written += 1;
+                assets += 1;
+            }
+        } else {
+            skipped.push(format!("asset folder not readable: {agf_dir}"));
+        }
+    }
+    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path)?;
+    zip.finish().map_err(|e| format!("Failed to finalize fanpatch: {e}"))?;
+
+    skipped.insert(0, format!("{} BIN(s) {} + {} asset(s)", processed, if bilingual { "made bilingual" } else { "repaired" }, assets));
+    let loader_written = write_loader_package(&output_path);
+    Ok(FanpatchResult { written, skipped, loader_written })
 }
 
 /// Set the API key for Claude translation.
@@ -1051,6 +1470,22 @@ pub async fn get_referenced_speakers(
         return Ok(speakers);
     }
 
+    // SYS4 fallback: speaker set via set-display-slot (0x1D2), e.g. Megami Zero.
+    if let Some(slot) = detect_speaker_display_slot(&parsed_bin.instructions) {
+        return Ok(extract_referenced_speakers_1d2(&parsed_bin.instructions, slot));
+    }
+
+    // SYS4 fallback: SYS5-style g-int char-ID register (e.g. 戦女神VERITA —
+    // `mov g-int:13449, <id>` before each line). It's mov-before-lookup-array,
+    // so the set-string register + 0x1D2 paths above both miss it. Strictly
+    // additive: only runs when those returned empty.
+    if let Some(id_var) = detect_speaker_id_variable(&parsed_bin.instructions) {
+        let s = extract_referenced_speakers_sys5_legacy(&parsed_bin.instructions, id_var);
+        if !s.is_empty() {
+            return Ok(s);
+        }
+    }
+
     Ok(Vec::new())
 }
 
@@ -1085,7 +1520,27 @@ pub async fn get_row_speakers(
 
     // SYS4: set-string + speaker register
     if let Some(speaker_reg) = detect_speaker_register(&parsed_bin.instructions) {
-        return Ok(extract_row_speakers(&parsed_bin.instructions, speaker_reg));
+        let rows = extract_row_speakers(&parsed_bin.instructions, speaker_reg);
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+    }
+
+    // SYS4 fallback: speaker set via set-display-slot (0x1D2), e.g. Megami Zero.
+    if let Some(slot) = detect_speaker_display_slot(&parsed_bin.instructions) {
+        let rows = extract_row_speakers_1d2(&parsed_bin.instructions, slot);
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
+    }
+
+    // SYS4 fallback: SYS5-style g-int char-ID register (e.g. 戦女神VERITA).
+    // Matches the detection in get_referenced_speakers above.
+    if let Some(id_var) = detect_speaker_id_variable(&parsed_bin.instructions) {
+        let rows = extract_row_speakers_sys5_legacy(&parsed_bin.instructions, id_var);
+        if !rows.is_empty() {
+            return Ok(rows);
+        }
     }
 
     Ok(std::collections::BTreeMap::new())
@@ -1278,59 +1733,36 @@ pub async fn get_bridge_template_status(
 
 /// Compute a split plan for an overflowing entry. Returns a SplitPlan that
 /// the frontend applies via `applySplitPlan`.
-#[tauri::command]
-pub async fn auto_split_entry(
-    tab_id: String,
-    translated_text: String,
+/// Core of auto-split: compute a `SplitPlan` for one entry from an
+/// already-resolved bridge template + parsed BIN. Shared by `auto_split_entry`
+/// and `auto_split_entries_batch` so the batch path computes N plans under a
+/// single tab lock (no per-row IPC round-trip). Auto-split is LINE-ONLY: it wraps
+/// the overflow into one box of end-text-line-separated lines (the engine
+/// paginates); multi-box splitting is the user's explicit `insertTextBoxBridge`.
+fn build_split_plan(
+    template: &crate::editor::bridge::BridgeTemplate,
+    parsed_bin: &crate::bin_format::parser::ParsedBin,
+    translated_text: &str,
     entry_index: usize,
     line_char_cap: u32,
-    block_char_cap: u32,
-    max_lines_per_box: u32,
-    state: State<'_, AppState>,
 ) -> Result<crate::editor::bridge::SplitPlan, String> {
-    let tabs = state.tabs.lock().unwrap();
-    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
-
-    let template = tab
-        .bridge_template
-        .as_ref()
-        .ok_or("No bridge template available")?;
-
-    if line_char_cap == 0 {
-        return Err("Per-line character cap must be set for auto-split".into());
-    }
-    // block_char_cap / max_lines_per_box are no longer used here: auto-split is
-    // now LINE-ONLY. Adding text boxes is a separate, explicit user action
-    // (insertTextBoxBridge), so we never split into multiple boxes — we wrap the
-    // whole overflow into a single run of end-text-line-separated lines and let
-    // the engine paginate (Sankai auto-advances boxes; other engines keep one
-    // box and the user bridges manually where needed).
-    let _ = (block_char_cap, max_lines_per_box);
-
     // u32::MAX lines-per-box → wrap_english never starts a new box → single box.
-    let wrap = crate::editor::wrap::wrap_english(&translated_text, line_char_cap, u32::MAX);
-
-    // Empty wrap (no text at all) — nothing to do.
+    let wrap = crate::editor::wrap::wrap_english(translated_text, line_char_cap, u32::MAX);
     if wrap.boxes.is_empty() {
         return Err("No text to split".into());
     }
-
-    // If wrap produced exactly one box with one line AND that line matches
-    // the original, there's nothing to fix.
     if wrap.boxes.len() == 1 && wrap.boxes[0].len() == 1 && wrap.boxes[0][0] == translated_text {
         return Err("Text already fits within the line cap".into());
     }
 
-    // Speaker ID: 0 (narrator) is fine — the bridge clone will just leave
-    // speaker args at 0 if no speaker_arg_positions are populated.
+    // Speaker ID 0 (narrator) is fine — the bridge clone leaves speaker args at 0
+    // unless speaker_arg_positions are populated.
     let speaker_id = 0u32;
 
-    // Extract argument template from the source show-text instruction so the
-    // frontend can build structurally correct continuation instructions.
-    let parsed_bin = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
+    // Argument template from the source show-text so the frontend builds
+    // structurally correct continuation instructions.
     let show_text_template_args = if entry_index < parsed_bin.instructions.len() {
-        let source_instr = &parsed_bin.instructions[entry_index];
-        source_instr
+        parsed_bin.instructions[entry_index]
             .arguments
             .iter()
             .map(|a| crate::editor::bridge::SerializedArg {
@@ -1343,12 +1775,8 @@ pub async fn auto_split_entry(
         Vec::new()
     };
 
-    // Template for the end-text-line (opcode 0x6F) inserted between wrapped
-    // lines. Prefer cloning a real one from the BIN; if the BIN has none (rare —
-    // e.g. auto-wrap SYS4 scenes with no native line breaks), synthesize it.
-    // 0x6F is a 1-arg opcode whose single argument is a literal 0 (verified
-    // across scenes), so a synthetic instance is structurally identical to a
-    // cloned one — safe to insert.
+    // end-text-line (0x6F) template — clone a real one, else synthesize (0x6F is a
+    // 1-arg literal-0 opcode, so a synthetic is structurally identical).
     const OP_END_TEXT_LINE: u32 = 0x6F;
     let end_text_line_template = Some(
         parsed_bin
@@ -1376,6 +1804,71 @@ pub async fn auto_split_entry(
         show_text_template_args,
         end_text_line_template,
     ))
+}
+
+#[tauri::command]
+pub async fn auto_split_entry(
+    tab_id: String,
+    translated_text: String,
+    entry_index: usize,
+    line_char_cap: u32,
+    block_char_cap: u32,
+    max_lines_per_box: u32,
+    state: State<'_, AppState>,
+) -> Result<crate::editor::bridge::SplitPlan, String> {
+    let _ = (block_char_cap, max_lines_per_box); // line-only; see build_split_plan
+    let tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+    if line_char_cap == 0 {
+        return Err("Per-line character cap must be set for auto-split".into());
+    }
+    let template = tab.bridge_template.as_ref().ok_or("No bridge template available")?;
+    let parsed_bin = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
+    build_split_plan(template, parsed_bin, &translated_text, entry_index, line_char_cap)
+}
+
+/// One overflow entry to plan a split for.
+#[derive(serde::Deserialize)]
+pub struct SplitRequest {
+    pub translated_text: String,
+    pub entry_index: usize,
+}
+
+/// Result for one batch item: either a plan or a per-item error (so one bad
+/// entry doesn't fail the whole batch).
+#[derive(serde::Serialize)]
+pub struct SplitOutcome {
+    pub entry_index: usize,
+    pub plan: Option<crate::editor::bridge::SplitPlan>,
+    pub error: Option<String>,
+}
+
+/// Compute split plans for many overflowing entries in a single call. Replaces N
+/// `auto_split_entry` round-trips during a bulk auto-split: one tab lock, one IPC
+/// hop, plans computed in Rust. The frontend then applies them synchronously so
+/// the editor table repaints once.
+#[tauri::command]
+pub async fn auto_split_entries_batch(
+    tab_id: String,
+    items: Vec<SplitRequest>,
+    line_char_cap: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<SplitOutcome>, String> {
+    let tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+    if line_char_cap == 0 {
+        return Err("Per-line character cap must be set for auto-split".into());
+    }
+    let template = tab.bridge_template.as_ref().ok_or("No bridge template available")?;
+    let parsed_bin = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match build_split_plan(template, parsed_bin, &item.translated_text, item.entry_index, line_char_cap) {
+            Ok(plan) => out.push(SplitOutcome { entry_index: item.entry_index, plan: Some(plan), error: None }),
+            Err(e) => out.push(SplitOutcome { entry_index: item.entry_index, plan: None, error: Some(e) }),
+        }
+    }
+    Ok(out)
 }
 
 /// Compose the BATCH-PROMPT.md content that the parent-level Claude Code
@@ -2225,8 +2718,13 @@ pub async fn open_folder_in_explorer(folder_path: String) -> Result<(), String> 
     }
     #[cfg(target_os = "windows")]
     {
+        // explorer.exe silently ignores forward-slash paths (it opens the
+        // default Documents/home folder instead), and the frontend joins paths
+        // with "/" (e.g. `${parentDir}/${folder}`). Normalize to backslashes so
+        // the target folder actually opens.
+        let native = folder_path.replace('/', "\\");
         std::process::Command::new("explorer")
-            .arg(&folder_path)
+            .arg(&native)
             .spawn()
             .map_err(|e| format!("Failed to open explorer: {}", e))?;
     }
@@ -2245,6 +2743,406 @@ pub async fn open_folder_in_explorer(folder_path: String) -> Result<(), String> 
             .map_err(|e| format!("Failed to open file manager: {}", e))?;
     }
     Ok(())
+}
+
+/// One AGE script BIN discovered in a game folder, classified for the SYS
+/// folder picker.
+#[derive(serde::Serialize)]
+pub struct SysBinFile {
+    pub path: String,
+    pub filename: String,
+    /// Filename with the `$N$` append-prefix stripped (the logical name).
+    pub base_name: String,
+    /// Append layer: `$1$`/`$2$`… override/patch files (N≥1) vs the base game BIN
+    /// (0 = no `$N$` prefix). The highest append is what the game loads, so it
+    /// wins the dedupe.
+    pub layer: u32,
+    /// 3, 4, or 5.
+    pub sys_version: u8,
+    /// Picker bucket: "names" (character/item name tables) | "sc" (story
+    /// scenes) | "sp" (special scenes) | "ui" (menu/system text) | "other"
+    /// (everything else). See `classify_bin`.
+    pub category: String,
+    /// Count of TRANSLATABLE strings (non-empty, letter-bearing) on the text
+    /// opcodes show-text / display-furigana / comment, plus set-string in
+    /// name/item files. 0 ⇒ a data/structural BIN with nothing to translate
+    /// (the picker hides these). Drives the picker's per-file line count.
+    pub string_count: usize,
+    /// Heuristic: the dialogue is mostly Latin (not Japanese) → this loose file
+    /// is probably already translated / not the original game data.
+    pub likely_translated: bool,
+    pub size: u64,
+    /// Set only for entries packed in a `.alf` archive (not loose on disk):
+    /// which data volume + where, so the frontend can extract them on open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alf_archive_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alf_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alf_length: Option<u64>,
+}
+
+/// Split an Eushully update-layer filename: `"$2$NAME.BIN"` -> `(2, "NAME.BIN")`.
+/// Unprefixed names -> `(0, name)`.
+fn parse_update_layer(filename: &str) -> (u32, String) {
+    if let Some(rest) = filename.strip_prefix('$') {
+        if let Some(idx) = rest.find('$') {
+            if let Ok(n) = rest[..idx].parse::<u32>() {
+                return (n, rest[idx + 1..].to_string());
+            }
+        }
+    }
+    (0, filename.to_string())
+}
+
+/// Filename prefixes (uppercased, append-prefix stripped) marking a character/
+/// item NAME table where `set-string` (0x192) writes ARE translatable content.
+/// Mirrors the frontend `NAME_ITEM_PREFIXES` in `src/lib/fileCategory.ts` and
+/// drives both the `names` bucket in `classify_bin` and the set-string string
+/// count in `scan_bin_folder`.
+const NAME_ITEM_PREFIXES: [&str; 7] =
+    ["CVINIT", "CIINIT", "CNINIT", "CHINIT", "AFINIT", "ITINIT", "ITMES"];
+
+/// True when the uppercased logical base name is a character/item NAME table.
+fn is_name_item(base_upper: &str) -> bool {
+    NAME_ITEM_PREFIXES.iter().any(|p| base_upper.starts_with(p))
+}
+
+/// Classify a script BIN into one of five picker buckets so the user can
+/// translate in staged categories (names first → scenes inherit final names):
+///   - `"names"` — character/item NAME tables (CVINIT/CIINIT/CNINIT/CHINIT/
+///     AFINIT/ITINIT/ITMES). Translate first; `set-string` is editable here.
+///   - `"sp"`    — special scenes (prefix(es) configurable via `sp_prefixes`).
+///   - `"ui"`    — menu/system text (MENU/INFO/BTLMENU/CGMODE/CHMODE/SAVE/FIELD/
+///     GAMESTART/CHANGECH/HOSOKU, or any `SYS*`).
+///   - `"sc"`    — story scenes: an `SC`-prefixed BIN that actually has dialogue.
+///   - `"other"` — everything else (data/structural BINs, misc text).
+///
+/// `base_upper` is the uppercased logical filename (append-prefix stripped; may
+/// still carry the `.BIN` extension — prefix checks are unaffected). `sp_prefixes`
+/// must already be uppercased. `has_dialogue` gates the SC bucket so empty `SC`
+/// stubs fall through to other rather than masquerading as story scenes.
+fn classify_bin(base_upper: &str, has_dialogue: bool, sp_prefixes: &[String]) -> &'static str {
+    const UI_PREFIXES: [&str; 10] = [
+        "MENU", "INFO", "BTLMENU", "CGMODE", "CHMODE", "SAVE", "FIELD", "GAMESTART",
+        "CHANGECH", "HOSOKU",
+    ];
+
+    if is_name_item(base_upper) {
+        return "names";
+    }
+    if sp_prefixes
+        .iter()
+        .any(|p| !p.is_empty() && base_upper.starts_with(p.as_str()))
+    {
+        return "sp";
+    }
+    if base_upper.starts_with("SYS") || UI_PREFIXES.iter().any(|p| base_upper.starts_with(p)) {
+        return "ui";
+    }
+    if base_upper.starts_with("SC") && has_dialogue {
+        return "sc";
+    }
+    "other"
+}
+
+/// Scan a folder (non-recursive) for AGE script `.BIN` files for the SYS picker.
+///
+/// Eushully ships updates as loose `$1$`/`$2$`…-prefixed BINs that override the
+/// `.alf`-packed base; the highest layer is what the game actually loads, so we
+/// **dedupe by logical name and keep the highest layer** (the user's "most
+/// recent file"). Non-script BINs (graphics/data — no SYS signature) are skipped.
+///
+/// Files are bucketed into five picker categories (names/sc/sp/ui/other) by
+/// `classify_bin`: name/item tables are `names`, story scenes are `SC`-prefixed
+/// BINs that actually carry dialogue, special-scene prefixes come from
+/// `sp_prefixes` (default `["SP"]`), menu/system files are `ui`, and everything
+/// else is `other`. The translatable-string count + `likely_translated`
+/// heuristics still run per file.
+#[tauri::command]
+pub async fn scan_bin_folder(
+    folder_path: String,
+    sp_prefixes: Vec<String>,
+) -> Result<Vec<SysBinFile>, String> {
+    use std::collections::HashMap;
+    let dir = std::path::Path::new(&folder_path);
+    if !dir.is_dir() {
+        return Err(format!("Not a folder: {}", folder_path));
+    }
+
+    // Normalize the special-scene prefixes: trim + uppercase (classify compares
+    // against uppercased names), drop blanks. Default to ["SP"] when unset.
+    let sp_prefixes: Vec<String> = {
+        let cleaned: Vec<String> = sp_prefixes
+            .iter()
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cleaned.is_empty() {
+            vec!["SP".to_string()]
+        } else {
+            cleaned
+        }
+    };
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read folder: {}", e))?;
+
+    // Pass 1: pick the highest update layer per logical (base) name.
+    let mut winners: HashMap<String, (std::path::PathBuf, String, u32)> = HashMap::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let is_bin = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("bin"))
+            .unwrap_or(false);
+        if !is_bin {
+            continue;
+        }
+        let filename = match p.file_name().and_then(|f| f.to_str()) {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        let (layer, base) = parse_update_layer(&filename);
+        let key = base.to_uppercase();
+        match winners.get(&key) {
+            Some((_, _, l)) if *l >= layer => {}
+            _ => {
+                winners.insert(key, (p, filename, layer));
+            }
+        }
+    }
+
+    // Pass 2: validate + classify only the winners (parse for dialogue count).
+    let mut out: Vec<SysBinFile> = Vec::new();
+    for (_key, (p, filename, layer)) in winners {
+        let data = match std::fs::read(&p) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let header = match crate::bin_format::header::Header::from_bytes(&data) {
+            Ok(h) => h,
+            Err(_) => continue, // not an AGE script BIN — skip
+        };
+        let (_, base) = parse_update_layer(&filename);
+        let base_upper = base.to_uppercase();
+        let name_item = is_name_item(&base_upper);
+        // Parse once: count TRANSLATABLE strings AND tally Japanese vs Latin
+        // letters so we can flag loose files that look already-translated.
+        //
+        // A "translatable" string is a non-empty, trimmed string carrying at
+        // least one LETTER (a JP char in the ranges below OR an ASCII letter) on
+        // one of these opcodes: show-text (0x6E), display-furigana (0x196), and
+        // comment (0x1A7) for every file, PLUS set-string (0x192) ONLY in
+        // name/item files (where it's the editable name table — elsewhere it's
+        // the structural speaker slot). Pure symbol/numeric/structural strings
+        // are skipped, so data/structural BINs (ALLMAP, ANIME, SAVE, MP*, …)
+        // come out 0 and the picker can hide them.
+        let (string_count, likely_translated) = match crate::bin_format::parser::parse_bin(&data) {
+            Ok(parsed) => {
+                let mut count = 0usize;
+                let mut jp = 0usize;
+                let mut latin = 0usize;
+                for instr in &parsed.instructions {
+                    let is_text = matches!(instr.opcode, 0x6E | 0x196 | 0x1A7)
+                        || (name_item && instr.opcode == 0x192);
+                    if !is_text {
+                        continue;
+                    }
+                    for a in &instr.arguments {
+                        let Some(s) = a.decoded_string.as_deref() else { continue };
+                        let t = s.trim();
+                        if t.is_empty() {
+                            continue;
+                        }
+                        let mut has_letter = false;
+                        for ch in t.chars() {
+                            let c = ch as u32;
+                            if (0x3040..=0x30FF).contains(&c)   // hiragana + katakana
+                                || (0xFF66..=0xFF9D).contains(&c) // half-width katakana
+                                || (0x4E00..=0x9FFF).contains(&c) // CJK kanji
+                                || (0x3400..=0x4DBF).contains(&c)
+                            {
+                                jp += 1;
+                                has_letter = true;
+                            } else if ch.is_ascii_alphabetic() {
+                                latin += 1;
+                                has_letter = true;
+                            }
+                        }
+                        // Only real content counts — skip pure symbol/number strings.
+                        if has_letter {
+                            count += 1;
+                        }
+                    }
+                }
+                // Enough letters to judge, and Latin clearly dominates → translated.
+                let translated = (jp + latin) >= 20 && (latin as f64) / ((jp + latin) as f64) > 0.7;
+                (count, translated)
+            }
+            Err(_) => (0, false),
+        };
+        let category = classify_bin(&base_upper, string_count > 0, &sp_prefixes);
+        out.push(SysBinFile {
+            path: p.to_string_lossy().to_string(),
+            filename,
+            base_name: base,
+            layer,
+            sys_version: header.sys_version,
+            category: category.to_string(),
+            string_count,
+            likely_translated,
+            size: std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+            alf_archive_index: None,
+            alf_offset: None,
+            alf_length: None,
+        });
+    }
+
+    // Merge in base BINs packed in the `.alf` archives (the bulk of the game —
+    // loose files are just updates). A loose file overrides the archived base of
+    // the same name, so skip archived names already present loose. Classified by
+    // filename (extracting+parsing all archived entries would be too slow).
+    let loose_names: std::collections::HashSet<String> =
+        out.iter().map(|f| f.base_name.to_uppercase()).collect();
+    if let Ok(mdata) = std::fs::read(dir.join("SYS4INI.BIN")) {
+        if let Some(idx) = crate::alf::read_sys4_master(&mdata) {
+            for e in &idx.entries {
+                let up = e.name.to_uppercase();
+                if !up.ends_with(".BIN") || loose_names.contains(&up) {
+                    continue;
+                }
+                // Archived entries aren't parsed (too slow to extract all), so
+                // classify by filename only — treat any `SC*` as a dialogue scene.
+                let category = classify_bin(&up, true, &sp_prefixes);
+                out.push(SysBinFile {
+                    path: String::new(),
+                    filename: e.name.clone(),
+                    base_name: e.name.clone(),
+                    layer: 0,
+                    sys_version: 4,
+                    category: category.to_string(),
+                    string_count: 0,
+                    likely_translated: false,
+                    size: e.length,
+                    alf_archive_index: Some(e.archive_index),
+                    alf_offset: Some(e.offset),
+                    alf_length: Some(e.length),
+                });
+            }
+        }
+    }
+
+    out.sort_by(|a, b| a.base_name.cmp(&b.base_name));
+    Ok(out)
+}
+
+/// A reference to one packed entry, for extraction (sent from the frontend).
+#[derive(serde::Deserialize)]
+pub struct AlfRef {
+    pub archive_index: u32,
+    pub offset: u64,
+    pub length: u64,
+    pub name: String,
+}
+
+/// Extract packed `.alf` entries from a game folder into `dest_folder` as real
+/// `.BIN` files (so they can be edited + autosaved + exported like any BIN).
+/// Returns the written paths.
+///
+/// Best-effort per entry: a single bad entry (corrupt offset, decompress error)
+/// is logged and skipped rather than aborting the whole workspace — so the
+/// scenes that DO extract still open. Only catastrophic failures (can't read the
+/// master index / can't create the dest) return `Err`. The caller compares the
+/// returned count against the requested count to report partial extraction.
+#[tauri::command]
+pub async fn extract_alf_to_folder(
+    game_dir: String,
+    dest_folder: String,
+    entries: Vec<AlfRef>,
+) -> Result<Vec<String>, String> {
+    let dir = std::path::Path::new(&game_dir);
+    let mdata = std::fs::read(dir.join("SYS4INI.BIN")).map_err(|e| format!("read SYS4INI.BIN: {e}"))?;
+    let idx = crate::alf::read_sys4_master(&mdata).ok_or("failed to parse SYS4INI.BIN")?;
+    let dest = std::path::Path::new(&dest_folder);
+    std::fs::create_dir_all(dest).map_err(|e| format!("create dest: {e}"))?;
+    let mut out = Vec::with_capacity(entries.len());
+    for r in &entries {
+        let entry = crate::alf::AlfEntry {
+            name: r.name.clone(),
+            archive_index: r.archive_index,
+            offset: r.offset,
+            length: r.length,
+        };
+        let bytes = match crate::alf::extract_entry(dir, &idx, &entry) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("workspace extract: skip {} (extract failed: {e})", r.name);
+                continue;
+            }
+        };
+        let target = dest.join(&r.name);
+        if let Err(e) = std::fs::write(&target, &bytes) {
+            eprintln!("workspace extract: skip {} (write failed: {e})", r.name);
+            continue;
+        }
+        out.push(target.to_string_lossy().to_string());
+    }
+    Ok(out)
+}
+
+/// Whether a path is a directory. Backend check (full FS access) — the frontend
+/// fs plugin's `stat` is capability-scoped and throws on arbitrary dropped paths.
+#[tauri::command]
+pub async fn path_is_dir(path: String) -> Result<bool, String> {
+    Ok(std::path::Path::new(&path).is_dir())
+}
+
+/// Probe whether a folder is writable by creating + removing a temp file.
+/// More reliable than inspecting ACLs (Windows perms are layered) — an actual
+/// write attempt is the ground truth. Used to detect admin-locked game folders
+/// so the UI can offer a writable workspace before autosave silently fails.
+#[tauri::command]
+pub async fn is_folder_writable(folder_path: String) -> Result<bool, String> {
+    let dir = std::path::Path::new(&folder_path);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let probe = dir.join(".eushully_write_probe.tmp");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Copy a set of files into `dest_folder` (created if needed), preserving file
+/// names. Returns the new full paths (same order). Used to set up a writable
+/// workspace when the source game folder is read-only — copies the selected
+/// scenes plus the speaker-name init BINs so names still resolve.
+#[tauri::command]
+pub async fn copy_files_to_folder(
+    sources: Vec<String>,
+    dest_folder: String,
+) -> Result<Vec<String>, String> {
+    let dest = std::path::Path::new(&dest_folder);
+    std::fs::create_dir_all(dest)
+        .map_err(|e| format!("Failed to create destination folder: {}", e))?;
+    let mut out = Vec::with_capacity(sources.len());
+    for src in &sources {
+        let sp = std::path::Path::new(src);
+        let name = sp
+            .file_name()
+            .ok_or_else(|| format!("Invalid source path: {}", src))?;
+        let target = dest.join(name);
+        std::fs::copy(sp, &target).map_err(|e| format!("Failed to copy {}: {}", src, e))?;
+        out.push(target.to_string_lossy().to_string());
+    }
+    Ok(out)
 }
 
 /// Re-launch a single translation folder's `translate.bat`/`.sh` in a new

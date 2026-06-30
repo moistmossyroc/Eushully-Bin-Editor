@@ -3,22 +3,23 @@
 </script>
 
 {#if store.loadingProgress}
+  {@const lp = store.loadingProgress}
   <div class="loading-overlay">
     <div class="loading-dialog">
-      <div class="loading-header">Loading Files</div>
+      <div class="loading-header">{lp.total > 0 ? "Loading Files" : "Working…"}</div>
       <div class="loading-body">
-        <div class="progress-text">
-          {store.loadingProgress.current} / {store.loadingProgress.total}
-        </div>
-        <div class="progress-bar-track">
-          <div
-            class="progress-bar-fill"
-            style="width: {(store.loadingProgress.current / store.loadingProgress.total) * 100}%"
-          ></div>
-        </div>
-        <div class="current-file" title={store.loadingProgress.currentFile}>
-          {store.loadingProgress.currentFile}
-        </div>
+        {#if lp.total > 0}
+          <div class="progress-text">{lp.current} / {lp.total}</div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" style="width: {(lp.current / lp.total) * 100}%"></div>
+          </div>
+        {:else}
+          <!-- Indeterminate: a single Rust call with no per-item progress. -->
+          <div class="progress-bar-track">
+            <div class="progress-bar-indeterminate"></div>
+          </div>
+        {/if}
+        <div class="current-file" title={lp.currentFile}>{lp.currentFile}</div>
       </div>
     </div>
   </div>
@@ -78,6 +79,21 @@
     background: #6c9bd2;
     border-radius: 3px;
     transition: width 0.2s ease;
+  }
+
+  .progress-bar-track { position: relative; }
+  .progress-bar-indeterminate {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    width: 35%;
+    background: #6c9bd2;
+    border-radius: 3px;
+    animation: indeterminate 1.1s ease-in-out infinite;
+  }
+  @keyframes indeterminate {
+    0% { left: -35%; }
+    100% { left: 100%; }
   }
 
   .current-file {

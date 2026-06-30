@@ -5,17 +5,106 @@
     doExportBin, doExportAllBins, doLoadFile, doLoadProjectFolders,
     doExportForTranslation, doImportTranslations,
     doExportAllTabsForTranslation, doImportAllTranslations, doCheckTranslationStatus,
-    forgetRecentFile, clearRecentFiles, doOpenParenteGameFolder,
+    forgetRecentFile, clearRecentFiles, doOpenParenteGameFolder, doOpenSysGameFolder,
+    doExportFanpatchFromTabs, doPackFanpatchFromFolder, doPackDualLanguageFanpatch,
+    doSaveProject,
   } from "../lib/actions";
   import SaveExportPromptDialog from "./SaveExportPromptDialog.svelte";
   import AboutDialog from "./AboutDialog.svelte";
 
   let aboutOpen = $state(false);
 
+  /** Open the Help Center at a specific section (contextual `?` links). */
+  function openHelp(section: string) {
+    store.helpSection = section;
+    store.helpOpen = true;
+  }
+
   let promptOpen = $state(false);
   let openMenuOpen = $state(false);
   let ccMenuOpen = $state(false);
+  let exportMenuOpen = $state(false);
   let tabCount = $derived(store.tabs.length);
+
+  // --- Export popover model ---------------------------------------------------
+  // Context-aware enablement. `hasBinTabs` mirrors doExportFanpatchFromTabs's own
+  // guard (≥1 non-Parente BIN tab with entries). The folder-based fanpatch
+  // builders pick their inputs at runtime, so they're always available.
+  let hasActiveTab = $derived(!!store.activeTab);
+  let hasBinTabs = $derived(
+    store.tabs.some((t) => t.format !== "parente" && t.entries.length > 0),
+  );
+
+  interface ExportOption {
+    label: string;
+    desc: string;
+    disabled: boolean;
+    /** Shown (inline + as title) when disabled, explaining why. */
+    reason?: string;
+    run: () => void;
+  }
+  interface ExportGroup {
+    title: string;
+    items: ExportOption[];
+  }
+
+  let exportGroups: ExportGroup[] = $derived([
+    {
+      title: "Game build",
+      items: [
+        {
+          label: "Export BIN…",
+          desc: "Translated .BIN to drop into the game's data folder.",
+          disabled: !hasActiveTab,
+          reason: "Open a tab first",
+          run: handleExport,
+        },
+        {
+          label: "Export open tabs as .fanpatch",
+          desc: "Single zip the loader serves; overrides base scenes. Built from your open BIN tabs.",
+          disabled: !hasBinTabs,
+          reason: "No BIN tabs open",
+          run: doExportFanpatchFromTabs,
+        },
+        {
+          label: "Build .fanpatch from folder…",
+          desc: "Zip an existing folder of translated BINs into a loader .fanpatch.",
+          disabled: false,
+          run: doPackFanpatchFromFolder,
+        },
+        {
+          label: "Repair speaker boxes → .fanpatch…",
+          desc: "Fix narrator/speaker boxes from EN + original JP folders; outputs a .fanpatch.",
+          disabled: false,
+          run: () => doPackDualLanguageFanpatch(false),
+        },
+        {
+          label: "Bilingual (EN↔JP switch) → .fanpatch…",
+          desc: "Adds in-game mid-scene EN↔JP toggle; needs EN + JP BIN folders.",
+          disabled: false,
+          run: () => doPackDualLanguageFanpatch(true),
+        },
+      ],
+    },
+    {
+      title: "Translation workflow",
+      items: [
+        {
+          label: "Save project (.json)…",
+          desc: "Save translations, glossary & characters as a reloadable project file.",
+          disabled: !hasActiveTab,
+          reason: "Open a tab first",
+          run: doSaveProject,
+        },
+      ],
+    },
+  ]);
+
+  /** Close the popover, then fire the option's existing action. */
+  function runExport(fn: () => void) {
+    exportMenuOpen = false;
+    fn();
+  }
 
   async function handleLoad() {
     openMenuOpen = false;
@@ -59,6 +148,12 @@
     if (typeof dir === "string") await doOpenParenteGameFolder(dir);
   }
 
+  async function handleOpenSysFolder() {
+    openMenuOpen = false;
+    const dir = await open({ directory: true, title: "Select the game's BIN folder (SYS3/4/5)" });
+    if (typeof dir === "string") await doOpenSysGameFolder(dir);
+  }
+
   function handleExport() {
     if (store.tabs.length > 1) {
       promptOpen = true;
@@ -78,6 +173,12 @@
   }
 </script>
 
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key === "Escape") { exportMenuOpen = false; openMenuOpen = false; ccMenuOpen = false; }
+  }}
+/>
+
 <div class="toolbar">
   <div class="toolbar-group">
     <div class="open-menu-wrapper">
@@ -91,6 +192,7 @@
         <div class="open-menu open-menu-wide">
           <button class="menu-item" onclick={handleLoad}>Open Files…</button>
           <button class="menu-item" onclick={handleLoadFolders}>Open Project Folders…</button>
+          <button class="menu-item" onclick={handleOpenSysFolder}>Open Game Folder… (SYS3/4/5)</button>
           <button class="menu-item" onclick={handleOpenGameFolder}>Open Game Folder… (Parente)</button>
           {#if store.recentFiles.length > 0}
             <div class="menu-sep"></div>
@@ -122,13 +224,44 @@
         </div>
       {/if}
     </div>
-    <button
-      class="toolbar-btn"
-      onclick={handleExport}
-      disabled={!store.activeTab}
-    >
-      Export BIN
-    </button>
+    <div class="open-menu-wrapper">
+      <button
+        class="toolbar-btn"
+        aria-haspopup="menu"
+        aria-expanded={exportMenuOpen}
+        onclick={() => (exportMenuOpen = !exportMenuOpen)}
+      >
+        Export
+      </button>
+      {#if exportMenuOpen}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- svelte-ignore a11y_click_events_have_key_events -->
+        <div class="menu-backdrop" onclick={() => (exportMenuOpen = false)}></div>
+        <div class="open-menu export-menu" role="menu" aria-label="Export options">
+          {#each exportGroups as group, gi}
+            {#if gi > 0}<div class="menu-sep"></div>{/if}
+            <div class="menu-section-label">{group.title}</div>
+            {#each group.items as item}
+              <button
+                class="export-item"
+                role="menuitem"
+                disabled={item.disabled}
+                title={item.disabled && item.reason ? item.reason : item.desc}
+                onclick={() => runExport(item.run)}
+              >
+                <span class="export-label">{item.label}</span>
+                <span class="export-desc"
+                  >{item.desc}{#if item.disabled && item.reason}<span class="export-reason"> — {item.reason}</span>{/if}</span
+                >
+              </button>
+            {/each}
+          {/each}
+          <div class="menu-hint">Dual-language builders ask for translated + original BIN folders and bundle the version.dll loader; drop the output into the game folder.
+            <button class="menu-help-link" onclick={() => { exportMenuOpen = false; openHelp("bilingual"); }}>Learn more →</button>
+          </div>
+        </div>
+      {/if}
+    </div>
     <div class="open-menu-wrapper">
       <button
         class="toolbar-btn"
@@ -220,6 +353,13 @@
     >
       About
     </button>
+    <button
+      class="toolbar-btn"
+      onclick={() => openHelp("getting-started")}
+      title="Help Center (F1)"
+    >
+      ? Help
+    </button>
   </div>
 
   {#if store.activeTab?.sourceBinFilename}
@@ -228,7 +368,13 @@
       {#if store.activeTab.format === "parente"}
         <span class="format-badge parente-badge">Parente</span>
       {:else}
-        <span class="format-badge">SYS{store.activeTab.sysVersion}</span>
+        <button
+          class="format-badge format-badge-btn"
+          title="Detected Eushully game + AGE engine build — click for help"
+          onclick={() => openHelp("loading")}
+        >
+          {store.activeTab.engineLabel || `SYS${store.activeTab.sysVersion}`}
+        </button>
       {/if}
     </div>
   {/if}
@@ -313,6 +459,51 @@
     max-height: 400px;
     overflow-y: auto;
   }
+
+  /* Export popover: wider than the plain menus so each option's one-line
+   * description fits on a single row under its label. */
+  .export-menu {
+    min-width: 320px;
+    max-width: 360px;
+    max-height: 460px;
+    overflow-y: auto;
+    padding-bottom: 2px;
+  }
+  .export-item {
+    display: block;
+    width: 100%;
+    padding: 7px 14px;
+    border: none;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .export-item:hover:not(:disabled) {
+    background: #2a2a5e;
+  }
+  .export-item:disabled {
+    cursor: not-allowed;
+  }
+  .export-label {
+    display: block;
+    color: #c0c0e0;
+    font-size: 0.85rem;
+  }
+  .export-item:disabled .export-label {
+    color: #6a6a8a;
+  }
+  .export-desc {
+    display: block;
+    margin-top: 2px;
+    color: #777;
+    font-size: 0.72rem;
+    line-height: 1.3;
+  }
+  .export-reason {
+    color: #c08a8a;
+    font-style: italic;
+  }
   .menu-section-label {
     padding: 6px 14px 2px 14px;
     font-size: 0.65rem;
@@ -360,6 +551,26 @@
     margin: 4px 0;
   }
 
+  .menu-hint {
+    padding: 6px 12px 2px;
+    color: #777;
+    font-size: 0.72rem;
+    line-height: 1.3;
+  }
+  .menu-help-link {
+    display: inline;
+    background: none;
+    border: none;
+    padding: 0;
+    margin-left: 4px;
+    color: #8ab4f8;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+  .menu-help-link:hover {
+    text-decoration: underline;
+  }
+
   .toolbar-btn {
     padding: 6px 14px;
     border: 1px solid #3a3a5a;
@@ -405,6 +616,14 @@
     color: #8ab4f8;
     font-size: 0.75rem;
     font-weight: 600;
+  }
+  .format-badge-btn {
+    border: none;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .format-badge-btn:hover {
+    background: #34487a;
   }
   /* Parente (Unity Lua) tabs use a distinct color so it's obvious this isn't
    * the traditional AGE binary SYS engine. */

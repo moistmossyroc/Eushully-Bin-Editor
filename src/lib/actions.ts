@@ -4,6 +4,7 @@ import { confirmDialog } from "./confirm";
 import type { TabState } from "./stores.svelte";
 import {
   loadBin,
+  getEngineInfo,
   loadProject,
   loadBinForProject,
   computeFileHash,
@@ -11,6 +12,9 @@ import {
   getRowSpeakers,
   saveProject,
   exportBin,
+  exportFanpatch,
+  packFanpatchFromDir,
+  packDualLanguageFanpatch,
   ensureDirectory,
   fileExists,
   scanBinForCharacters,
@@ -18,12 +22,18 @@ import {
   exportForTranslation,
   getSplitCapability,
   autoSplitEntry,
+  autoSplitEntriesBatch,
   importTranslations,
   lookupCharacterNamesForPointers,
   extractChinitIdNameMap,
   readPriorTranslationMap,
   loadFolderGlossary,
   scanTranslationProjectStatus,
+  scanBinFolder,
+  extractAlfToFolder,
+  isFolderWritable,
+  copyFilesToFolder,
+  pathIsDir,
   writeMultiTranslateLaunchers,
   parenteListArc,
   parenteListGame,
@@ -33,10 +43,12 @@ import {
   parenteLoadProject,
   type TranslationRow,
   type TranslationFolderStatus,
+  type SysBinFile,
   type ParenteGameFile,
   type ParentePatchFile,
 } from "./ipc";
 import { isStructuralOnly, hasTranslatableContent } from "./exportOmit";
+import { isNameItemFile, isDialogueBin, isUiAbbreviation } from "./fileCategory";
 import { resolveInsertionsForExport } from "./insertions";
 import { store } from "./stores.svelte";
 import type { CharacterEntry } from "./types";
@@ -151,6 +163,21 @@ async function tryMergeInitNames(tab: import("./stores.svelte").TabState): Promi
  * Additive only — fills blanks, never overrides. Returns the number of names
  * newly resolved.
  */
+/**
+ * Populate a tab's engine indicator (game name + SYS build) on the project-restore
+ * paths, which load the BIN via `loadBinForProject` and so don't receive a
+ * `LoadBinResult`. Best-effort: falls back to a bare `SYS<n>` label on failure.
+ */
+async function applyEngineInfo(tab: import("./stores.svelte").TabState): Promise<void> {
+  try {
+    const e = await getEngineInfo(tab.id);
+    tab.engineVersion = e.engine_version;
+    tab.engineLabel = e.engine_label;
+  } catch {
+    tab.engineLabel = `SYS${tab.sysVersion}`;
+  }
+}
+
 async function tryDirectPointerLookup(tab: import("./stores.svelte").TabState): Promise<number> {
   if (!tab.binPath || tab.characters.length === 0) return 0;
   // Skip pointers that look like absolute addresses, not character IDs.
@@ -222,20 +249,25 @@ async function tryChinitIdMapLookup(tab: import("./stores.svelte").TabState): Pr
   const dir = normalized.substring(0, normalized.lastIndexOf("/"));
   const binFilename = normalized.substring(normalized.lastIndexOf("/") + 1);
 
-  // Append-aware: scan `$N$CHINIT.BIN` first if loaded BIN is an append,
-  // then base `CHINIT.BIN`. Merge maps with APPEND WINS on key conflict —
-  // appends introduce new characters AND can rebind base-game IDs to new
-  // names if the engine treats append init as an overlay.
-  const chinitCandidates = getInitFilenameCandidates(binFilename, ["CHINIT.BIN"]);
+  // ID→name tables in priority order: CHINIT (canonical for triplet/CVINIT
+  // games), then CNINIT/CIINIT — where `0x1D2` display-slot games (e.g. Megami
+  // Zero) store their character names in the SAME mov-lit-then-set-string pattern
+  // `extract_chinit_id_name_map` reads. For each, the `$N$` append variant takes
+  // precedence over base (appends add new characters / rebind base IDs).
+  const idTableCandidates = ["CHINIT.BIN", "CNINIT.BIN", "CIINIT.BIN"].flatMap(
+    (n) => getInitFilenameCandidates(binFilename, [n]),
+  );
   const mergedMap: Record<string, string> = {};
-  // Build base first, then overlay append on top so append entries overwrite.
-  // The candidate list is `[$N$CHINIT, CHINIT]`, so iterate in reverse.
-  for (let i = chinitCandidates.length - 1; i >= 0; i--) {
-    const path = `${dir}/${chinitCandidates[i]}`;
+  // Iterate high-priority first; first write wins (so CHINIT, and append-over-base,
+  // are not overwritten by lower-priority tables).
+  for (const fn of idTableCandidates) {
+    const path = `${dir}/${fn}`;
     if (!(await fileExists(path))) continue;
     try {
       const m = await extractChinitIdNameMap(path);
-      Object.assign(mergedMap, m); // later writes (= earlier in candidate order = append) win
+      for (const [k, v] of Object.entries(m)) {
+        if (!(k in mergedMap)) mergedMap[k] = v;
+      }
     } catch {
       // skip unreadable file
     }
@@ -471,10 +503,12 @@ export async function doLoadBin(filePath: string): Promise<void> {
       tab.sourceBinFilename = project.source_bin_filename;
       tab.sourceBinHash = project.source_bin_sha256;
       tab.sysVersion = project.sys_version || (project.is_ver5 ? 5 : 4);
+      await applyEngineInfo(tab);
 
-      // For SYS3/SYS5, re-detect speakers from the BIN since detection may
-      // have improved since the project was saved
-      if (tab.sysVersion <= 3 || tab.sysVersion >= 5) {
+      // For SYS3/SYS5 — and any project that saved no characters (e.g. a SYS4
+      // 0x1D2 game like Megami Zero opened before that detection existed) —
+      // re-detect speakers from the BIN since detection may have improved.
+      if (tab.sysVersion <= 3 || tab.sysVersion >= 5 || tab.characters.length === 0) {
         try {
           const speakers = await getReferencedSpeakers(tab.id);
           if (speakers.length > 0) {
@@ -521,6 +555,8 @@ export async function doLoadBin(filePath: string): Promise<void> {
     const result = await loadBin(tab.id, filePath);
     tab.entries = result.entries;
     tab.sysVersion = result.sys_version;
+    tab.engineVersion = result.engine_version;
+    tab.engineLabel = result.engine_label;
     tab.binPath = filePath;
 
     tab.sourceBinFilename = binFilename;
@@ -672,6 +708,7 @@ export async function doLoadProject(filePath: string): Promise<void> {
     tab.sourceBinFilename = project.source_bin_filename;
     tab.sourceBinHash = project.source_bin_sha256;
     tab.sysVersion = project.sys_version || (project.is_ver5 ? 5 : 4);
+    await applyEngineInfo(tab);
     tab.claudeModel = project.settings.claude_model;
     store.apiKeyConfigured = project.settings.api_key_configured;
 
@@ -776,6 +813,186 @@ export async function doOpenParenteGameFolder(dir: string): Promise<void> {
   } catch (err) {
     store.statusMessage = `Error scanning game folder: ${err}`;
   }
+}
+
+/** Scan a SYS3/4/5 game folder for script BINs and open the folder picker.
+ *  Returns true if it found AGE BINs (so a folder drop can fall back to the
+ *  Parente scanner when this returns false). */
+export async function doOpenSysGameFolder(dir: string): Promise<boolean> {
+  const name = dir.replace(/\\/g, "/").split("/").pop() || dir;
+  // Indeterminate overlay — the scan is one Rust call (parses loose BINs +
+  // inflates the .alf index) with no per-item progress; total:0 = spinner.
+  store.loadingProgress = { current: 0, total: 0, currentFile: `Scanning ${name} for BIN files…` };
+  try {
+    const spPrefixes = store.spScenePrefixes.split(",").map((s) => s.trim()).filter(Boolean);
+    const files = await scanBinFolder(dir, spPrefixes);
+    if (files.length === 0) return false;
+    // Detect admin-locked folders so the picker can offer a writable workspace
+    // (autosave/backups write next to the BIN and would otherwise fail).
+    const writable = await isFolderWritable(dir);
+    store.sysBinFolderRequest = { folder: dir, files, writable };
+    const scenes = files.filter((f) => f.category === "sc").length;
+    const ro = writable ? "" : " — read-only folder, you'll choose a workspace";
+    store.statusMessage = `${files.length} BIN file(s) found (${scenes} scene)${ro}.`;
+    return true;
+  } catch (err) {
+    store.statusMessage = `Error scanning folder: ${err}`;
+    return false;
+  } finally {
+    store.loadingProgress = null;
+  }
+}
+
+/** Set up a writable workspace from a game folder and open the selected files.
+ *
+ *  Materializes exactly `selected ∪ name-tables` into the workspace — NOT the
+ *  whole archive:
+ *   - Every SELECTED file (any category) is materialized: loose → copied,
+ *     archived (`.alf`) → extracted. This is the user's actual pick, so it must
+ *     always land in the workspace (a full-archive install like VERITA keeps the
+ *     real scenes packed, so the selection is mostly archived entries).
+ *   - The character/item NAME tables (`category === "names"` = CVINIT/CIINIT/
+ *     CNINIT/CHINIT/…) are added as support, again loose→copy / archived→extract,
+ *     so speaker names resolve. These are the only files the name-resolution
+ *     passes read; we deliberately do NOT extract every non-scene BIN (that's
+ *     what made VERITA try to unpack ~1600 BINs and fail).
+ *
+ *  Needed when the source folder is read-only OR a selected/name file is archived.
+ *
+ *  The chosen workspace is remembered per source game folder
+ *  (`store.workspaceFolders`, persisted in settings.json): a later open of the
+ *  same game reuses it without re-prompting, and any file already materialized
+ *  there is skipped (no re-copy/re-extract). A remembered path that no longer
+ *  exists falls back to the picker.
+ */
+export async function doSetupWorkspaceAndOpen(
+  folder: string,
+  selected: SysBinFile[],
+  all: SysBinFile[],
+): Promise<void> {
+  if (selected.length === 0) {
+    store.statusMessage = "No files selected to open.";
+    return;
+  }
+  try {
+    // Normalized source game-folder path = the key into the remembered-workspace
+    // map (backslashes→"/", no trailing slash — same normalization used for
+    // workspace paths below and in doOpenSysGameFolder).
+    const key = folder.replace(/\\/g, "/").replace(/\/$/, "");
+
+    // Reuse a previously-chosen workspace if it still exists on disk, skipping
+    // the picker entirely. A remembered path that's gone (drive unmounted, user
+    // deleted it) falls through to the picker and re-records the new choice.
+    // The picker is inside the try so a dialog/plugin error surfaces as a status
+    // message instead of failing silently (the symptom that left the status
+    // stuck on the scan line with no tabs + no error).
+    let dest: string;
+    const remembered = store.workspaceFolders[key];
+    if (remembered && (await pathIsDir(remembered))) {
+      dest = remembered;
+    } else {
+      const picked = await open({
+        directory: true,
+        title: "Choose a writable folder for the translation workspace",
+      });
+      if (typeof picked !== "string") {
+        store.statusMessage = "Cancelled — no workspace chosen.";
+        return;
+      }
+      dest = picked;
+      // Remember it for next time. Reassign the whole object so Svelte's
+      // reactivity picks up the new entry, then persist via the same flow App
+      // uses for settings.json.
+      store.workspaceFolders = { ...store.workspaceFolders, [key]: dest };
+      void import("./settings").then((m) => m.persistAllSettings());
+    }
+
+    const norm = dest.replace(/\\/g, "/").replace(/\/$/, "");
+
+    // selected (any category) + name tables for resolution. Dedup by filename so
+    // a name file that's also somehow selected isn't materialized twice.
+    const byName = new Map<string, SysBinFile>();
+    for (const f of [...selected, ...all.filter((f) => f.category === "names")]) {
+      if (!byName.has(f.filename)) byName.set(f.filename, f);
+    }
+    const provide = [...byName.values()];
+
+    // Skip work already done: only copy/extract files NOT already in the
+    // workspace (the win for re-loading a many-scene game across sessions).
+    // loadPaths below still references ALL selected so they open whether they
+    // were freshly written this run or left over from a previous one.
+    let alreadyPresent = 0;
+    const missing: SysBinFile[] = [];
+    for (const f of provide) {
+      if (await fileExists(`${norm}/${f.filename}`)) {
+        alreadyPresent++;
+      } else {
+        missing.push(f);
+      }
+    }
+
+    const looseSrcs = [...new Set(missing.filter((f) => f.path).map((f) => f.path))];
+    const archivedRefs = missing
+      .filter((f) => f.alf_offset !== undefined)
+      .map((f) => ({
+        archive_index: f.alf_archive_index!,
+        offset: f.alf_offset!,
+        length: f.alf_length!,
+        name: f.filename,
+      }));
+
+    store.statusMessage = "Setting up workspace…";
+    store.loadingProgress = { current: 0, total: 0, currentFile: "Extracting & copying to workspace…" };
+    if (looseSrcs.length) await copyFilesToFolder(looseSrcs, dest);
+    // Best-effort: returns the entries that actually extracted. A shortfall here
+    // is reported (it's the difference between "selected" and "openable").
+    let extracted = 0;
+    if (archivedRefs.length) {
+      const written = await extractAlfToFolder(folder, dest, archivedRefs);
+      extracted = written.length;
+    }
+    store.loadingProgress = null; // doOpenSysBins shows its own per-file progress
+
+    const loadPaths = selected.map((f) => `${norm}/${f.filename}`);
+    // Count tabs actually opened so a per-file failure isn't masked by a blanket
+    // "success" message (the old silent-failure behavior).
+    const before = store.tabs.length;
+    await doOpenSysBins(loadPaths);
+    const opened = store.tabs.length - before;
+    const wsName = norm.split("/").pop();
+    const extractNote =
+      archivedRefs.length > 0 && extracted < archivedRefs.length
+        ? ` (extracted ${extracted} of ${archivedRefs.length} archived)`
+        : "";
+
+    if (opened === 0) {
+      store.statusMessage =
+        `Workspace ${wsName}: opened 0 of ${loadPaths.length} file(s)${extractNote}. ${store.statusMessage}`;
+    } else {
+      store.statusMessage =
+        `Workspace ${wsName} — opened ${opened} of ${loadPaths.length} (${extracted} extracted, ${alreadyPresent} already present)${extractNote}.`;
+    }
+  } catch (err) {
+    store.loadingProgress = null;
+    store.statusMessage = `Workspace setup failed: ${err}`;
+  }
+}
+
+/** Open the chosen folder BINs, each into its own tab. Reuses the single-file
+ *  loader so speaker-name resolution (sibling-folder scan) works automatically. */
+export async function doOpenSysBins(paths: string[]): Promise<void> {
+  if (paths.length === 0) return;
+  if (paths.length > 1) {
+    store.loadingProgress = { current: 0, total: paths.length, currentFile: "" };
+  }
+  for (let i = 0; i < paths.length; i++) {
+    const filename = paths[i].replace(/\\/g, "/").split("/").pop() || paths[i];
+    if (store.loadingProgress) {
+      store.loadingProgress = { current: i, total: paths.length, currentFile: filename };
+    }
+    await doLoadFile(paths[i]);
+  }
+  store.loadingProgress = null;
 }
 
 /** Load the chosen Parente scenes, each into its own tab. */
@@ -1020,6 +1237,7 @@ export async function doLoadProjectFolders(): Promise<void> {
       tab.sourceBinFilename = project.source_bin_filename;
       tab.sourceBinHash = project.source_bin_sha256;
       tab.sysVersion = project.sys_version || (project.is_ver5 ? 5 : 4);
+      await applyEngineInfo(tab);
       tab.claudeModel = project.settings.claude_model;
       store.apiKeyConfigured = project.settings.api_key_configured;
 
@@ -1192,6 +1410,139 @@ export async function doExportBin(): Promise<boolean> {
   });
 }
 
+/**
+ * Export all open BIN tabs as a single `.fanpatch` (a ZIP the version.dll loader
+ * serves). Each BIN is built with the same corruption guardrail as a normal
+ * export. Parente tabs are excluded (they rebuild a .arc, not a BIN).
+ */
+export async function doExportFanpatchFromTabs(): Promise<boolean> {
+  const binTabs = store.tabs.filter((t) => t.format !== "parente" && t.entries.length > 0);
+  if (binTabs.length === 0) {
+    store.statusMessage = "No BIN tabs open to export";
+    return false;
+  }
+
+  const outputPath = await save({
+    filters: [{ name: "Fanpatch", extensions: ["fanpatch"] }],
+    defaultPath: "01_english.fanpatch",
+  });
+  if (!outputPath) return false;
+
+  store.statusMessage = `Building .fanpatch from ${binTabs.length} open BIN(s)…`;
+  try {
+    const result = await exportFanpatch(
+      binTabs.map((t) => ({
+        tabId: t.id,
+        filename: t.sourceBinFilename,
+        entries: t.entries,
+        insertedInstructions: t.insertedInstructions,
+      })),
+      outputPath,
+      store.fanpatchTitle,
+      store.fanpatchLabel,
+      store.fanpatchUiConfigPath
+    );
+    return reportFanpatchResult(result, outputPath);
+  } catch (err) {
+    store.statusMessage = `Error exporting fanpatch: ${err}`;
+    return false;
+  }
+}
+
+/**
+ * Package an existing folder of translated BINs into a `.fanpatch` — no tabs
+ * needed. The right tool for shipping a finished translation (zips the folder).
+ */
+export async function doPackFanpatchFromFolder(): Promise<boolean> {
+  const sourceDir = await open({ directory: true, title: "Select folder of translated BINs" });
+  if (!sourceDir || typeof sourceDir !== "string") return false;
+
+  const outputPath = await save({
+    filters: [{ name: "Fanpatch", extensions: ["fanpatch"] }],
+    defaultPath: "01_english.fanpatch",
+  });
+  if (!outputPath) return false;
+
+  store.statusMessage = "Packaging folder into .fanpatch…";
+  try {
+    const result = await packFanpatchFromDir(
+      sourceDir,
+      outputPath,
+      store.fanpatchTitle,
+      store.fanpatchLabel,
+      store.fanpatchUiConfigPath
+    );
+    return reportFanpatchResult(result, outputPath);
+  } catch (err) {
+    store.statusMessage = `Error packaging fanpatch: ${err}`;
+    return false;
+  }
+}
+
+/**
+ * Build a dual-language `.fanpatch`: pick a folder of translated (English) BINs +
+ * a folder of the matching Japanese originals. `bilingual=false` repairs narrator
+ * boxes only; `bilingual=true` also adds in-game mid-scene EN↔JP switching.
+ */
+export async function doPackDualLanguageFanpatch(bilingual: boolean): Promise<boolean> {
+  const enDir = await open({ directory: true, title: "Select folder of TRANSLATED (English) BINs" });
+  if (!enDir || typeof enDir !== "string") return false;
+
+  const jpDir = await open({ directory: true, title: "Select folder of ORIGINAL (Japanese) BINs" });
+  if (!jpDir || typeof jpDir !== "string") return false;
+
+  // Optional: a folder of translated assets (AGF UI/CG images) to bundle for a full
+  // UI+dialog swap. Cancel this dialog to skip (dialog-only patch).
+  const agfPick = await open({ directory: true, title: "Optional: translated ASSET (AGF) folder — Cancel to skip" });
+  const agfDir = typeof agfPick === "string" ? agfPick : "";
+
+  const outputPath = await save({
+    filters: [{ name: "Fanpatch", extensions: ["fanpatch"] }],
+    defaultPath: "01_english.fanpatch",
+  });
+  if (!outputPath) return false;
+
+  store.statusMessage = bilingual
+    ? "Building bilingual .fanpatch (repair + mid-scene switching)…"
+    : "Building repaired .fanpatch (speaker boxes)…";
+  try {
+    const result = await packDualLanguageFanpatch(
+      enDir,
+      jpDir,
+      agfDir,
+      bilingual,
+      outputPath,
+      store.fanpatchTitle,
+      store.fanpatchLabel,
+      store.fanpatchUiConfigPath
+    );
+    return reportFanpatchResult(result, outputPath);
+  } catch (err) {
+    store.statusMessage = `Error building dual-language fanpatch: ${err}`;
+    return false;
+  }
+}
+
+/** Shared status reporting for the two .fanpatch builders. */
+function reportFanpatchResult(
+  result: { written: number; skipped: string[]; loader_written: boolean },
+  outputPath: string
+): boolean {
+  const name = outputPath.replace(/\\/g, "/").split("/").pop();
+  if (result.skipped.length > 0) {
+    console.warn("Fanpatch skipped entries:", result.skipped);
+  }
+  if (result.written === 0) {
+    store.statusMessage = `Fanpatch empty — nothing exported (${result.skipped.length} skipped, see console)`;
+    return false;
+  }
+  // version.dll + README are written alongside so it's a complete drop-in.
+  const loader = result.loader_written ? " + version.dll" : " (⚠ version.dll not written — see console)";
+  const skip = result.skipped.length > 0 ? ` — ${result.skipped.length} skipped (see console)` : "";
+  store.statusMessage = `Exported ${result.written} BIN(s)${loader} to ${name}${skip}. Drop both into the game folder.`;
+  return true;
+}
+
 /** Resolve a speaker display string for an entry, mirroring EditorRow's logic. */
 function resolveSpeakerForRow(tab: TabState, instructionIndex: number): string | undefined {
   const ref = tab.rowSpeakers[String(instructionIndex)];
@@ -1235,9 +1586,18 @@ function buildTranslationRowsForTab(tab: TabState, opts: { parallel?: boolean } 
 
   // Glossary exact-match lookup — pre-fills translated_text on rows whose
   // original matches a glossary key, so Claude skips them naturally.
+  //
+  // Leak prevention: in DIALOGUE/scene BINs, skip glossary entries whose English
+  // looks like a UI abbreviation (攻撃力 → "ATK"). Those entries exist for stat
+  // screens; auto-seeding them here would plant the abbreviation into prose where
+  // "attack power" is wanted. Leaving them out lets Claude translate the line
+  // fresh. UI/name BINs keep pre-filling normally — abbreviations are correct there.
+  const dialogueBin = isDialogueBin(tab.sourceBinFilename);
   const glossaryMap = new Map<string, string>();
   for (const g of [...store.globalGlossary, ...tab.glossary]) {
-    if (g.japanese && g.english) glossaryMap.set(g.japanese, g.english);
+    if (!g.japanese || !g.english) continue;
+    if (dialogueBin && isUiAbbreviation(g.english)) continue;
+    glossaryMap.set(g.japanese, g.english);
   }
 
   // First pass: build raw rows + assign block_id (bumped on each wait-for-input).
@@ -1489,50 +1849,77 @@ export async function bulkAutoSplitActiveTab(
   const { findOverflows, entryDisplayLength } = await import("./overflow");
   const { applySplitPlan, splitOverflowingGroup } = await import("./insertions");
 
-  const overflows = findOverflows(tab.entries, store.translatedLineCharCap);
+  const cap = store.translatedLineCharCap;
+  const overflows = findOverflows(tab.entries, cap);
   const candidates = overflows.filter((r) => !r.isContinuation && r.splittable);
-  const groupsHandled = new Set<number>();
 
-  for (let i = 0; i < candidates.length; i++) {
-    onProgress?.(i + 1, candidates.length);
-    const row = candidates[i];
+  // Partition overflows: entry-text overflows need a Rust wrap plan (one batch
+  // round-trip); group overflows are frontend-only. Both apply paths below are
+  // synchronous, so Svelte coalesces the inserts into a single table repaint —
+  // the awaited per-row call was both N round-trips AND N repaints.
+  const reqs: import("./ipc").SplitRequest[] = [];
+  const groupRows: typeof candidates = [];
+  for (const row of candidates) {
     const current = tab.entries.find((e) => e.instruction_index === row.id);
     if (!current) continue;
-    try {
-      if (row.individualLength > store.translatedLineCharCap) {
-        // Entry-text overflow → Rust wrap + apply.
-        if (entryDisplayLength(current) <= store.translatedLineCharCap) continue;
-        const plan = await autoSplitEntry(
-          tab.id,
-          current.translated_text,
-          row.id,
-          store.translatedLineCharCap,
-          store.translatedCharCap,
-          store.maxLinesPerBox,
-        );
-        applySplitPlan(plan);
-        out.split++;
-      } else if (row.partOfGroup) {
-        // Group overflow — process once per group (splitOverflowingGroup is
-        // idempotent: returns "not over the line cap" when already handled).
-        if (groupsHandled.has(row.id)) continue;
-        const result = splitOverflowingGroup(current, store.translatedLineCharCap);
-        if (typeof result === "string") {
-          if (!result.includes("not over the line cap")) {
-            out.failed++;
-            if (out.errors.length < 3) out.errors.push(`#${row.id}: ${result}`);
-          }
-        } else {
-          out.split++;
-          groupsHandled.add(row.id);
-        }
-      }
-    } catch (err) {
-      out.failed++;
-      if (out.errors.length < 3) out.errors.push(`#${row.id}: ${err}`);
+    if (row.individualLength > cap) {
+      if (entryDisplayLength(current) <= cap) continue;
+      reqs.push({ translated_text: current.translated_text, entry_index: row.id });
+    } else if (row.partOfGroup) {
+      groupRows.push(row);
     }
   }
-  if (out.split > 0) tab.isDirty = true;
+
+  // Entry-text overflows: one round-trip for all plans, then apply synchronously.
+  if (reqs.length > 0) {
+    let outcomes: import("./ipc").SplitOutcome[];
+    try {
+      outcomes = await autoSplitEntriesBatch(tab.id, reqs, cap);
+    } catch (err) {
+      out.failed += reqs.length;
+      if (out.errors.length < 3) out.errors.push(`batch: ${err}`);
+      outcomes = [];
+    }
+    for (let i = 0; i < outcomes.length; i++) {
+      onProgress?.(i + 1, outcomes.length);
+      const o = outcomes[i];
+      if (o.plan) {
+        const r = applySplitPlan(o.plan);
+        if (typeof r === "string") {
+          out.failed++;
+          if (out.errors.length < 3) out.errors.push(`#${o.entry_index}: ${r}`);
+        } else {
+          out.split++;
+        }
+      } else {
+        out.failed++;
+        if (o.error && out.errors.length < 3) out.errors.push(`#${o.entry_index}: ${o.error}`);
+      }
+    }
+  }
+
+  // Group overflows — frontend-only, idempotent ("not over the line cap" once handled).
+  const groupsHandled = new Set<number>();
+  for (const row of groupRows) {
+    if (groupsHandled.has(row.id)) continue;
+    const current = tab.entries.find((e) => e.instruction_index === row.id);
+    if (!current) continue;
+    const result = splitOverflowingGroup(current, cap);
+    if (typeof result === "string") {
+      if (!result.includes("not over the line cap")) {
+        out.failed++;
+        if (out.errors.length < 3) out.errors.push(`#${row.id}: ${result}`);
+      }
+    } else {
+      out.split++;
+      groupsHandled.add(row.id);
+    }
+  }
+
+  if (out.split > 0) {
+    tab.isDirty = true;
+    tab.entries = [...tab.entries]; // single reactivity nudge → one repaint
+  }
   return out;
 }
 
@@ -1544,12 +1931,15 @@ export async function bulkAutoSplitActiveTab(
  */
 export async function bulkAutoSplitAllTabs(
   onProgress?: (current: number, total: number, tabName: string) => void,
-): Promise<{ split: number; failed: number; tabsProcessed: number; errors: string[] }> {
-  const agg = { split: 0, failed: 0, tabsProcessed: 0, errors: [] as string[] };
+): Promise<{ split: number; failed: number; tabsProcessed: number; cancelled: boolean; errors: string[] }> {
+  const agg = { split: 0, failed: 0, tabsProcessed: 0, cancelled: false, errors: [] as string[] };
   if (store.translatedLineCharCap <= 0) return agg;
+  store.bulkCancelRequested = false;
   const prevActiveIndex = store.activeTabIndex;
   const tabs = [...store.tabs];
   for (let i = 0; i < tabs.length; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let a Stop click process between tabs
+    if (store.bulkCancelRequested) { agg.cancelled = true; break; } // user stopped between tabs
     const t = tabs[i];
     const tabIndex = store.tabs.indexOf(t);
     if (tabIndex < 0) continue;
@@ -1573,35 +1963,151 @@ export async function bulkAutoSplitAllTabs(
  * action, this switches the active tab transiently (paginateBox uses per-tab
  * state) and restores it. Returns aggregated totals.
  */
+export async function bulkPaginateActiveTab(): Promise<{ paginated: number; errors: string[] }> {
+  const out = { paginated: 0, errors: [] as string[] };
+  const tab = store.activeTab;
+  if (!tab || store.maxLinesPerBox < 1) return out;
+  const { findBoxOverflows } = await import("./overflow");
+  const { paginateBoxWithBridge } = await import("./insertions");
+  const { getBridgeClone } = await import("./ipc");
+  const boxes = findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox)
+    .filter((b) => b.tooManyLines)
+    .sort((a, b) => b.index - a.index); // back-to-front so indices stay valid
+  if (boxes.length === 0) return out;
+  // Resolve the box-transition bridge ONCE (not per box), then paginate
+  // synchronously (Svelte coalesces every insert into one repaint).
+  let bridge: import("./types").SerializedInstruction[];
+  const q = tab.bridgeTemplateQuality;
+  if (q === "clean" || q === "degraded") {
+    try {
+      bridge = await getBridgeClone(tab.id);
+    } catch (err) {
+      out.errors.push(`No box bridge: ${err}`);
+      return out;
+    }
+  } else {
+    // This scene has no native bridge (e.g. MZ event scenes). Borrow a CALL-FREE
+    // box-open from another open scene: strip control-flow (call 0x8F / jmp 0x8C /
+    // jcc 0xA0) whose address args are scene-specific and would mis-resolve here.
+    // The remaining box-state + box-open opcodes carry no addresses → safe to
+    // clone. Verified in-game on MZ SC0740/SC0750 (clean box, no crash).
+    const donor = store.tabs.find(
+      (t) => t.id !== tab.id && (t.bridgeTemplateQuality === "clean" || t.bridgeTemplateQuality === "degraded"),
+    );
+    if (!donor) {
+      out.errors.push("No box bridge in this scene; open a scene that paginates in another tab to borrow one.");
+      return out;
+    }
+    try {
+      bridge = (await getBridgeClone(donor.id)).filter(
+        (i) => i.opcode !== 0x8f && i.opcode !== 0x8c && i.opcode !== 0xa0,
+      );
+    } catch (err) {
+      out.errors.push(`borrowed bridge: ${err}`);
+      return out;
+    }
+    if (!bridge.some((i) => i.opcode === 0x1f5)) {
+      out.errors.push("borrowed bridge had no box-open after stripping control-flow.");
+      return out;
+    }
+  }
+  for (const box of boxes) {
+    const startEntry = tab.entries[box.index];
+    if (!startEntry) continue;
+    const r = paginateBoxWithBridge(startEntry, store.maxLinesPerBox, bridge);
+    if (typeof r === "number" && r > 0) out.paginated++;
+    else if (typeof r === "string" && !r.includes("already fits")) {
+      if (out.errors.length < 5) out.errors.push(r);
+    }
+  }
+  if (out.paginated > 0) tab.entries = [...tab.entries]; // single reactivity nudge
+  return out;
+}
+
 export async function bulkPaginateAllTabs(
   onProgress?: (current: number, total: number, tabName: string) => void,
-): Promise<{ paginated: number; tabsProcessed: number; errors: string[] }> {
-  const agg = { paginated: 0, tabsProcessed: 0, errors: [] as string[] };
+): Promise<{ paginated: number; tabsProcessed: number; cancelled: boolean; errors: string[] }> {
+  const agg = { paginated: 0, tabsProcessed: 0, cancelled: false, errors: [] as string[] };
   if (store.maxLinesPerBox < 1) return agg;
-  const { findBoxOverflows } = await import("./overflow");
-  const { paginateBox } = await import("./insertions");
+  store.bulkCancelRequested = false;
   const prevActiveIndex = store.activeTabIndex;
   const tabs = [...store.tabs];
   for (let i = 0; i < tabs.length; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0)); // let a Stop click process between tabs
+    if (store.bulkCancelRequested) { agg.cancelled = true; break; } // user stopped between tabs
     const t = tabs[i];
     const tabIndex = store.tabs.indexOf(t);
     if (tabIndex < 0) continue;
     store.activeTabIndex = tabIndex; // paginateBox operates on the active tab
     onProgress?.(i + 1, tabs.length, t.sourceBinFilename || `Tab ${i + 1}`);
-    const boxes = findBoxOverflows(t.entries, store.translatedCharCap, store.maxLinesPerBox)
-      .filter((b) => b.tooManyLines)
-      .sort((a, b) => b.index - a.index); // back-to-front so indices stay valid
-    for (const box of boxes) {
-      const startEntry = t.entries[box.index];
-      if (!startEntry) continue;
-      const r = await paginateBox(startEntry, store.maxLinesPerBox);
-      if (typeof r === "number" && r > 0) agg.paginated++;
-      else if (typeof r === "string" && !r.includes("already fits")) {
-        if (agg.errors.length < 5) agg.errors.push(`${t.sourceBinFilename}: ${r}`);
-      }
-    }
-    t.entries = [...t.entries]; // nudge reactivity after in-place inserts
+    const r = await bulkPaginateActiveTab();
+    agg.paginated += r.paginated;
+    for (const e of r.errors) if (agg.errors.length < 5) agg.errors.push(`${t.sourceBinFilename}: ${e}`);
     agg.tabsProcessed++;
+  }
+  store.activeTabIndex = prevActiveIndex;
+  return agg;
+}
+
+/**
+ * Re-flow the ACTIVE tab to new text-box caps. Reverts every existing auto-split
+ * beat back to its full English (via `revertAllAutoSplits`), then re-wraps at the
+ * given per-line cap and re-paginates at the given lines-per-box. This rebuilds
+ * the line/box layout for a corrected box geometry WITHOUT re-translating — the
+ * fix for translations baked at the wrong caps (e.g. 50×3 when the game is 47×2).
+ *
+ * Sets the global caps as a side effect (the wrap/paginate steps read them).
+ */
+export async function reflowActiveTab(
+  lineCharCap: number,
+  maxLinesPerBox: number,
+): Promise<{ reverted: number; split: number; paginated: number; errors: string[] }> {
+  const { revertAllAutoSplits } = await import("./insertions");
+  store.translatedLineCharCap = lineCharCap;
+  store.maxLinesPerBox = maxLinesPerBox;
+  const rev = revertAllAutoSplits();
+  const wrap = await bulkAutoSplitActiveTab();
+  const pag = await bulkPaginateActiveTab();
+  return {
+    reverted: rev.reverted,
+    split: wrap.split,
+    paginated: pag.paginated,
+    errors: [...rev.errors, ...wrap.errors, ...pag.errors],
+  };
+}
+
+/**
+ * Re-flow EVERY open tab to new caps (all-tabs version of `reflowActiveTab`).
+ * Switches the active tab transiently per tab (the revert/wrap/paginate steps
+ * use per-tab Rust + store state keyed by the active tab) and restores it.
+ */
+export async function reflowAllTabs(
+  lineCharCap: number,
+  maxLinesPerBox: number,
+  onProgress?: (current: number, total: number, tabName: string) => void,
+): Promise<{ reverted: number; split: number; paginated: number; tabsProcessed: number; cancelled: boolean; errors: string[] }> {
+  const agg = { reverted: 0, split: 0, paginated: 0, tabsProcessed: 0, cancelled: false, errors: [] as string[] };
+  store.bulkCancelRequested = false;
+  const prevActiveIndex = store.activeTabIndex;
+  const tabs = [...store.tabs];
+  for (let i = 0; i < tabs.length; i++) {
+    // Yield to the MACROtask queue so a queued Stop click is processed before we
+    // check the flag. A tab with nothing to do resolves via microtasks only,
+    // which never lets the click through — that's why Stop looked dead. This also
+    // lets the progress bar repaint between tabs.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (store.bulkCancelRequested) { agg.cancelled = true; break; } // user stopped between tabs
+    const t = tabs[i];
+    const tabIndex = store.tabs.indexOf(t);
+    if (tabIndex < 0) continue;
+    store.activeTabIndex = tabIndex;
+    onProgress?.(i + 1, tabs.length, t.sourceBinFilename || `Tab ${i + 1}`);
+    const r = await reflowActiveTab(lineCharCap, maxLinesPerBox);
+    agg.reverted += r.reverted;
+    agg.split += r.split;
+    agg.paginated += r.paginated;
+    agg.tabsProcessed++;
+    for (const e of r.errors) if (agg.errors.length < 8) agg.errors.push(`${t.sourceBinFilename}: ${e}`);
   }
   store.activeTabIndex = prevActiveIndex;
   return agg;
@@ -1768,6 +2274,17 @@ export async function doExportAllTabsForTranslation(): Promise<boolean> {
       if (rows.length === 0) { skipped++; continue; }
       tabBundles.push({ tab, folderName, rows });
     }
+
+    // Order name/item (CVINIT/…) bundles FIRST so the batch translates the
+    // character/item name tables before any scene — scenes then inherit the
+    // final translated names (and the cross-folder dedup below picks a name
+    // file as canonical for any shared string). Stable: keeps original tab
+    // order within each group.
+    tabBundles.sort((a, b) => {
+      const an = isNameItemFile(a.tab.sourceBinFilename) ? 0 : 1;
+      const bn = isNameItemFile(b.tab.sourceBinFilename) ? 0 : 1;
+      return an - bn;
+    });
 
     // Phase 2: cross-folder dedup + translation-memory pre-fill.
     // For every unique `original` text across the export bundle:
