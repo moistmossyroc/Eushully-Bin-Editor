@@ -296,10 +296,17 @@ export function applySplitPlan(plan: SplitPlan): string | number {
         break;
       }
     }
+    // Continuations are ALWAYS plain dialogue lines — force show-text (0x6E),
+    // never inherit the source's opcode. A split source can be a display-furigana
+    // (0x196) whose group anchor carried the whole line; emitting 0x196
+    // continuations would ruby-render the English. The 0x6E arg template comes
+    // from plan.show_text_template_args (a real show-text shape; see
+    // build_split_plan's non-0x6E fallback), so the single string slot is set
+    // above with no stale kanji.
     const idx = insertInstructionVisually(
       prevInstructionIndex,
-      source.label,
-      source.opcode,
+      "show-text",
+      0x6e,
       contArgs,
       false,
       "",

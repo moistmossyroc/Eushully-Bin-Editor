@@ -43,6 +43,7 @@ import {
   parenteLoadProject,
   type TranslationRow,
   type TranslationFolderStatus,
+  type SplitCapability,
   type SysBinFile,
   type ParenteGameFile,
   type ParentePatchFile,
@@ -1399,7 +1400,20 @@ export async function doExportBin(): Promise<boolean> {
           // Full entries (incl. negative continuation rows) — see exportBin note;
           // resolveInsertionsForExport needs them for ordering + text sync.
           await exportBin(tab.id, outputPath, tab.entries, tab.insertedInstructions);
-          store.statusMessage = `Exported to ${outputPath.replace(/\\/g, "/").split("/").pop()}`;
+          // Count display-furigana entries that apply.rs converts to show-text
+          // (prose translation, no "[reading]" suffix) — mirror its condition so
+          // the status surfaces the change; entries kept as ruby are excluded.
+          const furiganaFixed = tab.entries.filter((e) => {
+            if (e.label !== "display-furigana" || e.deleted || e.is_context_row || e.omit_export) return false;
+            const t = e.translated_text ?? "";
+            if (t.trim() === "") return false;
+            const hasReading = t.endsWith("]") && t.lastIndexOf(" [") !== -1;
+            return !hasReading;
+          }).length;
+          const fileName = outputPath.replace(/\\/g, "/").split("/").pop();
+          store.statusMessage = furiganaFixed > 0
+            ? `Exported to ${fileName} — ${furiganaFixed} furigana line${furiganaFixed === 1 ? "" : "s"} rendered as normal text`
+            : `Exported to ${fileName}`;
           resolve(true);
         } catch (err) {
           store.statusMessage = `Error exporting: ${err}`;
@@ -1612,7 +1626,12 @@ function buildTranslationRowsForTab(tab: TabState, opts: { parallel?: boolean } 
       i++;
       continue;
     }
-    if (e.deleted || e.is_context_row || !TRANSLATABLE.has(e.label)) { i++; continue; }
+    // Parente rows carry Lua block/function names (e.g. "block_00001", "text")
+    // as their label, not AGE opcode labels — the TRANSLATABLE opcode gate would
+    // drop every one. For Parente every non-deleted string is translatable; its
+    // labels aren't GROUPABLE either, so each becomes an individual row below.
+    const isTranslatableLabel = tab.format === "parente" || TRANSLATABLE.has(e.label);
+    if (e.deleted || e.is_context_row || !isTranslatableLabel) { i++; continue; }
     // Skip rows the user explicitly marked omit_export. The intent is "don't
     // write this to the BIN at export time" → there's no value in asking
     // Claude to translate it, and including it in translation.json makes
@@ -1658,7 +1677,13 @@ function buildTranslationRowsForTab(tab: TabState, opts: { parallel?: boolean } 
           block_id: blockId,
         });
       } else {
-        const anchor = members[0];
+        // Anchor on the first show-text member (never a display-furigana): the
+        // full-line English must land on a 0x6E show-text so the engine renders
+        // it as normal dialogue, not ruby. Non-anchor members — including the
+        // furigana — get omit-emptied on import (see import_translations'
+        // group_member_to_anchor pass). Fall back to members[0] when the group
+        // has no show-text at all (lone-furigana lines: unchanged behaviour).
+        const anchor = members.find((m) => m.label === "show-text") ?? members[0];
         const concatJp = members.map(groupJp).join("");
         const existing = anchor.translated_text ?? "";
         const fromGlossary = !existing.trim() ? glossaryMap.get(concatJp) : undefined;
@@ -1669,7 +1694,12 @@ function buildTranslationRowsForTab(tab: TabState, opts: { parallel?: boolean } 
           original: concatJp,
           translated: fromGlossary ?? existing,
           notes: anchor.notes ?? "",
-          group_member_ids: members.map((m) => m.instruction_index),
+          // Anchor id FIRST so import's skip(1) omit-empties the rest (incl.
+          // the furigana); remaining members stay in original reading order.
+          group_member_ids: [
+            anchor.instruction_index,
+            ...members.filter((m) => m !== anchor).map((m) => m.instruction_index),
+          ],
           block_id: blockId,
         });
       }
@@ -1782,11 +1812,16 @@ export async function doExportForTranslation(): Promise<boolean> {
     }
 
     store.statusMessage = "Writing translation files...";
-    const cap = await getSplitCapability(tab.id);
+    // Parente tabs have no Rust-side parsed_bin/bridge — getSplitCapability
+    // would error. No-split default matching SplitCapability's shape.
+    const cap: SplitCapability =
+      tab.format === "parente"
+        ? { can_add_boxes: false, can_break_lines: false }
+        : await getSplitCapability(tab.id);
     const writtenDir = await exportForTranslation(
       outputDir,
       tab.sourceBinFilename,
-      tab.sourceBinHash,
+      tab.sourceBinHash ?? "",
       store.translatedLineCharCap,
       store.maxLinesPerBox,
       cap.can_add_boxes,
@@ -2177,8 +2212,17 @@ export async function doImportTranslations(): Promise<boolean> {
     }
 
     // Auto-split on import (opt-in): wrap/box-split overflowing rows now so the
-    // user doesn't have to open the Overflow dialog and split manually.
-    if (store.autoSplitOnImport && store.translatedLineCharCap > 0 && result.applied > 0) {
+    // user doesn't have to open the Overflow dialog and split manually. Skipped
+    // for Parente — box/line splitting is an AGE opcode concept (the Unity/Lua
+    // engine wraps text itself), and bulkAutoSplitActiveTab hits Rust per-tab
+    // state Parente tabs don't have, which would throw and mislabel a successful
+    // import as failed.
+    if (
+      tab.format !== "parente" &&
+      store.autoSplitOnImport &&
+      store.translatedLineCharCap > 0 &&
+      result.applied > 0
+    ) {
       store.statusMessage = "Auto-splitting overflowing rows...";
       const r = await bulkAutoSplitActiveTab();
       tab.entries = [...tab.entries]; // nudge reactivity after in-place inserts
@@ -2239,9 +2283,11 @@ function binNameToFolderName(filename: string): string {
  * `translate-all.bat` / `translate-all.sh` for batch translation.
  */
 export async function doExportAllTabsForTranslation(): Promise<boolean> {
-  const tabs = store.tabs.filter((t) => t.binPath && t.entries.length > 0);
+  const tabs = store.tabs.filter(
+    (t) => t.entries.length > 0 && (!!t.binPath || t.format === "parente"),
+  );
   if (tabs.length === 0) {
-    store.statusMessage = "No tabs with loaded BIN data to export.";
+    store.statusMessage = "No tabs with translatable data to export.";
     return false;
   }
 
@@ -2419,11 +2465,17 @@ export async function doExportAllTabsForTranslation(): Promise<boolean> {
         // Non-fatal — proceed with fresh export.
       }
 
-      const cap = await getSplitCapability(tab.id);
+      // Parente tabs have no Rust-side parsed_bin/bridge — getSplitCapability
+      // would error. They also can't grow boxes or break lines the AGE way, so
+      // use a no-split default matching SplitCapability's shape.
+      const cap: SplitCapability =
+        tab.format === "parente"
+          ? { can_add_boxes: false, can_break_lines: false }
+          : await getSplitCapability(tab.id);
       await exportForTranslation(
         subPath,
         tab.sourceBinFilename,
-        tab.sourceBinHash,
+        tab.sourceBinHash ?? "",
         store.translatedLineCharCap,
         store.maxLinesPerBox,
         cap.can_add_boxes,
@@ -2547,6 +2599,9 @@ export async function doImportAllTranslations(): Promise<boolean> {
       const prevActiveIndex = store.activeTabIndex;
       for (let i = 0; i < importedTabs.length; i++) {
         const t = importedTabs[i];
+        // Splitting is AGE-only (Parente/Lua wraps its own text and has no
+        // per-tab Rust bridge state) — skip so the batch doesn't throw.
+        if (t.format === "parente") continue;
         const tabIndex = store.tabs.indexOf(t);
         if (tabIndex < 0) continue;
         store.activeTabIndex = tabIndex;

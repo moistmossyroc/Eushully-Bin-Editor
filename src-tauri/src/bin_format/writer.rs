@@ -95,7 +95,12 @@ pub fn write_bin(header: &Header, instructions: &[Instruction]) -> Result<Vec<u8
                     current_string_offset += padding as u64;
                 }
             } else if is_ver5 {
-                let text = arg.decoded_string.as_ref().unwrap();
+                // Normalize smart/curly quotes → ASCII (see strings.rs) so they
+                // don't encode to wide full-width glyphs in-game. Only MODIFIED
+                // strings reach here (unchanged reuse original_encoded_bytes above).
+                let text = crate::bin_format::strings::normalize_export_punctuation(
+                    arg.decoded_string.as_ref().unwrap(),
+                );
                 // SYS5: UTF-16LE encoding, each byte XOR'd with 0xFF
                 let utf16_chars: Vec<u16> = text.encode_utf16().collect();
                 let str_len = utf16_chars.len();
@@ -117,9 +122,13 @@ pub fn write_bin(header: &Header, instructions: &[Instruction]) -> Result<Vec<u8
                 }
                 current_string_offset += padding as u64;
             } else {
-                let text = arg.decoded_string.as_ref().unwrap();
+                // Normalize smart/curly quotes → ASCII so they don't encode to
+                // wide full-width SJIS glyphs (e.g. "Celica's" → "Celica' s").
+                let text = crate::bin_format::strings::normalize_export_punctuation(
+                    arg.decoded_string.as_ref().unwrap(),
+                );
                 // SYS4: SJIS encoding, each byte XOR'd with 0xFF
-                let (encoded, _, _) = SHIFT_JIS.encode(text);
+                let (encoded, _, _) = SHIFT_JIS.encode(&text);
                 let sjis_bytes = encoded.as_ref();
                 let str_len = sjis_bytes.len();
 

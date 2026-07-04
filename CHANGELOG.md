@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.4.1 — 2026-07-04
+
+### Fixed — in-game render correctness
+- **Furigana lines no longer render as ruby.** A dialogue line containing an
+  inline `display-furigana` word used to put the whole English translation on the
+  furigana (ruby) slot, so it rendered as tiny annotation with the Japanese word
+  still showing. The translation now lands on a normal `show-text`, and auto-split
+  continuations are proper show-text. Already-translated furigana scenes are
+  corrected simply by re-exporting (a prose-carrying furigana entry converts to
+  show-text on export).
+- **Full Shift-JIS character normalization on export.** Characters that Claude
+  emits but the game's font can't show were becoming wide or `?` mojibake in-game.
+  Now normalized on export: smart/curly quotes → ASCII (fixes `Celica's`
+  rendering as `Celica' s`); tilde `~` → centered full-width wave dash; and
+  accented Latin (é/ñ/ü), romaji macrons (ā/ō/ū), em/en dashes, non-breaking
+  spaces, ligatures (æ/œ/ß), fractions, `™©®`, and hearts (→ `<3`) are
+  transliterated to safe ASCII. The in-editor text keeps its original typography;
+  only the exported bytes change. Re-export existing scenes to apply.
+- **`.fanpatch` loading for Japanese-named game folders.** The loader's zip reader
+  assumed UTF-8 paths and failed to open the patch when the game folder had a
+  Japanese name (so nothing was served).
+- Loader-package export no longer drops a redundant loose `fanpatch_title.txt`
+  (the title/label are bundled inside the `.fanpatch`).
+
+### Added
+- **CC Translate support for Parente** (Yamiyo no Parente) scenes, with a
+  format-aware export menu — native `.arc`/Lua export, and the AGE-only
+  `.fanpatch` options are hidden when a Parente tab is active.
+- **Inline editing** in the Glossary Check "Abbreviations in dialogue" list, so
+  flagged lines can be fixed without leaving the dialog.
+
 ## 1.4.0 — 2026-06-29
 
 ### Added — archived-game support & staged translation

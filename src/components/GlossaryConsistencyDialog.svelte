@@ -126,6 +126,40 @@
     return [...byTab.values()].sort((a, b) => a.tabIndex - b.tabIndex);
   });
 
+  // ── Abbreviation-view inline edits ────────────────────────────────────────
+  // SEPARATE draft store from the consistency `drafts` below, so the consistency
+  // footer (pendingCount / "Apply all") is left untouched. Keyed by
+  // `${tabIndex}|${instruction_index}` — hits that share a row (a line with
+  // several abbreviations) share a key, so fixing the line once keeps every hit
+  // for that row in sync and they drop together once spelled out.
+  let abbrevDrafts = $state<Record<string, string>>({});
+  const abbrevKey = (h: AbbreviationHit) => `${h.tabIndex}|${h.instruction_index}`;
+  const abbrevChanged = (h: AbbreviationHit) => {
+    const v = abbrevDrafts[abbrevKey(h)];
+    return v !== undefined && v !== h.snippet;
+  };
+
+  /** Commit one abbreviation-hit edit to its dialogue row's `translated_text`.
+   *  Resolves the entry by stable `instruction_index` (falls back to `rowIndex`),
+   *  rebuilds `tab.entries` per the Svelte 5 reactivity gotcha, and marks the tab
+   *  dirty. Since `abbrevHits` is $derived, a row whose abbreviation was spelled
+   *  out drops from the list automatically on the next tick. */
+  function applyAbbrevEdit(h: AbbreviationHit) {
+    const key = abbrevKey(h);
+    const value = abbrevDrafts[key];
+    if (value === undefined || value === h.snippet) return;
+    const tab = store.tabs[h.tabIndex];
+    if (!tab) return;
+    const idx = tab.entries.findIndex((e) => e.instruction_index === h.instruction_index);
+    const target = idx >= 0 ? idx : h.rowIndex;
+    tab.entries = tab.entries.map((e, i) =>
+      i === target ? { ...e, translated_text: value } : e,
+    );
+    tab.isDirty = true;
+    delete abbrevDrafts[key];
+    toastInfo("Translation updated");
+  }
+
   // Inline-edit drafts keyed by `${tabIndex}|${rowId}`.
   let drafts = $state<Record<string, string>>({});
   const keyOf = (tabIndex: number, rowId: number) => `${tabIndex}|${rowId}`;
@@ -313,12 +347,19 @@
               <div class="tab-head">{g.file} <span class="tab-count">{g.hits.length}</span></div>
               {#each g.hits as h (h.instruction_index + "|" + h.term)}
                 <div class="row">
-                  <div class="abbrev-row">
-                    <div class="abbrev-main">
-                      <span class="chip"><span class="en">{h.term}</span></span>
-                      <span class="orig" title={h.snippet}>{truncate(h.snippet, 160)}</span>
+                  <div class="terms">
+                    <span class="chip"><span class="en">{h.term}</span></span>
+                  </div>
+                  <div class="edit">
+                    <textarea
+                      rows="2"
+                      value={abbrevDrafts[abbrevKey(h)] ?? h.snippet}
+                      oninput={(e) => (abbrevDrafts[abbrevKey(h)] = e.currentTarget.value)}
+                    ></textarea>
+                    <div class="row-actions">
+                      <button class="apply" disabled={!abbrevChanged(h)} onclick={() => applyAbbrevEdit(h)}>Apply</button>
+                      <button class="open" onclick={() => jumpToAbbrev(h)} title="Open this row in the editor">Open row →</button>
                     </div>
-                    <button class="open" onclick={() => jumpToAbbrev(h)} title="Open this row in the editor">Open row →</button>
                   </div>
                 </div>
               {/each}
@@ -366,9 +407,6 @@
   .vbtn { padding: 4px 14px; border: 1px solid #34345a; border-radius: 6px; background: #16162e; color: #b0b0d0; cursor: pointer; font-size: 0.82rem; }
   .vbtn:hover { background: #22224a; }
   .vbtn.active { background: #2a3a6e; border-color: #6c9bd2; color: #cfe0ff; }
-  .abbrev-row { display: flex; align-items: center; gap: 10px; }
-  .abbrev-main { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; }
-  .abbrev-main .orig { margin-bottom: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .filter-bar { display: flex; align-items: center; gap: 6px; padding: 10px 20px; border-bottom: 1px solid #2a2a4a; }
   .flabel { color: #8a8aae; font-size: 0.8rem; margin-right: 2px; }
   .fbtn { padding: 3px 12px; border: 1px solid #34345a; border-radius: 999px; background: #16162e; color: #b0b0d0; cursor: pointer; font-size: 0.78rem; }

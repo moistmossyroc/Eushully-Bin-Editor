@@ -13,6 +13,15 @@ pub fn apply_changes(
 ) -> Vec<Instruction> {
     let mut instructions = original_instructions.to_vec();
 
+    // Template for converting a display-furigana (0x196) whose translation is
+    // prose (no "[reading]" suffix) into a show-text (0x6E) — see the 0x196 arm
+    // in apply_translation_to_instruction. Clone the first real show-text's args
+    // so the converted instruction gets a valid 2-arg shape (one string slot).
+    let show_text_template: Option<Vec<Argument>> = original_instructions
+        .iter()
+        .find(|i| i.opcode == 0x6E && i.arguments.iter().any(|a| a.arg_type == 2))
+        .map(|i| i.arguments.clone());
+
     // Phase 1: Apply translations to existing instructions.
     // We match dialogue entries back to instructions by instruction_index.
     // Skip entries with negative instruction_index (visually-inserted, handled by insertedInstructions).
@@ -43,7 +52,7 @@ pub fn apply_changes(
                     }
                 }
             } else {
-                apply_translation_to_instruction(instr, entry);
+                apply_translation_to_instruction(instr, entry, show_text_template.as_deref());
             }
         }
     }
@@ -88,7 +97,14 @@ pub fn apply_changes(
 }
 
 /// Apply a translation to a specific instruction's string arguments.
-fn apply_translation_to_instruction(instr: &mut Instruction, entry: &DialogueEntry) {
+///
+/// `show_text_template` is the arg shape of a real show-text (0x6E), used to
+/// convert a prose-carrying display-furigana (0x196) into a show-text.
+fn apply_translation_to_instruction(
+    instr: &mut Instruction,
+    entry: &DialogueEntry,
+    show_text_template: Option<&[Argument]>,
+) {
     match instr.opcode {
         0x6E => {
             // show-text: the translated_text replaces string arguments
@@ -122,6 +138,46 @@ fn apply_translation_to_instruction(instr: &mut Instruction, entry: &DialogueEnt
                 (text.as_str(), "")
             };
 
+            // Conditional convert: if the translation is PROSE (no "[reading]"),
+            // this furigana entry is carrying a plain translated line, not a ruby
+            // annotation — rewrite it as a show-text (0x6E) so the engine renders
+            // normal dialogue instead of ruby. A real reading (furigana non-empty)
+            // is KEPT as 0x196 (ruby preserved); untranslated entries never reach
+            // here (skipped upstream). Needs a show-text template for a valid 2-arg
+            // shape; without one, fall through to the legacy furigana write.
+            if furigana.is_empty() && !main_text.is_empty() {
+                if let Some(tmpl) = show_text_template {
+                    let mut new_args: Vec<Argument> = tmpl
+                        .iter()
+                        .map(|a| Argument {
+                            arg_type: a.arg_type,
+                            raw_data: a.raw_data,
+                            decoded_string: a.decoded_string.clone(),
+                            original_encoded_bytes: None,
+                            data_array: a.data_array.clone(),
+                        })
+                        .collect();
+                    let mut wrote = false;
+                    for arg in &mut new_args {
+                        if arg.arg_type == 2 {
+                            arg.decoded_string = Some(main_text.to_string());
+                            arg.original_encoded_bytes = None;
+                            wrote = true;
+                            break;
+                        }
+                    }
+                    if wrote {
+                        instr.opcode = 0x6E;
+                        instr.label = "show-text".to_string();
+                        instr.argument_count = new_args.len() as u32;
+                        instr.arguments = new_args;
+                        // instr.offset stays at the parsed value (writer remaps it).
+                        return;
+                    }
+                }
+            }
+
+            // Keep as furigana: base → string slot 0, reading → string slot 1.
             let mut string_idx = 0;
             for arg in &mut instr.arguments {
                 if arg.arg_type == 2 {

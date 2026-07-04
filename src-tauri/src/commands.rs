@@ -374,21 +374,10 @@ fn write_loader_package(output_path: &str) -> bool {
     let dll_ok = !BUNDLED_LOADER_DLL.is_empty()
         && std::fs::write(dir.join("version.dll"), BUNDLED_LOADER_DLL).is_ok();
     let _ = std::fs::write(dir.join("README - fanpatch install.txt"), FANPATCH_README);
-    // Optional title-bar customization template (commented out → no effect until
-    // the user edits it). The loader reads the first non-# line as the game name.
-    let title_tpl = "# Optional title-bar customization (UTF-8). Remove the leading '#' to enable.\r\n\
-# Result shown in the title bar: <title> [<label> - English] / [<label> - \u{65E5}\u{672C}\u{8A9E}]\r\n\
-#\r\n\
-#   title = the game name (optional; defaults to the game's own title)\r\n\
-#   label = the patch label, e.g. a version (optional; defaults to \"Fanpatch\")\r\n\
-#\r\n\
-# Example (great for partial releases — version is visible in screenshots):\r\n\
-# title = Sankai no Yubiwa - Ring of the Sea King\r\n\
-# label = Fanpatch v0.9\r\n";
-    let title_path = dir.join("fanpatch_title.txt");
-    if !title_path.exists() {
-        let _ = std::fs::write(title_path, title_tpl);
-    }
+    // The title/label config (fanpatch_title.txt) is bundled INSIDE the .fanpatch
+    // zip (see bundle_loader_configs) from the in-editor Title/Label fields, and
+    // the loader reads the bundled copy first. So we no longer drop a loose
+    // template here — keeps the shipped package to version.dll + README + .fanpatch.
     dll_ok
 }
 
@@ -1759,21 +1748,32 @@ fn build_split_plan(
     // unless speaker_arg_positions are populated.
     let speaker_id = 0u32;
 
-    // Argument template from the source show-text so the frontend builds
-    // structurally correct continuation instructions.
-    let show_text_template_args = if entry_index < parsed_bin.instructions.len() {
-        parsed_bin.instructions[entry_index]
-            .arguments
-            .iter()
-            .map(|a| crate::editor::bridge::SerializedArg {
-                arg_type: a.arg_type,
-                raw_data: a.raw_data,
-                decoded_string: a.decoded_string.clone(),
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Argument template for continuation show-text instructions. Normally the
+    // source entry IS a show-text (0x6E), so we clone its args verbatim. But an
+    // overflowing entry can be a display-furigana (0x196) whose group anchor got
+    // promoted so it carries a whole line's English. A 0x196 has a 3-arg,
+    // two-string-slot shape; using it as a show-text template would emit a ruby
+    // instruction with a stale kanji slot. So when the source isn't a show-text,
+    // clone the FIRST real 0x6E's arguments instead — a proper single-string
+    // show-text shape (mirrors the end_text_line_template fallback below).
+    // argument_count stays == arguments.len() via build_instruction_from_insertion.
+    const OP_SHOW_TEXT: u32 = 0x6E;
+    let show_text_template_args = parsed_bin
+        .instructions
+        .get(entry_index)
+        .filter(|i| i.opcode == OP_SHOW_TEXT)
+        .or_else(|| parsed_bin.instructions.iter().find(|i| i.opcode == OP_SHOW_TEXT))
+        .map(|i| {
+            i.arguments
+                .iter()
+                .map(|a| crate::editor::bridge::SerializedArg {
+                    arg_type: a.arg_type,
+                    raw_data: a.raw_data,
+                    decoded_string: a.decoded_string.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // end-text-line (0x6F) template — clone a real one, else synthesize (0x6F is a
     // 1-arg literal-0 opcode, so a synthetic is structurally identical).

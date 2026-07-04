@@ -34,6 +34,10 @@
   let hasBinTabs = $derived(
     store.tabs.some((t) => t.format !== "parente" && t.entries.length > 0),
   );
+  // Parente tabs load natively from a Unity/Lua .arc, not the AGE/BIN engine —
+  // the fanpatch builders (loader-served .BIN overrides) can't apply, so the
+  // popover shows a Parente-native variant instead.
+  let isParente = $derived(store.activeTab?.format === "parente");
 
   interface ExportOption {
     label: string;
@@ -48,57 +52,77 @@
     items: ExportOption[];
   }
 
-  let exportGroups: ExportGroup[] = $derived([
-    {
-      title: "Game build",
-      items: [
-        {
-          label: "Export BIN…",
-          desc: "Translated .BIN to drop into the game's data folder.",
-          disabled: !hasActiveTab,
-          reason: "Open a tab first",
-          run: handleExport,
-        },
-        {
-          label: "Export open tabs as .fanpatch",
-          desc: "Single zip the loader serves; overrides base scenes. Built from your open BIN tabs.",
-          disabled: !hasBinTabs,
-          reason: "No BIN tabs open",
-          run: doExportFanpatchFromTabs,
-        },
-        {
-          label: "Build .fanpatch from folder…",
-          desc: "Zip an existing folder of translated BINs into a loader .fanpatch.",
-          disabled: false,
-          run: doPackFanpatchFromFolder,
-        },
-        {
-          label: "Repair speaker boxes → .fanpatch…",
-          desc: "Fix narrator/speaker boxes from EN + original JP folders; outputs a .fanpatch.",
-          disabled: false,
-          run: () => doPackDualLanguageFanpatch(false),
-        },
-        {
-          label: "Bilingual (EN↔JP switch) → .fanpatch…",
-          desc: "Adds in-game mid-scene EN↔JP toggle; needs EN + JP BIN folders.",
-          disabled: false,
-          run: () => doPackDualLanguageFanpatch(true),
-        },
-      ],
-    },
-    {
-      title: "Translation workflow",
-      items: [
-        {
-          label: "Save project (.json)…",
-          desc: "Save translations, glossary & characters as a reloadable project file.",
-          disabled: !hasActiveTab,
-          reason: "Open a tab first",
-          run: doSaveProject,
-        },
-      ],
-    },
-  ]);
+  // Identical for both formats — save the in-editor project regardless of engine.
+  let translationWorkflowGroup: ExportGroup = $derived({
+    title: "Translation workflow",
+    items: [
+      {
+        label: "Save project (.json)…",
+        desc: "Save translations, glossary & characters as a reloadable project file.",
+        disabled: !hasActiveTab,
+        reason: "Open a tab first",
+        run: doSaveProject,
+      },
+    ],
+  });
+
+  // Parente: only the native rebuild applies; no AGE .fanpatch affordances.
+  let parenteGameBuildGroup: ExportGroup = $derived({
+    title: "Game build",
+    items: [
+      {
+        label: "Export to game files… (native)",
+        desc: "Rebuild the Parente .arc with your translated Lua scripts, ready to drop into the game.",
+        disabled: !hasActiveTab,
+        reason: "Open a tab first",
+        run: handleExport,
+      },
+    ],
+  });
+
+  let ageGameBuildGroup: ExportGroup = $derived({
+    title: "Game build",
+    items: [
+      {
+        label: "Export BIN…",
+        desc: "Translated .BIN to drop into the game's data folder.",
+        disabled: !hasActiveTab,
+        reason: "Open a tab first",
+        run: handleExport,
+      },
+      {
+        label: "Export open tabs as .fanpatch",
+        desc: "Single zip the loader serves; overrides base scenes. Built from your open BIN tabs.",
+        disabled: !hasBinTabs,
+        reason: "No BIN tabs open",
+        run: doExportFanpatchFromTabs,
+      },
+      {
+        label: "Build .fanpatch from folder…",
+        desc: "Zip an existing folder of translated BINs into a loader .fanpatch.",
+        disabled: false,
+        run: doPackFanpatchFromFolder,
+      },
+      {
+        label: "Repair speaker boxes → .fanpatch…",
+        desc: "Fix narrator/speaker boxes from EN + original JP folders; outputs a .fanpatch.",
+        disabled: false,
+        run: () => doPackDualLanguageFanpatch(false),
+      },
+      {
+        label: "Bilingual (EN↔JP switch) → .fanpatch…",
+        desc: "Adds in-game mid-scene EN↔JP toggle; needs EN + JP BIN folders.",
+        disabled: false,
+        run: () => doPackDualLanguageFanpatch(true),
+      },
+    ],
+  });
+
+  let exportGroups: ExportGroup[] = $derived(
+    isParente
+      ? [parenteGameBuildGroup, translationWorkflowGroup]
+      : [ageGameBuildGroup, translationWorkflowGroup],
+  );
 
   /** Close the popover, then fire the option's existing action. */
   function runExport(fn: () => void) {
@@ -256,9 +280,11 @@
               </button>
             {/each}
           {/each}
-          <div class="menu-hint">Dual-language builders ask for translated + original BIN folders and bundle the version.dll loader; drop the output into the game folder.
-            <button class="menu-help-link" onclick={() => { exportMenuOpen = false; openHelp("bilingual"); }}>Learn more →</button>
-          </div>
+          {#if !isParente}
+            <div class="menu-hint">Dual-language builders ask for translated + original BIN folders and bundle the version.dll loader; drop the output into the game folder.
+              <button class="menu-help-link" onclick={() => { exportMenuOpen = false; openHelp("bilingual"); }}>Learn more →</button>
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
