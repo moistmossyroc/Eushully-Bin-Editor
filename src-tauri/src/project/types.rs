@@ -61,6 +61,13 @@ pub struct InsertedInstruction {
     pub label: String,
     /// Arguments for the new instruction
     pub arguments: Vec<SerializedArg>,
+    /// Frontend link to the visual entry (its negative `instruction_index`).
+    /// Persisted so project reload can relink EXACTLY — the old label/opcode
+    /// greedy relink crossed same-opcode bridge rows and permuted their args
+    /// (LaDEA "box opens, text invisible until backlog"). Ignored by export;
+    /// absent in legacy projects (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic_index: Option<i64>,
 }
 
 /// A serializable argument for inserted instructions.

@@ -2,13 +2,15 @@
   import type { DialogueEntry, InsertedInstruction, SerializedArg } from "../lib/types";
   import { furiganaDisplayLength, stripQuoteBrackets, displaySafe } from "../lib/types";
   import { store } from "../lib/stores.svelte";
-  import { insertInstructionVisually, deleteInsertedEntryForever, isAutoSplitContinuation, applySplitPlan, unsplitContinuation } from "../lib/insertions";
+  import { insertInstructionVisually, deleteInsertedEntryForever, isAutoSplitContinuation, applySplitPlan, splitBoxBridge, unsplitContinuation } from "../lib/insertions";
   import { optimizeEntry, autoSplitEntry } from "../lib/ipc";
   import * as blockMemoryMod from "../lib/blockMemory";
   import { confirmDialog } from "../lib/confirm";
   import { clampToViewport } from "../lib/clampMenu";
   import { toastError } from "../lib/toast";
   import { isNameItemFile } from "../lib/fileCategory";
+  import { engineBoxRulesFor, engineMetricsFor } from "../lib/engineMode";
+  import { engineBoxFits } from "../lib/gameLayout";
 
   interface Props {
     entry: DialogueEntry;
@@ -163,12 +165,19 @@
   const RENDERED_DIALOGUE_LABELS = new Set(["show-text", "display-furigana"]);
   let isRenderedDialogue = $derived(RENDERED_DIALOGUE_LABELS.has(entry.label));
 
-  /** Whether this row's translation exceeds the line character cap */
+  // Engine word-wrap mode (loader hook + reported metrics): the engine wraps rows, so a
+  // text only overflows when it doesn't fit one engine box.
+  let engineRules = $derived(engineBoxRulesFor(store.activeTab));
+  let engineMetrics = $derived(engineRules ? engineMetricsFor(store.activeTab) : null);
+
+  /** Whether this row's translation exceeds the line character cap (engine mode: the box) */
   let isOverLimit = $derived(
     isRenderedDialogue &&
     entry.translated_text.trim() !== "" &&
-    store.translatedLineCharCap > 0 &&
-    (lineGroupCount?.translated ?? cellDisplayLength) > store.translatedLineCharCap
+    (engineRules && engineMetrics
+      ? entry.label === "show-text" &&
+        !engineBoxFits(entry.translated_text, engineMetrics, true, engineRules.rowsPerBox, engineRules.bottomCap)
+      : store.translatedLineCharCap > 0 && (lineGroupCount?.translated ?? cellDisplayLength) > store.translatedLineCharCap)
   );
 
   let isAutoSplitRow = $derived(isAutoSplitContinuation(entry));
@@ -190,6 +199,14 @@
     const tab = store.activeTab;
     if (!tab || splitting) return;
     splitting = true;
+    if (engineRules && engineMetrics) {
+      const { engineSplitEntries } = await import("../lib/actions");
+      const r = await engineSplitEntries(tab, [entry.instruction_index], engineMetrics, engineRules.rowsPerBox, engineRules.bottomCap);
+      if (r.errors.length > 0) store.statusMessage = r.errors[0];
+      splitting = false;
+      showContextMenu = false;
+      return;
+    }
     try {
       const plan = await autoSplitEntry(
         tab.id,
@@ -198,8 +215,9 @@
         store.translatedLineCharCap,
         store.translatedCharCap,
         store.maxLinesPerBox,
+        store.bottomLineCharCap,
       );
-      const result = applySplitPlan(plan);
+      const result = applySplitPlan(plan, await splitBoxBridge(tab.id));
       if (typeof result === "string") {
         store.statusMessage = result;
       }
@@ -519,7 +537,7 @@
   <td
     class="cell-translated"
     class:readonly={!isTranslatable}
-    class:over-line-cap={isRenderedDialogue && store.translatedLineCharCap > 0 && (lineGroupCount?.translated ?? cellDisplayLength) > store.translatedLineCharCap}
+    class:over-line-cap={isOverLimit}
   >
     {#if isTranslatable}
       <textarea
@@ -536,7 +554,7 @@
       {#if entry.translated_text.length > 0}
         <span
           class="line-char-count"
-          class:over-line-cap={isRenderedDialogue && store.translatedLineCharCap > 0 && (lineGroupCount?.translated ?? cellDisplayLength) > store.translatedLineCharCap}
+          class:over-line-cap={isOverLimit}
         >{lineGroupCount?.translated ?? cellDisplayLength}</span>
       {/if}
       {#if blockMemoryMatch}

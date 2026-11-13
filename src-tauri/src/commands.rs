@@ -4,7 +4,7 @@ use crate::claude::client::{ApiProvider, ClaudeClient};
 use crate::claude::prompt::TranslationOptions;
 use crate::claude::session::{SessionControl, TranslationSession};
 use crate::editor::apply::apply_changes;
-use crate::editor::characters::{extract_all_character_definitions, extract_ciinit_character_names, extract_referenced_speakers, detect_speaker_register, extract_row_speakers, detect_speaker_lookup_array, detect_speaker_id_variable, extract_referenced_speakers_sys5, extract_row_speakers_sys5, extract_referenced_speakers_sys5_legacy, extract_row_speakers_sys5_legacy, extract_referenced_speakers_sys3, extract_row_speakers_sys3, detect_speaker_display_slot, extract_referenced_speakers_1d2, extract_row_speakers_1d2};
+use crate::editor::characters::{extract_all_character_definitions, extract_ciinit_character_names, extract_referenced_speakers, detect_speaker_lookup_array, detect_speaker_id_variable, extract_referenced_speakers_sys5, extract_referenced_speakers_sys5_legacy, extract_referenced_speakers_sys3, detect_speaker_display_slot, extract_referenced_speakers_1d2};
 use crate::editor::extract::{extract_dialogue, DialogueEntry};
 use crate::project::io::{load_project as load_project_file, save_project as save_project_file};
 use crate::project::types::{CharacterEntry, GlossaryEntry, InsertedInstruction, ProjectFile};
@@ -243,13 +243,14 @@ pub async fn export_bin(
     entries: Vec<DialogueEntry>,
     inserted_instructions: Vec<InsertedInstruction>,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let tabs = state.tabs.lock().unwrap();
     let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
     let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
 
     // Build the translated bytes with the corruption guardrail (see helper).
-    let output_data = build_translated_bin(parsed_bin, &entries, &inserted_instructions)
+    // Returns the warn-only export-lint findings to the frontend.
+    let TranslatedBin { bytes: output_data, lint_warnings } = build_translated_bin(parsed_bin, &entries, &inserted_instructions)
         .map_err(|e| format!("Export aborted — {e}. No file written (the original BIN is untouched)."))?;
 
     // Pre-write backup: if the output path already exists (i.e. we're about
@@ -277,7 +278,7 @@ pub async fn export_bin(
     std::fs::write(&output_path, &output_data)
         .map_err(|e| format!("Failed to write output file: {}", e))?;
 
-    Ok(())
+    Ok(lint_warnings)
 }
 
 /// Build a translated BIN's bytes from a parsed BIN + edits, applying the SAME
@@ -285,16 +286,38 @@ pub async fn export_bin(
 /// identical instruction count or this returns an error instead of corrupt data.
 /// Shared by single-file export and `.fanpatch` export so the guardrail can never
 /// diverge between them.
-fn build_translated_bin(
+pub fn build_translated_bin(
     parsed_bin: &ParsedBin,
     entries: &[DialogueEntry],
     inserted_instructions: &[InsertedInstruction],
-) -> Result<Vec<u8>, String> {
-    let modified = apply_changes(&parsed_bin.instructions, entries, inserted_instructions);
+) -> Result<TranslatedBin, String> {
+    let applied = apply_changes(&parsed_bin.instructions, entries, inserted_instructions);
+    // SYS3: inserted click-waits close their line first (as every native wait does),
+    // inserted clears re-blit the window like the native clear (else old text stays), and
+    // continuation boxes repeat the box's inline name line (Meishoku / Minefuka).
+    let applied = if parsed_bin.header.sys_version <= 3 {
+        let closed = crate::editor::bridge::close_lines_before_inserted_waits(applied);
+        let redrawn = crate::editor::bridge::redraw_box_after_inserted_clears(closed);
+        crate::editor::bridge::carry_inline_speaker_names(&parsed_bin.instructions, redrawn)
+    } else {
+        applied
+    };
+    let modified = crate::editor::bridge::resolve_speaker_redraws(applied);
+    // Warn-only semantic checks (delta vs the original) — see editor::lint.
+    let lint_warnings = crate::editor::lint::lint_export(&parsed_bin.instructions, &modified);
     let bytes = write_bin(&parsed_bin.header, &modified)
         .map_err(|e| format!("failed to write BIN: {e}"))?;
     match parse_bin(&bytes) {
         Ok(reparsed) => {
+            // Every jump/call/callback target must land on an instruction start.
+            let unresolved = crate::bin_format::writer::unresolved_code_targets(&reparsed.instructions);
+            if !unresolved.is_empty() {
+                return Err(format!(
+                    "internal corruption check failed: {} code target(s) point mid-instruction (first: {})",
+                    unresolved.len(),
+                    unresolved[0]
+                ));
+            }
             if reparsed.instructions.len() != modified.len() {
                 return Err(format!(
                     "internal corruption check failed: wrote {} instructions but read back {} \
@@ -306,7 +329,14 @@ fn build_translated_bin(
         }
         Err(e) => return Err(format!("the result does not re-parse ({e}) — corruption bug")),
     }
-    Ok(bytes)
+    Ok(TranslatedBin { bytes, lint_warnings })
+}
+
+/// Output of `build_translated_bin`: the verified bytes plus warn-only lint
+/// findings (`editor::lint`) for the frontend to surface.
+pub struct TranslatedBin {
+    pub bytes: Vec<u8>,
+    pub lint_warnings: Vec<String>,
 }
 
 /// One BIN to pack into a `.fanpatch`: the tab to build from + the request-name
@@ -327,6 +357,11 @@ pub struct FanpatchResult {
     pub skipped: Vec<String>,
     /// True if version.dll was written next to the patch (the drop-in loader).
     pub loader_written: bool,
+    /// "<NAME>: <warning>" export-lint findings (warn-only; the BIN was still written).
+    pub lint_warnings: Vec<String>,
+    /// Files the text box profile added (system script + untranslated dialogue scenes);
+    /// exported scenes carry the profile too.
+    pub box_profile_files: usize,
 }
 
 /// The fanpatch loader, bundled so an exported `.fanpatch` is a complete drop-in
@@ -381,6 +416,48 @@ fn write_loader_package(output_path: &str) -> bool {
     dll_ok
 }
 
+/// Opt-in loader features bundled into a `.fanpatch` as `fanpatch_features.txt`
+/// (read by the loader's `Feature_Enabled`). See docs/engine/age-sys.md.
+#[derive(serde::Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct FanpatchFeatures {
+    /// Resizable, aspect-locked window + HQ upscaler (verified on SYS4 438/443).
+    #[serde(default)]
+    pub resizable_window: bool,
+    /// Developer menu + F2/F5/F6/F8/F11 hotkeys, and the game's own developer menu
+    /// (scene jump) unlocked behind the title's Quit button (testing builds only).
+    #[serde(default)]
+    pub dev_menu: bool,
+    /// Crisp HD rendering: the engine's own hi-res virtual-fullscreen mode run in the
+    /// resizable window (`native_hires_window`), plus the internal-resolution fallback
+    /// for the classic windowed mode / builds without it (`internal_resolution`).
+    /// Needs `resizable_window` (the loader's scaler). Verified on SYS4 438 (Atelial).
+    #[serde(default)]
+    pub crisp_hd: bool,
+    /// English word wrap: the loader hooks the SYS4 typewriter's per-character wrap
+    /// check and wraps before an ASCII word that would not fit (docs/engine/age-sys.md
+    /// §7b). Signature found in Atelial 438, Madou, Sankai builds; inert elsewhere.
+    #[serde(default)]
+    pub english_word_wrap: bool,
+}
+
+/// `fanpatch_features.txt` contents (`key = 0|1` lines, parsed by the loader's
+/// `Feature_Enabled`), or `None` when every feature is off.
+fn features_file(features: FanpatchFeatures) -> Option<String> {
+    if !(features.resizable_window || features.dev_menu || features.english_word_wrap) {
+        return None;
+    }
+    let crisp_hd = features.crisp_hd && features.resizable_window;
+    Some(format!(
+        "# Fanpatch loader features (written by Eushully BIN Editor)\r\nresizable_window = {}\r\ndev_menu = {}\r\nnative_hires_window = {}\r\ninternal_resolution = {}\r\nenglish_word_wrap = {}\r\n",
+        u8::from(features.resizable_window),
+        u8::from(features.dev_menu),
+        u8::from(crisp_hd),
+        u8::from(crisp_hd),
+        u8::from(features.english_word_wrap)
+    ))
+}
+
 /// Bundle the loader's runtime config files INSIDE the `.fanpatch` zip so a
 /// shipped patch is just `version.dll` + one `.fanpatch` (no loose config files
 /// to hunt for). The loader reads `fanpatch_title.txt` (title/label for the
@@ -396,8 +473,16 @@ fn bundle_loader_configs<W: std::io::Write + std::io::Seek>(
     title: &str,
     label: &str,
     ui_config_path: &str,
+    features: FanpatchFeatures,
 ) -> Result<(), String> {
     use std::io::Write;
+
+    if let Some(contents) = features_file(features) {
+        zip.start_file("fanpatch_features.txt", opts)
+            .map_err(|e| format!("zip entry fanpatch_features.txt: {e}"))?;
+        zip.write_all(contents.as_bytes())
+            .map_err(|e| format!("zip write fanpatch_features.txt: {e}"))?;
+    }
 
     let title = title.trim();
     let label = label.trim();
@@ -431,6 +516,87 @@ fn bundle_loader_configs<W: std::io::Write + std::io::Seek>(
 /// Export a `.fanpatch` (a ZIP of translated BINs, flat, request-named) for the
 /// version.dll fanpatch loader. Each BIN is built with the corruption guardrail;
 /// any that fail are skipped (reported) rather than poisoning the whole patch.
+/// A text box profile being applied to a `.fanpatch` export (docs/engine/age-sys.md §7b):
+/// each BIN written gets the profile, then the system script and every other dialogue
+/// scene of the base game are appended. Shared by the tab and folder exports.
+struct BoxProfileExport {
+    profile: crate::engine::box_profile::BoxProfile,
+    root: std::path::PathBuf,
+    geometry: crate::engine::box_profile::BoxGeometry,
+}
+
+impl BoxProfileExport {
+    fn prepare(profile: Option<crate::engine::box_profile::BoxProfile>, root: Option<std::path::PathBuf>) -> Result<Option<Self>, String> {
+        let Some(profile) = profile else { return Ok(None) };
+        let root = root.ok_or("text box profile: game folder not found (open the game folder once)")?;
+        let geometry = crate::engine::base_box_geometry(&root)?;
+        Ok(Some(Self { profile, root, geometry }))
+    }
+
+    /// The profile applied to one exported BIN (`name` = request name).
+    fn apply(&self, name: &str, bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+        crate::engine::apply_box_profile_to_scene(&bytes, &self.geometry, &self.profile, crate::engine::is_system_script(name))
+            .map_err(|e| format!("{name}: text box profile: {e}"))
+    }
+
+    /// Append the patched system script + other dialogue scenes not already written.
+    fn append_rest<W: std::io::Write + std::io::Seek>(
+        &self,
+        zip: &mut zip::ZipWriter<W>,
+        opts: zip::write::SimpleFileOptions,
+        written: &std::collections::HashSet<String>,
+    ) -> Result<usize, String> {
+        use std::io::Write;
+        let patch = crate::engine::box_profile_patch(&self.root, &self.profile, written)?;
+        let count = patch.files.len();
+        for (name, bytes) in patch.files {
+            zip.start_file(&name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
+            zip.write_all(&bytes).map_err(|e| format!("zip write {name}: {e}"))?;
+        }
+        Ok(count)
+    }
+}
+
+
+/// Testing builds ("Developer menu"): add the game's TITLE.BIN with the developer menu
+/// unlocked behind the Quit button (engine::dev_title — scene jump via the SC????.BIN
+/// picker). Skipped when the export already carries a TITLE.BIN or the game is unknown.
+fn append_dev_title<W: std::io::Write + std::io::Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    opts: zip::write::SimpleFileOptions,
+    features: Option<FanpatchFeatures>,
+    root: Option<&std::path::Path>,
+    profile: Option<&BoxProfileExport>,
+    seen: &mut std::collections::HashSet<String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), String> {
+    use std::io::Write;
+    const TITLE: &str = "TITLE.BIN";
+    if !features.is_some_and(|f| f.dev_menu) {
+        return Ok(());
+    }
+    if seen.contains(TITLE) {
+        skipped.push(format!("{TITLE}: exported translation kept — developer menu not unlocked"));
+        return Ok(());
+    }
+    let Some(root) = root else {
+        skipped.push("developer menu: game folder unknown — TITLE.BIN not unlocked".to_string());
+        return Ok(());
+    };
+    let Some(bytes) = crate::engine::dev_title_patch(root, None)? else {
+        skipped.push("developer menu: no developer menu found in TITLE.BIN".to_string());
+        return Ok(());
+    };
+    let bytes = match profile {
+        Some(profile) => profile.apply(TITLE, bytes)?,
+        None => bytes,
+    };
+    zip.start_file(TITLE, opts).map_err(|e| format!("zip entry {TITLE}: {e}"))?;
+    zip.write_all(&bytes).map_err(|e| format!("zip write {TITLE}: {e}"))?;
+    seen.insert(TITLE.to_string());
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn export_fanpatch(
     items: Vec<FanpatchItem>,
@@ -438,9 +604,19 @@ pub async fn export_fanpatch(
     title: String,
     label: String,
     ui_config_path: String,
+    features: Option<FanpatchFeatures>,
+    box_profile: Option<crate::engine::box_profile::BoxProfile>,
+    game_dir_hint: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<FanpatchResult, String> {
     use std::io::Write;
+
+    // Text box profile (docs/engine/age-sys.md §7b): computed from the base game files.
+    let first_bin = {
+        let tabs = state.tabs.lock().unwrap();
+        items.iter().find_map(|item| tabs.get(&item.tab_id).and_then(|t| t.bin_path.clone()))
+    };
+    let profile = BoxProfileExport::prepare(box_profile, tab_game_root(first_bin.as_deref(), game_dir_hint.as_deref()))?;
 
     let file = std::fs::File::create(&output_path)
         .map_err(|e| format!("Failed to create {output_path}: {e}"))?;
@@ -451,6 +627,7 @@ pub async fn export_fanpatch(
     let tabs = state.tabs.lock().unwrap();
     let mut written = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    let mut lint_warnings: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for item in &items {
@@ -471,26 +648,38 @@ pub async fn export_fanpatch(
             continue;
         };
         match build_translated_bin(parsed, &item.entries, &item.inserted_instructions) {
-            Ok(bytes) => {
+            Ok(TranslatedBin { bytes, lint_warnings: bin_warnings }) => {
                 if !seen.insert(name.clone()) {
                     skipped.push(format!("{name}: duplicate name (kept first)"));
                     continue;
                 }
+                let bytes = match &profile {
+                    Some(profile) => profile.apply(&name, bytes)?,
+                    None => bytes,
+                };
                 zip.start_file(&name, opts)
                     .map_err(|e| format!("zip entry {name}: {e}"))?;
                 zip.write_all(&bytes)
                     .map_err(|e| format!("zip write {name}: {e}"))?;
                 written += 1;
+                lint_warnings.extend(bin_warnings.into_iter().map(|w| format!("{name}: {w}")));
             }
             Err(e) => skipped.push(format!("{name}: {e}")),
         }
     }
-    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path)?;
+    drop(tabs);
+    let root = tab_game_root(first_bin.as_deref(), game_dir_hint.as_deref());
+    append_dev_title(&mut zip, opts, features, root.as_deref(), profile.as_ref(), &mut seen, &mut skipped)?;
+    let box_profile_files = match &profile {
+        Some(profile) => profile.append_rest(&mut zip, opts, &seen)?,
+        None => 0,
+    };
+    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path, features.unwrap_or_default())?;
     zip.finish()
         .map_err(|e| format!("Failed to finalize fanpatch: {e}"))?;
 
     let loader_written = write_loader_package(&output_path);
-    Ok(FanpatchResult { written, skipped, loader_written })
+    Ok(FanpatchResult { written, skipped, loader_written, lint_warnings, box_profile_files })
 }
 
 /// Package every file in `source_dir` (flat, non-recursive) into a `.fanpatch`,
@@ -504,9 +693,13 @@ pub async fn pack_fanpatch_from_dir(
     title: String,
     label: String,
     ui_config_path: String,
+    features: Option<FanpatchFeatures>,
+    box_profile: Option<crate::engine::box_profile::BoxProfile>,
+    game_dir_hint: Option<String>,
 ) -> Result<FanpatchResult, String> {
     use std::io::Write;
 
+    let profile = BoxProfileExport::prepare(box_profile, tab_game_root(Some(&source_dir), game_dir_hint.as_deref()))?;
     let file = std::fs::File::create(&output_path)
         .map_err(|e| format!("Failed to create {output_path}: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -515,6 +708,7 @@ pub async fn pack_fanpatch_from_dir(
 
     let mut written = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    let lint_warnings: Vec<String> = Vec::new(); // no original BIN to diff against → nothing to lint
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let dir = std::fs::read_dir(&source_dir)
@@ -544,18 +738,28 @@ pub async fn pack_fanpatch_from_dir(
             skipped.push(format!("{name}: duplicate name (kept first)"));
             continue;
         }
+        let bytes = match (&profile, name.ends_with(".BIN")) {
+            (Some(profile), true) => profile.apply(&name, bytes)?,
+            _ => bytes,
+        };
         zip.start_file(&name, opts)
             .map_err(|e| format!("zip entry {name}: {e}"))?;
         zip.write_all(&bytes)
             .map_err(|e| format!("zip write {name}: {e}"))?;
         written += 1;
     }
-    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path)?;
+    let root = tab_game_root(Some(&source_dir), game_dir_hint.as_deref());
+    append_dev_title(&mut zip, opts, features, root.as_deref(), profile.as_ref(), &mut seen, &mut skipped)?;
+    let box_profile_files = match &profile {
+        Some(profile) => profile.append_rest(&mut zip, opts, &seen)?,
+        None => 0,
+    };
+    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path, features.unwrap_or_default())?;
     zip.finish()
         .map_err(|e| format!("Failed to finalize fanpatch: {e}"))?;
 
     let loader_written = write_loader_package(&output_path);
-    Ok(FanpatchResult { written, skipped, loader_written })
+    Ok(FanpatchResult { written, skipped, loader_written, lint_warnings, box_profile_files })
 }
 
 /// Build a `.fanpatch` from a folder of translated (English) BINs, applying the
@@ -576,6 +780,7 @@ pub async fn pack_dual_language_fanpatch(
     title: String,
     label: String,
     ui_config_path: String,
+    features: Option<FanpatchFeatures>,
 ) -> Result<FanpatchResult, String> {
     use crate::editor::dual_language;
     use std::io::Write;
@@ -589,6 +794,7 @@ pub async fn pack_dual_language_fanpatch(
     let mut written = 0usize;
     let mut processed = 0usize; // BINs that got repaired/bilingual
     let mut skipped: Vec<String> = Vec::new();
+    let lint_warnings: Vec<String> = Vec::new(); // no original BIN to diff against → nothing to lint
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let dir = std::fs::read_dir(&en_dir).map_err(|e| format!("Failed to read {en_dir}: {e}"))?;
@@ -681,12 +887,12 @@ pub async fn pack_dual_language_fanpatch(
             skipped.push(format!("asset folder not readable: {agf_dir}"));
         }
     }
-    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path)?;
+    bundle_loader_configs(&mut zip, opts, &title, &label, &ui_config_path, features.unwrap_or_default())?;
     zip.finish().map_err(|e| format!("Failed to finalize fanpatch: {e}"))?;
 
     skipped.insert(0, format!("{} BIN(s) {} + {} asset(s)", processed, if bilingual { "made bilingual" } else { "repaired" }, assets));
     let loader_written = write_loader_package(&output_path);
-    Ok(FanpatchResult { written, skipped, loader_written })
+    Ok(FanpatchResult { written, skipped, loader_written, lint_warnings, box_profile_files: 0 })
 }
 
 /// Set the API key for Claude translation.
@@ -1423,13 +1629,120 @@ pub async fn stop_translation(tab_id: String, state: State<'_, AppState>) -> Res
     Ok(())
 }
 
+/// Installed game folder for a tab: the game holding its BIN, else `game_dir_hint`
+/// (workspace tabs are copies outside the game).
+fn tab_game_root(bin_path: Option<&str>, game_dir_hint: Option<&str>) -> Option<std::path::PathBuf> {
+    bin_path
+        .and_then(|p| crate::engine::game_root_of(std::path::Path::new(p)))
+        .or_else(|| game_dir_hint.filter(|h| !h.is_empty()).and_then(|h| crate::engine::game_root_of(std::path::Path::new(h))))
+}
+
+/// The game's speaker tables, parsed once per game folder + change stamp.
+fn game_speaker_tables(state: &AppState, root: &std::path::Path) -> std::sync::Arc<crate::engine::GameSpeakerTables> {
+    let key = format!("{}|{}", root.display(), crate::engine::game_files_stamp(root));
+    if let Some(tables) = state.speaker_tables.lock().unwrap().get(&key) {
+        return tables.clone();
+    }
+    let tables = std::sync::Arc::new(crate::engine::GameSpeakerTables::load(root));
+    let mut cache = state.speaker_tables.lock().unwrap();
+    let prefix = format!("{}|", root.display());
+    cache.retain(|k, _| !k.starts_with(&prefix)); // drop stale stamps of this game
+    cache.insert(key, tables.clone());
+    tables
+}
+
+/// Talk-key speakers (SYS4 438, Atelial): per-row character indices + their names,
+/// resolved through the installed game's INIT2/CFINIT/CHINIT. `None` when the scene
+/// doesn't use the scheme or the game folder can't be found.
+fn talk_key_speakers_for(
+    state: &AppState,
+    instructions: &[crate::bin_format::instruction::Instruction],
+    bin_path: Option<&str>,
+    game_dir_hint: Option<&str>,
+) -> Option<(std::collections::BTreeMap<usize, crate::editor::characters::SpeakerRef>, Vec<CharacterEntry>)> {
+    use crate::editor::characters::{detect_talk_key_scheme, talk_key_row_speakers, SpeakerRef};
+    let scheme = detect_talk_key_scheme(instructions)?;
+    let root = tab_game_root(bin_path, game_dir_hint)?;
+    let speakers = game_speaker_tables(state, &root).talk_key_speakers(&root, scheme.table)?;
+    let mut rows = std::collections::BTreeMap::new();
+    for (index, character) in talk_key_row_speakers(instructions, &scheme, &speakers.owners) {
+        rows.insert(index, SpeakerRef { source_type: 3, source_raw_data: character, literal_name: None });
+    }
+    let mut ids: Vec<u32> = rows.values().map(|r| r.source_raw_data).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let characters = ids
+        .into_iter()
+        .map(|id| CharacterEntry { pointer: id, name: speakers.names.get(&id).cloned().unwrap_or_default() })
+        .collect();
+    Some((rows, characters))
+}
+
+/// Names for numeric speaker ids, from the game's name tables (CNINIT string table /
+/// CHINIT ID register, discovered per game — see `discover_speaker_names`). Looks in the
+/// installed game holding the tab's BIN, then `game_dir_hint`, then beside the BIN
+/// (`$N$` append copies matching the BIN's own prefix first, then base copies).
+#[tauri::command]
+pub async fn resolve_speaker_names(
+    tab_id: String,
+    ids: Vec<u32>,
+    game_dir_hint: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<u32, String>, String> {
+    let bin_path = {
+        let tabs = state.tabs.lock().unwrap();
+        tabs.get(&tab_id).ok_or("Tab not found")?.bin_path.clone()
+    };
+    if let Some(root) = tab_game_root(bin_path.as_deref(), game_dir_hint.as_deref()) {
+        let tables = game_speaker_tables(&state, &root);
+        return Ok(crate::editor::characters::discover_speaker_names(&tables.name_scripts, &ids));
+    }
+    let bin = bin_path.as_deref().map(std::path::Path::new).ok_or("no folder for this tab")?;
+    let dir = bin.parent().ok_or("no folder for this tab")?;
+    let append_prefix: String = bin
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .and_then(|n| n.strip_prefix('$').and_then(|rest| rest.find('$').map(|end| format!("${}$", &rest[..end]))))
+        .unwrap_or_default();
+    let mut scripts = Vec::new();
+    for file in crate::editor::characters::NAME_TABLE_FILES {
+        let mut candidates = vec![file.to_string()];
+        if !append_prefix.is_empty() {
+            candidates.insert(0, format!("{append_prefix}{file}"));
+        }
+        for candidate in candidates {
+            if let Some(bin) = std::fs::read(dir.join(&candidate)).ok().and_then(|b| parse_bin(&b).ok()) {
+                scripts.push((candidate, bin.instructions));
+            }
+        }
+    }
+    Ok(crate::editor::characters::discover_speaker_names(&scripts, &ids))
+}
+
 /// Extract all referenced speaker pointers from the loaded BIN.
 /// Returns CharacterEntry for each unique speaker — name is empty if not defined in this BIN.
 #[tauri::command]
 pub async fn get_referenced_speakers(
     tab_id: String,
+    game_dir_hint: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<CharacterEntry>, String> {
+    let (talk_key_input, bin_path) = {
+        let tabs = state.tabs.lock().unwrap();
+        let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+        let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
+        let input = (parsed_bin.header.sys_version == 4 && crate::editor::characters::detect_talk_key_scheme(&parsed_bin.instructions).is_some())
+            .then(|| parsed_bin.instructions.clone());
+        (input, tab.bin_path.clone())
+    };
+    // SYS4 talk-key scenes (Atelial): speakers live only in the game's INIT tables. Without
+    // the game folder report none — the generic detectors below pick unrelated variables
+    // in these scenes (audit 2026-11-11).
+    if let Some(instructions) = talk_key_input {
+        return Ok(talk_key_speakers_for(&state, &instructions, bin_path.as_deref(), game_dir_hint.as_deref())
+            .map(|(_, characters)| characters)
+            .unwrap_or_default());
+    }
     let tabs = state.tabs.lock().unwrap();
     let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
     let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
@@ -1482,57 +1795,30 @@ pub async fn get_referenced_speakers(
 #[tauri::command]
 pub async fn get_row_speakers(
     tab_id: String,
+    game_dir_hint: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<std::collections::BTreeMap<usize, crate::editor::characters::SpeakerRef>, String> {
+    let (talk_key_input, bin_path) = {
+        let tabs = state.tabs.lock().unwrap();
+        let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+        let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
+        let input = (parsed_bin.header.sys_version == 4 && crate::editor::characters::detect_talk_key_scheme(&parsed_bin.instructions).is_some())
+            .then(|| parsed_bin.instructions.clone());
+        (input, tab.bin_path.clone())
+    };
+    // SYS4 talk-key scenes (Atelial): see get_referenced_speakers — none without the game.
+    if let Some(instructions) = talk_key_input {
+        return Ok(talk_key_speakers_for(&state, &instructions, bin_path.as_deref(), game_dir_hint.as_deref())
+            .map(|(rows, _)| rows)
+            .unwrap_or_default());
+    }
     let tabs = state.tabs.lock().unwrap();
     let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
     let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
 
-    let sys_version = parsed_bin.header.sys_version;
-
-    // SYS3: inline literal names
-    if sys_version <= 3 {
-        return Ok(extract_row_speakers_sys3(&parsed_bin.instructions));
-    }
-
-    // SYS5: lookup-array character ID pattern (preferred)
-    if sys_version >= 5 {
-        if let Some((array_addr, _)) = detect_speaker_lookup_array(&parsed_bin.instructions) {
-            return Ok(extract_row_speakers_sys5(&parsed_bin.instructions, array_addr));
-        }
-        // SYS5 legacy fallback
-        if let Some(id_var) = detect_speaker_id_variable(&parsed_bin.instructions) {
-            return Ok(extract_row_speakers_sys5_legacy(&parsed_bin.instructions, id_var));
-        }
-        return Ok(std::collections::BTreeMap::new());
-    }
-
-    // SYS4: set-string + speaker register
-    if let Some(speaker_reg) = detect_speaker_register(&parsed_bin.instructions) {
-        let rows = extract_row_speakers(&parsed_bin.instructions, speaker_reg);
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-    }
-
-    // SYS4 fallback: speaker set via set-display-slot (0x1D2), e.g. Megami Zero.
-    if let Some(slot) = detect_speaker_display_slot(&parsed_bin.instructions) {
-        let rows = extract_row_speakers_1d2(&parsed_bin.instructions, slot);
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-    }
-
-    // SYS4 fallback: SYS5-style g-int char-ID register (e.g. 戦女神VERITA).
-    // Matches the detection in get_referenced_speakers above.
-    if let Some(id_var) = detect_speaker_id_variable(&parsed_bin.instructions) {
-        let rows = extract_row_speakers_sys5_legacy(&parsed_bin.instructions, id_var);
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-    }
-
-    Ok(std::collections::BTreeMap::new())
+    Ok(crate::editor::characters::detect_row_speakers(&parsed_bin.instructions, parsed_bin.header.sys_version)
+        .map(|(_, rows)| rows)
+        .unwrap_or_default())
 }
 
 /// Scan a BIN file for character definitions (set-string pairs).
@@ -1728,15 +2014,41 @@ pub async fn get_bridge_template_status(
 /// single tab lock (no per-row IPC round-trip). Auto-split is LINE-ONLY: it wraps
 /// the overflow into one box of end-text-line-separated lines (the engine
 /// paginates); multi-box splitting is the user's explicit `insertTextBoxBridge`.
+/// Re-flow against the engine's own row breaking (loader word-wrap hook + reported
+/// metrics, docs/engine/age-sys.md §7b): the plan's lines are whole BOX texts.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSplit {
+    pub metrics: crate::engine::text_metrics::EngineTextMetrics,
+    pub word_wrap: bool,
+    pub rows_per_box: u32,
+    pub bottom_cap: u32,
+}
+
 fn build_split_plan(
     template: &crate::editor::bridge::BridgeTemplate,
     parsed_bin: &crate::bin_format::parser::ParsedBin,
     translated_text: &str,
     entry_index: usize,
-    line_char_cap: u32,
+    caps: crate::editor::wrap::RowCaps,
+    engine: Option<&EngineSplit>,
 ) -> Result<crate::editor::bridge::SplitPlan, String> {
-    // u32::MAX lines-per-box → wrap_english never starts a new box → single box.
-    let wrap = crate::editor::wrap::wrap_english(translated_text, line_char_cap, u32::MAX);
+    // Line-only plan: all lines in one "box" (pagination is a separate step).
+    // - Engine mode: one line per BOX text; the engine wraps each box's rows itself, the
+    //   later pagination (1 line per box) opens a box per line.
+    // - Otherwise: rows laid out as balanced boxes (even share per box, bottom rows within
+    //   the UI-art cap) so the later pagination recovers even boxes.
+    let wrap = match engine {
+        Some(engine) => {
+            let wrap = crate::editor::wrap::EngineWrap { metrics: &engine.metrics, word_wrap: engine.word_wrap };
+            let boxes = crate::editor::wrap::engine_boxes(translated_text, wrap, engine.rows_per_box as usize, engine.bottom_cap);
+            crate::editor::wrap::WrapOutput { boxes: vec![boxes], overflow_words: Vec::new() }
+        }
+        None => {
+            let rows = crate::editor::wrap::wrap_rows_balanced(translated_text, caps);
+            crate::editor::wrap::WrapOutput { boxes: vec![rows.rows], overflow_words: rows.overflow_words }
+        }
+    };
     if wrap.boxes.is_empty() {
         return Err("No text to split".into());
     }
@@ -1814,9 +2126,10 @@ pub async fn auto_split_entry(
     line_char_cap: u32,
     block_char_cap: u32,
     max_lines_per_box: u32,
+    bottom_line_cap: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<crate::editor::bridge::SplitPlan, String> {
-    let _ = (block_char_cap, max_lines_per_box); // line-only; see build_split_plan
+    let _ = block_char_cap; // line-only; see build_split_plan
     let tabs = state.tabs.lock().unwrap();
     let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
     if line_char_cap == 0 {
@@ -1824,7 +2137,8 @@ pub async fn auto_split_entry(
     }
     let template = tab.bridge_template.as_ref().ok_or("No bridge template available")?;
     let parsed_bin = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
-    build_split_plan(template, parsed_bin, &translated_text, entry_index, line_char_cap)
+    let caps = crate::editor::wrap::RowCaps { line: line_char_cap, bottom: bottom_line_cap.unwrap_or(0), rows_per_box: max_lines_per_box };
+    build_split_plan(template, parsed_bin, &translated_text, entry_index, caps, None)
 }
 
 /// One overflow entry to plan a split for.
@@ -1852,8 +2166,16 @@ pub async fn auto_split_entries_batch(
     tab_id: String,
     items: Vec<SplitRequest>,
     line_char_cap: u32,
+    max_lines_per_box: Option<u32>,
+    bottom_line_cap: Option<u32>,
+    engine: Option<EngineSplit>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SplitOutcome>, String> {
+    let caps = crate::editor::wrap::RowCaps {
+        line: line_char_cap,
+        bottom: bottom_line_cap.unwrap_or(0),
+        rows_per_box: max_lines_per_box.unwrap_or(0),
+    };
     let tabs = state.tabs.lock().unwrap();
     let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
     if line_char_cap == 0 {
@@ -1863,7 +2185,7 @@ pub async fn auto_split_entries_batch(
     let parsed_bin = tab.parsed_bin.as_ref().ok_or("No parsed BIN data")?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
-        match build_split_plan(template, parsed_bin, &item.translated_text, item.entry_index, line_char_cap) {
+        match build_split_plan(template, parsed_bin, &item.translated_text, item.entry_index, caps, engine.as_ref()) {
             Ok(plan) => out.push(SplitOutcome { entry_index: item.entry_index, plan: Some(plan), error: None }),
             Err(e) => out.push(SplitOutcome { entry_index: item.entry_index, plan: None, error: Some(e) }),
         }
@@ -3194,38 +3516,6 @@ pub async fn relaunch_translation_folder(folder_path: String) -> Result<(), Stri
     Ok(())
 }
 
-/// Build a `character_id → name` map for a CHINIT-style init BIN by detecting
-/// its consecutive-register character table. See `extract_chinit_id_name_map`
-/// in `editor/characters.rs` for the pattern explanation. Returns string keys
-/// because serde_json serializes integer-keyed maps as strings anyway.
-///
-/// Cached by file SHA-256: every scene loaded from the same game folder shares
-/// a single parse of CHINIT.BIN (which can be 80k+ instructions). Cache lives
-/// in AppState so it survives across tab opens but resets on app restart.
-#[tauri::command]
-pub async fn extract_chinit_id_name_map(
-    bin_path: String,
-    state: State<'_, AppState>,
-) -> Result<std::collections::HashMap<String, String>, String> {
-    let data = std::fs::read(&bin_path).map_err(|e| format!("Failed to read file: {}", e))?;
-
-    // Hash first so we can short-circuit before paying the parse cost.
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    let hash = hex::encode(hasher.finalize());
-
-    if let Some(cached) = state.chinit_cache.lock().unwrap().get(&hash) {
-        return Ok(cached.iter().map(|(k, v)| (k.to_string(), v.clone())).collect());
-    }
-
-    let parsed = parse_bin(&data).map_err(|e| format!("Failed to parse BIN: {}", e))?;
-    let map = crate::editor::characters::extract_chinit_id_name_map(&parsed.instructions);
-
-    state.chinit_cache.lock().unwrap().insert(hash, map.clone());
-
-    Ok(map.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
-}
-
 /// List every set-string-defined name in the provided init BIN paths.
 /// Returns one entry per unique (source_file, address, name) triple, in
 /// stable file order — frontend filters/sorts as needed for the picker UI.
@@ -3297,6 +3587,29 @@ pub async fn get_bridge_clone(
     // when speaker_arg_positions is empty (which it currently is in v1).
     let cloned = crate::editor::bridge::clone_bridge(template, 0, None);
     Ok(cloned.iter().map(crate::editor::bridge::SerializedInstruction::from).collect())
+}
+
+/// Semantic box-break bridge (see `bridge::build_semantic_bridge`): built from
+/// opcode semantics instead of cloning the scene's transition, so it contains no
+/// scene-specific calls and is available even when the native template is
+/// Degraded/Unavailable. `keep_speaker_plate` makes continuation boxes keep the
+/// speaker (calls the scene's speaker box-begin routine; narration continuations
+/// are fixed per box at export by `bridge::resolve_speaker_redraws`).
+#[tauri::command]
+pub async fn get_semantic_bridge(
+    tab_id: String,
+    keep_speaker_plate: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::editor::bridge::SerializedInstruction>, String> {
+    let tabs = state.tabs.lock().unwrap();
+    let tab = tabs.get(&tab_id).ok_or("Tab not found")?;
+    let parsed_bin = tab.parsed_bin.as_ref().ok_or("No BIN file loaded")?;
+    let bridge = crate::editor::bridge::build_semantic_bridge(
+        &parsed_bin.instructions,
+        tab.bridge_template.as_ref(),
+        keep_speaker_plate,
+    );
+    Ok(bridge.iter().map(crate::editor::bridge::SerializedInstruction::from).collect())
 }
 
 /// One term to send to the Claude CLI for glossary translation.
@@ -4228,4 +4541,36 @@ pub async fn import_translations(
         hash_mismatch,
         source_bin: import.source_bin,
     })
+}
+
+#[cfg(test)]
+mod fanpatch_features_tests {
+    use super::{features_file, FanpatchFeatures};
+
+    #[test]
+    fn crisp_hd_writes_both_rendering_keys() {
+        let text = features_file(FanpatchFeatures { resizable_window: true, dev_menu: false, crisp_hd: true, english_word_wrap: false }).unwrap();
+        assert!(text.contains("resizable_window = 1\r\n"));
+        assert!(text.contains("native_hires_window = 1\r\n"));
+        assert!(text.contains("internal_resolution = 1\r\n"));
+    }
+
+    #[test]
+    fn crisp_hd_needs_the_resizable_window() {
+        let text = features_file(FanpatchFeatures { resizable_window: false, dev_menu: true, crisp_hd: true, english_word_wrap: false }).unwrap();
+        assert!(text.contains("native_hires_window = 0\r\n"));
+        assert!(text.contains("internal_resolution = 0\r\n"));
+    }
+
+    #[test]
+    fn nothing_enabled_writes_no_file() {
+        assert!(features_file(FanpatchFeatures { resizable_window: false, dev_menu: false, crisp_hd: true, english_word_wrap: false }).is_none());
+    }
+
+    #[test]
+    fn word_wrap_alone_writes_the_file() {
+        let text = features_file(FanpatchFeatures { resizable_window: false, dev_menu: false, crisp_hd: false, english_word_wrap: true }).unwrap();
+        assert!(text.contains("english_word_wrap = 1\r\n"));
+        assert!(text.contains("resizable_window = 0\r\n"));
+    }
 }

@@ -278,6 +278,21 @@ fn detect_cvinit_id_register(instructions: &[Instruction]) -> Option<u32> {
     candidates.first().map(|(addr, _)| *addr)
 }
 
+/// The speaker register is a GLOBAL string variable (type 5): Madou 433, LaDEA 847,
+/// Sankai 1008 (`set-string t5:reg …` + `show-text 2, t5:reg`). Local strings (type
+/// 0xB/0xE) are scratch text — Atelial's `show-text 1, t14:0` prints recollection /
+/// menu strings ("キャンセル"); matching raw addresses across types made that local
+/// slot 0 look like a speaker register on every row (audit 2026-11-11).
+const GLOBAL_STRING: u32 = 5;
+
+/// `set-string` into the speaker register (type AND address must match).
+fn writes_speaker_register(instr: &Instruction, speaker_register: u32) -> bool {
+    instr.opcode == 0x192
+        && instr.arguments.len() >= 2
+        && instr.arguments[0].arg_type == GLOBAL_STRING
+        && instr.arguments[0].raw_data == speaker_register
+}
+
 /// Detect the speaker register for a BIN file.
 ///
 /// Looks for `set-string` instructions that write to an address which is also
@@ -286,22 +301,20 @@ fn detect_cvinit_id_register(instructions: &[Instruction]) -> Option<u32> {
 pub fn detect_speaker_register(instructions: &[Instruction]) -> Option<u32> {
     use std::collections::HashMap;
 
-    // Count how many times each address is the target of set-string
+    // Count how many times each global string is the target of set-string
     let mut set_string_targets: HashMap<u32, usize> = HashMap::new();
     for instr in instructions {
-        if instr.opcode == 0x192 && instr.arguments.len() >= 2 {
+        if instr.opcode == 0x192 && instr.arguments.len() >= 2 && instr.arguments[0].arg_type == GLOBAL_STRING {
             *set_string_targets.entry(instr.arguments[0].raw_data).or_insert(0) += 1;
         }
     }
 
-    // Find addresses referenced by show-text arguments (any non-literal, non-string arg type)
-    // This covers global string vars (type 5), local string vars (type 0xB/0xE), etc.
+    // Global strings referenced by show-text arguments.
     let mut show_text_refs: HashMap<u32, usize> = HashMap::new();
     for instr in instructions {
         if instr.opcode == 0x6E {
             for arg in &instr.arguments {
-                // Skip literal (type 0) and inline string (type 2) — those aren't register refs
-                if arg.arg_type != 0 && arg.arg_type != 2 {
+                if arg.arg_type == GLOBAL_STRING {
                     *show_text_refs.entry(arg.raw_data).or_insert(0) += 1;
                 }
             }
@@ -336,27 +349,25 @@ pub fn extract_row_speakers(
     // Identify the character ID variable(s) by tracing the speaker assignment chain
     let mut id_variables: HashSet<(u32, u32)> = HashSet::new();
     for (i, instr) in instructions.iter().enumerate() {
-        if instr.opcode == 0x192 && instr.arguments.len() >= 2 {
-            if instr.arguments[0].raw_data == speaker_register {
-                let src = &instr.arguments[1];
-                if src.arg_type != 2 {
-                    let search_start = i.saturating_sub(10);
-                    for j in (search_start..i).rev() {
-                        let prev = &instructions[j];
-                        if prev.opcode == 0x61 && prev.arguments.len() >= 3 {
-                            let idx_arg = &prev.arguments[2];
-                            if idx_arg.arg_type != 0 {
-                                id_variables.insert((idx_arg.arg_type, idx_arg.raw_data));
-                            }
-                            break;
+        if writes_speaker_register(instr, speaker_register) {
+            let src = &instr.arguments[1];
+            if src.arg_type != 2 {
+                let search_start = i.saturating_sub(10);
+                for j in (search_start..i).rev() {
+                    let prev = &instructions[j];
+                    if prev.opcode == 0x61 && prev.arguments.len() >= 3 {
+                        let idx_arg = &prev.arguments[2];
+                        if idx_arg.arg_type != 0 {
+                            id_variables.insert((idx_arg.arg_type, idx_arg.raw_data));
                         }
-                        if prev.opcode == 0x12C && prev.arguments.len() >= 5 {
-                            let row_arg = &prev.arguments[2];
-                            if row_arg.arg_type != 0 {
-                                id_variables.insert((row_arg.arg_type, row_arg.raw_data));
-                            }
-                            break;
+                        break;
+                    }
+                    if prev.opcode == 0x12C && prev.arguments.len() >= 5 {
+                        let row_arg = &prev.arguments[2];
+                        if row_arg.arg_type != 0 {
+                            id_variables.insert((row_arg.arg_type, row_arg.raw_data));
                         }
+                        break;
                     }
                 }
             }
@@ -381,15 +392,13 @@ pub fn extract_row_speakers(
         }
 
         // Track set-string writes to speaker register (both literal and variable sources)
-        if instr.opcode == 0x192 && instr.arguments.len() >= 2 {
-            if instr.arguments[0].raw_data == speaker_register {
-                let src = &instr.arguments[1];
-                if src.arg_type == 2 {
-                    // Literal string speaker — record directly
-                    let name = src.decoded_string.clone().unwrap_or_default();
-                    current_literal_speaker = Some((src.raw_data, name));
-                    current_speaker_id = None; // Literal takes over
-                }
+        if writes_speaker_register(instr, speaker_register) {
+            let src = &instr.arguments[1];
+            if src.arg_type == 2 {
+                // Literal string speaker — record directly
+                let name = src.decoded_string.clone().unwrap_or_default();
+                current_literal_speaker = Some((src.raw_data, name));
+                current_speaker_id = None; // Literal takes over
             }
         }
 
@@ -443,39 +452,36 @@ pub fn extract_referenced_speakers(instructions: &[Instruction]) -> Vec<Characte
 
     // Pass 1: Find set-string writes to speaker register and trace sources
     for (i, instr) in instructions.iter().enumerate() {
-        if instr.opcode == 0x192 && instr.arguments.len() >= 2 {
-            let dest = &instr.arguments[0];
-            if dest.raw_data == speaker_reg {
-                let src = &instr.arguments[1];
+        if writes_speaker_register(instr, speaker_reg) {
+            let src = &instr.arguments[1];
 
-                if src.arg_type == 2 {
-                    // Literal string source — record directly with the name
-                    if !found.contains_key(&src.raw_data) {
-                        let name = src.decoded_string.clone().unwrap_or_default();
-                        found.insert(src.raw_data, name);
+            if src.arg_type == 2 {
+                // Literal string source — record directly with the name
+                if !found.contains_key(&src.raw_data) {
+                    let name = src.decoded_string.clone().unwrap_or_default();
+                    found.insert(src.raw_data, name);
+                }
+            } else {
+                // Variable/temp register source — trace backward to find lookup-array
+                let search_start = i.saturating_sub(10);
+                for j in (search_start..i).rev() {
+                    let prev = &instructions[j];
+                    // lookup-array: dest = array[index] — 3 args
+                    if prev.opcode == 0x61 && prev.arguments.len() >= 3 {
+                        let idx_arg = &prev.arguments[2];
+                        if idx_arg.arg_type != 0 {
+                            index_variables.insert((idx_arg.arg_type, idx_arg.raw_data));
+                        }
+                        break;
                     }
-                } else {
-                    // Variable/temp register source — trace backward to find lookup-array
-                    let search_start = i.saturating_sub(10);
-                    for j in (search_start..i).rev() {
-                        let prev = &instructions[j];
-                        // lookup-array: dest = array[index] — 3 args
-                        if prev.opcode == 0x61 && prev.arguments.len() >= 3 {
-                            let idx_arg = &prev.arguments[2];
-                            if idx_arg.arg_type != 0 {
-                                index_variables.insert((idx_arg.arg_type, idx_arg.raw_data));
-                            }
-                            break;
+                    // lookup-array-2d: dest = array[row][col] — 5 args
+                    if prev.opcode == 0x12C && prev.arguments.len() >= 5 {
+                        // Capture both row (arg[2]) and col (arg[4]) index variables
+                        let row_arg = &prev.arguments[2];
+                        if row_arg.arg_type != 0 {
+                            index_variables.insert((row_arg.arg_type, row_arg.raw_data));
                         }
-                        // lookup-array-2d: dest = array[row][col] — 5 args
-                        if prev.opcode == 0x12C && prev.arguments.len() >= 5 {
-                            // Capture both row (arg[2]) and col (arg[4]) index variables
-                            let row_arg = &prev.arguments[2];
-                            if row_arg.arg_type != 0 {
-                                index_variables.insert((row_arg.arg_type, row_arg.raw_data));
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
             }
@@ -598,10 +604,18 @@ pub fn detect_speaker_id_variable(instructions: &[Instruction]) -> Option<u32> {
         return None;
     }
 
+    // Variables that feed play-voice (0xC4) hold VOICE numbers, not speaker IDs
+    // (Atelial: `mov 261009, 326` … `play-voice 261009` looked like a speaker register).
+    let voice_vars: HashSet<u32> = instructions
+        .iter()
+        .filter(|i| i.opcode == 0xC4)
+        .flat_map(|i| i.arguments.iter().filter(|a| a.arg_type == 0x3).map(|a| a.raw_data))
+        .collect();
+
     let mut dest_info: HashMap<u32, (HashSet<u32>, usize)> = HashMap::new();
 
     for (i, instr) in instructions.iter().enumerate() {
-        if instr.opcode == 0x55 && instr.arguments.len() >= 2 {
+        if instr.opcode == 0x55 && instr.arguments.len() >= 2 && !voice_vars.contains(&instr.arguments[0].raw_data) {
             let dest = &instr.arguments[0];
             let src = &instr.arguments[1];
             if dest.arg_type == 0x3 && src.arg_type == 0 && src.raw_data <= 1000 {
@@ -881,9 +895,9 @@ pub fn extract_referenced_speakers_1d2(
 ///
 /// Returns true if the text looks like a name: short, no sentence punctuation,
 /// not preceded by display-furigana, and followed by end-text-line.
-fn is_sys3_speaker_name(instructions: &[Instruction], i: usize, text: &str) -> bool {
-    // Must not start with dialogue quotes
-    if text.starts_with('「') || text.starts_with('（') {
+pub(crate) fn is_sys3_speaker_name(instructions: &[Instruction], i: usize, text: &str) -> bool {
+    // Must not start with dialogue quotes or a title bracket (『識るのは怖い』 chapter cards)
+    if text.starts_with('「') || text.starts_with('（') || text.starts_with('『') {
         return false;
     }
     // Must be followed by end-text-line
@@ -918,78 +932,108 @@ fn speaker_name_hash(name: &str) -> u32 {
     if hash == 0 { 1 } else { hash }
 }
 
-/// Extract row speakers for SYS3 using inline literal name pattern.
-///
-/// SYS3 embeds speaker names directly as show-text instructions with literal strings.
-/// Pattern: show-text "Name" → end-text-line → [play-voice] → show-text "「dialogue」"
-///
-/// Uses stable hash IDs so the speaker badge looks up the Characters panel,
-/// allowing users to type translated names that appear in the badge.
+/// SYS3 speaker of every text line, decided per box (click-wait to click-wait):
+/// - Minefuka / Meishoku: the box opens with a short name line (`show-text "フィーノ"` +
+///   end-text-line); the lines after it are that character's (Minefuka indents them with
+///   "　" instead of 「」, which the old 「-only rule missed entirely);
+/// - Kuutei: the scene writes the name literal into the name-plate string array the box
+///   routine draws (`lookup-array t14:0, t5:202, i` + `set-string t14:0, "男"`; the routine
+///   does `show-text 1, t5:202`). Literals into other arrays are menu text (Meishoku
+///   `t5:116` "キャンセル") or chapter titles, not speakers. The plate keeps its name, so a
+///   speaker's later boxes don't set it again: a box that opens with 「/（ and sets no
+///   name reuses the last plate name;
+/// - boxes with neither are narration. Name lines themselves get no speaker.
+/// Returns show-text index → name.
+pub fn sys3_row_names(instructions: &[Instruction]) -> BTreeMap<usize, String> {
+    const OP_WAIT_FOR_INPUT: u32 = 0x72;
+    const GLOBAL_STRING_ARG: u32 = 5;
+    // Global string arrays some show-text displays (the name plate among them).
+    let displayed: std::collections::HashSet<u32> = instructions
+        .iter()
+        .filter(|i| i.opcode == 0x6E)
+        .flat_map(|i| i.arguments.iter().filter(|a| a.arg_type == GLOBAL_STRING_ARG).map(|a| a.raw_data))
+        .collect();
+    let mut rows = BTreeMap::new();
+    let mut box_name: Option<String> = None;
+    let mut plate_name: Option<String> = None; // Kuutei: persists across boxes
+    let mut box_has_text = false;
+    let mut alias: Option<(u32, u32, u32)> = None; // lookup-array (local type, local slot) → global array
+    for (i, instr) in instructions.iter().enumerate() {
+        if instr.opcode == 0x61 {
+            alias = match (instr.arguments.first(), instr.arguments.get(1)) {
+                (Some(local), Some(array)) if array.arg_type == GLOBAL_STRING_ARG => Some((local.arg_type, local.raw_data, array.raw_data)),
+                _ => None,
+            };
+            continue;
+        }
+        match instr.opcode {
+            OP_WAIT_FOR_INPUT => {
+                box_name = None;
+                box_has_text = false;
+            }
+            0x192 => {
+                // Kuutei: literal into an element of a displayed string array (via the alias).
+                let target_array = instr.arguments.first().and_then(|t| {
+                    alias.filter(|(local_type, local_slot, _)| *local_type == t.arg_type && *local_slot == t.raw_data).map(|(_, _, array)| array)
+                });
+                let literal = instr.arguments.get(1).filter(|a| a.arg_type == 2).and_then(|a| a.decoded_string.as_deref());
+                if let (Some(array), Some(name)) = (target_array, literal) {
+                    if displayed.contains(&array) && is_name_like(name) {
+                        box_name = Some(name.trim().to_string());
+                        plate_name = box_name.clone();
+                    }
+                }
+            }
+            0x6E => {
+                let Some(text) = instr.arguments.iter().find_map(|a| a.decoded_string.as_deref()).filter(|t| !t.trim().is_empty()) else {
+                    continue;
+                };
+                if !box_has_text && is_sys3_speaker_name(instructions, i, text) {
+                    box_name = Some(text.trim().to_string());
+                } else if !box_has_text && box_name.is_none() && (text.starts_with('「') || text.starts_with('（')) {
+                    box_name = plate_name.clone(); // same speaker as the plate still shows
+                    if let Some(name) = &box_name {
+                        rows.insert(i, name.clone());
+                    }
+                } else if let Some(name) = &box_name {
+                    rows.insert(i, name.clone());
+                }
+                box_has_text = true;
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// A short literal that can be a character name (no sentence punctuation).
+fn is_name_like(text: &str) -> bool {
+    let trimmed = text.trim();
+    let count = trimmed.chars().count();
+    count >= 1
+        && count <= 12
+        && !trimmed.chars().any(|c| matches!(c, '。' | '、' | '「' | '」' | '『' | '』' | '…' | '？' | '！' | '～' | '　' | '：' | '/' | '\\'))
+}
+
+/// Row speakers for SYS3 (see `sys3_row_names`). Ids are stable hashes of the Japanese
+/// name, so the Characters panel can carry the translated name.
 pub fn extract_row_speakers_sys3(
     instructions: &[Instruction],
 ) -> BTreeMap<usize, SpeakerRef> {
-    let mut result = BTreeMap::new();
-    let mut current_speaker_id: Option<u32> = None;
-
-    for (i, instr) in instructions.iter().enumerate() {
-        if instr.opcode != 0x6E || instr.arguments.is_empty() {
-            continue;
-        }
-
-        let text = match instr.arguments.iter().find_map(|a| a.decoded_string.as_ref()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        // A show-text that starts with 「 is dialogue — attach the current speaker
-        if text.starts_with('「') || text.starts_with('（') {
-            if let Some(id) = current_speaker_id {
-                result.insert(i, SpeakerRef {
-                    source_type: 0,
-                    source_raw_data: id,
-                    literal_name: None,
-                });
-            }
-            continue;
-        }
-
-        if is_sys3_speaker_name(instructions, i, text) {
-            current_speaker_id = Some(speaker_name_hash(text));
-        }
-    }
-
-    result
+    sys3_row_names(instructions)
+        .into_iter()
+        .map(|(i, name)| (i, SpeakerRef { source_type: 0, source_raw_data: speaker_name_hash(&name), literal_name: None }))
+        .collect()
 }
 
-/// Extract unique speaker names from SYS3 inline show-text patterns.
-///
-/// Collects all distinct speaker names detected by the SYS3 pattern.
-/// Returns CharacterEntry where pointer is a stable hash of the Japanese name
-/// and name is the original Japanese text (user can overwrite with translation).
+/// Unique SYS3 speakers (see `sys3_row_names`): pointer = stable hash of the Japanese
+/// name, name = the Japanese text (the user can overwrite it with a translation).
 pub fn extract_referenced_speakers_sys3(
     instructions: &[Instruction],
 ) -> Vec<CharacterEntry> {
-    let mut seen: BTreeMap<u32, String> = BTreeMap::new();
-
-    for (i, instr) in instructions.iter().enumerate() {
-        if instr.opcode != 0x6E || instr.arguments.is_empty() {
-            continue;
-        }
-
-        let text = match instr.arguments.iter().find_map(|a| a.decoded_string.as_ref()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        if is_sys3_speaker_name(instructions, i, text) {
-            let id = speaker_name_hash(text);
-            seen.entry(id).or_insert_with(|| text.clone());
-        }
-    }
-
-    seen.into_iter()
-        .map(|(id, name)| CharacterEntry { pointer: id, name })
-        .collect()
+    let names: BTreeMap<u32, String> =
+        sys3_row_names(instructions).into_values().map(|name| (speaker_name_hash(&name), name)).collect();
+    names.into_iter().map(|(pointer, name)| CharacterEntry { pointer, name }).collect()
 }
 
 /// Reference to the speaker for a specific show-text instruction.
@@ -1268,7 +1312,7 @@ mod tests {
     #[test]
     #[ignore = "diagnostic — run via: cargo test -- --ignored"]
     fn diagnose_ciinit_call_numbers() {
-        let data = load_test_bin("sys4/CIINIT.BIN").unwrap();
+        let Ok(data) = load_test_bin("sys4/CIINIT.BIN") else { return };
         let parsed = parse_bin(&data).unwrap();
         // For each set-string in the main name run, dump movs strictly after it
         // up to the next set-string, with literals < 200.
@@ -1640,7 +1684,7 @@ mod tests {
     }
     #[test]
     fn test_sys3_speaker_detection() {
-        let data = load_test_bin("sys3/SC060.BIN").unwrap();
+        let Ok(data) = load_test_bin("sys3/SC060.BIN") else { return };
         let parsed = parse_bin(&data).unwrap();
 
         let speakers = extract_referenced_speakers_sys3(&parsed.instructions);
@@ -1657,4 +1701,766 @@ mod tests {
         assert!(row_speakers.len() >= 20, "Should have many speaker-tagged rows, got {}", row_speakers.len());
     }
 
+}
+
+// ---- Talk-key speaker scheme (Atelial / SYS4 438) --------------------------------
+//
+// Scenes never name the speaker. Each box sets a talk key and calls a line routine:
+//   mov  KEY, L            ; packed key: hi = L / 2^24 (append selector), lo = L % 2^24
+//   call <line routine>    ; div X, KEY, 2^24 / mod Y, KEY, 2^24
+//                          ; lookup-array-2d t12, TABLE, X, 30000, Y → speaker index (≤0 = narration)
+// INIT2 builds TABLE by inverting a per-character key list SOURCE[i*STRIDE + j] = key
+// (filled by an INIT file, Atelial CFINIT.BIN); character i's names live in CHINIT
+// (`mov <id table>+i, i` + set-string name) — the same shape `extract_chinit_id_name_map` reads.
+// See docs/engine/age-sys.md (speakers) and SYS4_DISCOVERIES.md.
+
+const PACKED_KEY_DIVISOR: u32 = 16_777_216;
+const OP_DIV: u32 = 0x53;
+const OP_MOD: u32 = 0x54;
+const OP_LOOKUP_2D: u32 = 0x12c;
+const OP_MOV: u32 = 0x55;
+const OP_SHOW_TEXT: u32 = 0x6e;
+const ARG_GLOBAL_INT: u32 = 3;
+const ARG_LITERAL: u32 = 0;
+/// INIT2's inversion loop covers character indices below this (Atelial `lt i, 1000`);
+/// arrays laid out right after SOURCE (CFINIT's face table at +100000) fall outside.
+const MAX_TALK_CHARACTERS: u32 = 1000;
+
+/// Where a scene keeps its talk key, which 2-D table maps keys to speakers, and the
+/// speaker-index variable the line routine writes (scenes also write it directly:
+/// `sub SPK, 0, 1` = narration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TalkKeyScheme {
+    pub key_var: u32,
+    pub table: u32,
+    pub speaker_var: Option<u32>,
+}
+
+fn arg_is(instr: &Instruction, index: usize, arg_type: u32, value: u32) -> bool {
+    instr.arguments.get(index).map(|a| a.arg_type == arg_type && a.raw_data == value).unwrap_or(false)
+}
+
+/// `div X, KEY, 2^24` + `mod Y, KEY, 2^24` + `lookup-array-2d t12, TABLE, X, _, Y` in a scene.
+pub fn detect_talk_key_scheme(instructions: &[Instruction]) -> Option<TalkKeyScheme> {
+    instructions.windows(3).enumerate().find_map(|(at, w)| {
+        let (div, modulo, lookup) = (&w[0], &w[1], &w[2]);
+        if div.opcode != OP_DIV || modulo.opcode != OP_MOD || lookup.opcode != OP_LOOKUP_2D {
+            return None;
+        }
+        if !arg_is(div, 2, ARG_LITERAL, PACKED_KEY_DIVISOR) || !arg_is(modulo, 2, ARG_LITERAL, PACKED_KEY_DIVISOR) {
+            return None;
+        }
+        let key = div.arguments.get(1).filter(|a| a.arg_type == ARG_GLOBAL_INT)?.raw_data;
+        if !arg_is(modulo, 1, ARG_GLOBAL_INT, key) {
+            return None;
+        }
+        let table = lookup.arguments.get(1).filter(|a| a.arg_type == ARG_GLOBAL_INT)?.raw_data;
+        // `mov SPK, t12` after the (repeated) lookup on TABLE.
+        let speaker_var = instructions[at + 3..(at + 8).min(instructions.len())].iter().find_map(|i| {
+            (i.opcode == OP_MOV && i.arguments.get(1).map(|a| a.arg_type == 12).unwrap_or(false))
+                .then(|| i.arguments.first().filter(|a| a.arg_type == ARG_GLOBAL_INT).map(|a| a.raw_data))
+                .flatten()
+        });
+        Some(TalkKeyScheme { key_var: key, table, speaker_var })
+    })
+}
+
+const OP_SUB: u32 = 0x51;
+const OP_CALL: u32 = 0x8f;
+const OP_RET: u32 = 0x05;
+/// How deep `call`s are followed when looking for a speaker reset (narration boxes call
+/// a box routine that calls the reset: `sub SPK, 0, 1`).
+const SPEAKER_RESET_CALL_DEPTH: usize = 2;
+const ROUTINE_SCAN_LIMIT: usize = 24;
+
+/// Does the routine at byte offset `target` clear the speaker (`sub SPK, 0, 1`), directly
+/// or through the calls it makes (up to `depth` levels)? The talk-key line routine also
+/// has a `sub SPK` (its "key has no owner" branch) but assigns the speaker first
+/// (`mov SPK, t12`) — that one is not a reset.
+fn routine_clears_speaker(instructions: &[Instruction], target: u64, speaker_var: u32, depth: usize) -> bool {
+    let Some(start) = instructions.iter().position(|i| i.offset == target) else { return false };
+    for instr in instructions[start..].iter().take(ROUTINE_SCAN_LIMIT) {
+        if instr.opcode == OP_RET || (instr.opcode == OP_MOV && arg_is(instr, 0, ARG_GLOBAL_INT, speaker_var)) {
+            return false;
+        }
+        if instr.opcode == OP_SUB && arg_is(instr, 0, ARG_GLOBAL_INT, speaker_var) {
+            return true;
+        }
+        if instr.opcode == OP_CALL && depth > 0 {
+            if let Some(next) = instr.arguments.first().filter(|a| a.arg_type == ARG_LITERAL) {
+                if routine_clears_speaker(instructions, next.raw_data as u64, speaker_var, depth - 1) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Who speaks in each show-text, following the engine's state: a talk-key write makes
+/// the key's owner current (`owners`; unknown key = narration); a direct literal write
+/// to the speaker variable sets it (≤ 0 = narration), as does a call into a routine that
+/// resets it (narration boxes). show-text index → character.
+pub fn talk_key_row_speakers(
+    instructions: &[Instruction],
+    scheme: &TalkKeyScheme,
+    owners: &std::collections::HashMap<u32, u32>,
+) -> std::collections::BTreeMap<usize, u32> {
+    let mut resets: std::collections::HashMap<u32, bool> = std::collections::HashMap::new();
+    let mut rows = std::collections::BTreeMap::new();
+    let mut current: Option<u32> = None;
+    for (index, instr) in instructions.iter().enumerate() {
+        let writes = |var: u32| instr.arguments.first().map(|a| a.arg_type == ARG_GLOBAL_INT && a.raw_data == var).unwrap_or(false);
+        if instr.opcode == OP_CALL {
+            if let (Some(speaker_var), Some(target)) = (scheme.speaker_var, instr.arguments.first().filter(|a| a.arg_type == ARG_LITERAL)) {
+                let clears = *resets
+                    .entry(target.raw_data)
+                    .or_insert_with(|| routine_clears_speaker(instructions, target.raw_data as u64, speaker_var, SPEAKER_RESET_CALL_DEPTH));
+                if clears {
+                    current = None;
+                }
+            }
+        } else if instr.opcode == OP_MOV && writes(scheme.key_var) {
+            if let Some(key) = instr.arguments.get(1).filter(|a| a.arg_type == ARG_LITERAL) {
+                current = owners.get(&(key.raw_data % PACKED_KEY_DIVISOR)).copied();
+            }
+        } else if scheme.speaker_var.map(writes).unwrap_or(false) {
+            current = match instr.opcode {
+                OP_SUB => None, // sub SPK, 0, 1 → -1
+                OP_MOV => instr.arguments.get(1).filter(|a| a.arg_type == ARG_LITERAL && a.raw_data > 0 && a.raw_data < MAX_TALK_CHARACTERS).map(|a| a.raw_data),
+                _ => current,
+            };
+        } else if instr.opcode == OP_SHOW_TEXT {
+            if let Some(character) = current {
+                rows.insert(index, character);
+            }
+        }
+    }
+    rows
+}
+
+/// In INIT2: the per-character key list (SOURCE, STRIDE) whose inversion fills `table` —
+/// the nearest earlier `lookup-array-2d` on another table before the one on `table`.
+pub fn talk_key_source(init2: &[Instruction], table: u32) -> Option<(u32, u32)> {
+    let at = init2.iter().position(|i| i.opcode == OP_LOOKUP_2D && arg_is(i, 1, ARG_GLOBAL_INT, table))?;
+    init2[..at].iter().rev().find_map(|i| {
+        if i.opcode != OP_LOOKUP_2D {
+            return None;
+        }
+        let source = i.arguments.get(1).filter(|a| a.arg_type == ARG_GLOBAL_INT)?.raw_data;
+        let stride = i.arguments.get(3).filter(|a| a.arg_type == ARG_LITERAL)?.raw_data;
+        (source != table && stride > 0).then_some((source, stride))
+    })
+}
+
+/// Talk key (lo part) → character index, from `mov SOURCE + i*STRIDE + j, key` writes.
+pub fn talk_key_owners(script: &[Instruction], source: u32, stride: u32, owners: &mut std::collections::HashMap<u32, u32>) {
+    for instr in script.iter().filter(|i| i.opcode == OP_MOV) {
+        let (Some(dest), Some(value)) = (instr.arguments.first(), instr.arguments.get(1)) else { continue };
+        if dest.arg_type != ARG_GLOBAL_INT || value.arg_type != ARG_LITERAL || dest.raw_data < source {
+            continue;
+        }
+        let offset = dest.raw_data - source;
+        let character = offset / stride;
+        if offset % stride == 0 || character == 0 || character >= MAX_TALK_CHARACTERS || value.raw_data == 0 {
+            continue; // j = 0 is never used; guards keep unrelated arrays out
+        }
+        owners.entry(value.raw_data % PACKED_KEY_DIVISOR).or_insert(character);
+    }
+}
+
+#[cfg(test)]
+mod talk_key_tests {
+    use super::*;
+    use crate::bin_format::instruction::Argument;
+
+    fn op(opcode: u32, args: &[(u32, u32)]) -> Instruction {
+        Instruction {
+            opcode,
+            label: String::new(),
+            argument_count: args.len() as u32,
+            arguments: args
+                .iter()
+                .map(|&(t, v)| Argument { arg_type: t, raw_data: v, decoded_string: None, original_encoded_bytes: None, data_array: None })
+                .collect(),
+            offset: 0,
+        }
+    }
+
+    /// Atelial SC0000 shape: two boxes (narration key 324, Chihiro key 335) + the line routine.
+    fn scene() -> Vec<Instruction> {
+        vec![
+            op(OP_MOV, &[(3, 261008), (0, 324)]),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]),
+            op(OP_MOV, &[(3, 261008), (0, 335)]),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]),
+            op(OP_DIV, &[(3, 2181132), (3, 261008), (0, PACKED_KEY_DIVISOR)]),
+            op(OP_MOD, &[(3, 2181133), (3, 261008), (0, PACKED_KEY_DIVISOR)]),
+            op(OP_LOOKUP_2D, &[(12, 0), (3, 261128), (3, 2181132), (0, 30000), (3, 2181133)]),
+            op(OP_MOV, &[(3, 12608), (12, 0)]),
+        ]
+    }
+
+    #[test]
+    fn narration_clears_the_speaker_even_when_the_key_is_unchanged() {
+        let scheme = detect_talk_key_scheme(&scene()).unwrap();
+        let owners = std::collections::HashMap::from([(335u32, 7u32)]);
+        let mut script = scene();
+        script.insert(4, op(0x51, &[(3, 12608), (0, 0), (0, 1)])); // narration box: sub SPK, 0, 1
+        script.insert(5, op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]));
+        let rows = talk_key_row_speakers(&script, &scheme, &owners);
+        assert_eq!(rows.get(&1), None); // key 324 has no owner → narration
+        assert_eq!(rows.get(&3), Some(&7)); // Chihiro
+        assert_eq!(rows.get(&5), None); // explicit narration after her line
+    }
+
+    #[test]
+    fn narration_through_a_reset_routine() {
+        let scheme = detect_talk_key_scheme(&scene()).unwrap();
+        let owners = std::collections::HashMap::from([(335u32, 7u32)]);
+        let mut call = op(OP_CALL, &[(0, 900)]);
+        call.offset = 10;
+        let mut reset = op(OP_SUB, &[(3, 12608), (0, 0), (0, 1)]);
+        reset.offset = 900;
+        let mut script = scene();
+        // The line routine (assigns SPK, then has its own `sub SPK` branch) is no reset.
+        let mut line_call = op(OP_CALL, &[(0, 950)]);
+        line_call.offset = 5;
+        let mut line_routine = vec![op(OP_MOV, &[(3, 12608), (12, 0)]), op(OP_SUB, &[(3, 12608), (0, 0), (0, 1)]), op(OP_RET, &[])];
+        line_routine[0].offset = 950;
+        script.insert(3, line_call); // after `mov KEY, 335`, before Chihiro's line
+        script.extend(line_routine);
+        script.insert(5, call); // narration box calls the reset routine
+        script.insert(6, op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]));
+        script.push(reset);
+        script.push(op(OP_RET, &[]));
+        let rows = talk_key_row_speakers(&script, &scheme, &owners);
+        assert_eq!(rows.get(&4), Some(&7)); // Chihiro's line, after the line routine
+        assert_eq!(rows.get(&6), None); // narration via the reset routine
+    }
+
+    #[test]
+    fn detects_scheme() {
+        let scheme = detect_talk_key_scheme(&scene()).unwrap();
+        assert_eq!(scheme, TalkKeyScheme { key_var: 261008, table: 261128, speaker_var: Some(12608) });
+    }
+
+    #[test]
+    fn inverts_init2_source_into_owners() {
+        let init2 = vec![
+            op(OP_LOOKUP_2D, &[(12, 2), (3, 2518161), (9, 0), (0, 100), (9, 1)]),
+            op(OP_LOOKUP_2D, &[(12, 2), (3, 261128), (9, 2), (0, 30000), (9, 3)]),
+        ];
+        assert_eq!(talk_key_source(&init2, 261128), Some((2518161, 100)));
+        let cfinit = vec![
+            op(OP_MOV, &[(3, 2518161 + 7 * 100 + 1), (0, 335)]),
+            op(OP_MOV, &[(3, 2518161 + 7 * 100), (0, 9)]),
+            op(OP_MOV, &[(3, 2618161 + 7 * 100 + 1), (0, 18273)]), // parallel face table
+        ];
+        let mut owners = std::collections::HashMap::new();
+        talk_key_owners(&cfinit, 2518161, 100, &mut owners);
+        assert_eq!(owners.get(&335), Some(&7));
+        assert_eq!(owners.len(), 1); // j = 0 slot and the face table ignored
+    }
+}
+
+// ---- Speaker name tables (all SYS4 / SYS5 corpus games) ---------------------------
+//
+// Speaker IDs become names through one of two INIT shapes (audit 2026-11-11):
+//   string table — CNINIT `set-string t5:<base + stride*id>, "name"`
+//                  (Megami Zero 224/1, Himegari 802/1, VERITA 440/1, Sankai 65551/1,
+//                   Hyakusen 43403/6);
+//   ID register  — CHINIT `mov <table>+id, id` + `set-string …, "name"`
+//                  (Madou, LaDEA, Atelial; read by `extract_chinit_id_name_map`).
+// (base, stride) is found by voting: every set-string address A and speaker id i propose
+// base = A − stride·i; the most-voted pair wins.
+
+/// Files that hold speaker names, highest priority first (appends shadow their base).
+pub const NAME_TABLE_FILES: [&str; 2] = ["CNINIT.BIN", "CHINIT.BIN"];
+const MAX_NAME_TABLE_STRIDE: u32 = 8;
+/// A table must name at least this share of the scene's speaker ids to be trusted.
+const MIN_NAME_COVERAGE: f64 = 0.5;
+
+/// `set-string` targets → names in a script (global strings only).
+fn string_slots(script: &[Instruction]) -> std::collections::HashMap<u32, String> {
+    script
+        .iter()
+        .filter(|i| i.opcode == 0x192 && i.arguments.len() >= 2 && i.arguments[0].arg_type == 5)
+        .filter_map(|i| Some((i.arguments[0].raw_data, i.arguments[1].decoded_string.clone()?.trim().to_string())))
+        .filter(|(_, name)| !name.is_empty())
+        .collect()
+}
+
+/// id → name through the best (base, stride) string table for `ids`, if any.
+pub fn string_table_names(script: &[Instruction], ids: &[u32]) -> std::collections::HashMap<u32, String> {
+    let slots = string_slots(script);
+    let mut votes: std::collections::HashMap<(i64, u32), usize> = std::collections::HashMap::new();
+    for stride in 1..=MAX_NAME_TABLE_STRIDE {
+        for &address in slots.keys() {
+            for &id in ids {
+                *votes.entry((address as i64 - (stride as i64) * (id as i64), stride)).or_default() += 1;
+            }
+        }
+    }
+    let Some(&top) = votes.values().max() else { return Default::default() };
+    let resolve = |base: i64, stride: u32| -> std::collections::HashMap<u32, String> {
+        ids.iter()
+            .filter_map(|&id| {
+                let address = base + stride as i64 * id as i64;
+                u32::try_from(address).ok().and_then(|a| slots.get(&a)).map(|name| (id, name.clone()))
+            })
+            .collect()
+    };
+    // Equal votes: a record's other fields (descriptions at base+1 …) align too. Names are
+    // the most distinct and shortest strings; then the lowest base / stride.
+    let mut tied: Vec<(i64, u32)> = votes.into_iter().filter(|&(_, count)| count == top).map(|(key, _)| key).collect();
+    tied.sort();
+    tied.into_iter()
+        .map(|(base, stride)| resolve(base, stride))
+        .max_by_key(|names| {
+            let distinct = names.values().collect::<std::collections::HashSet<_>>().len();
+            let total_chars: usize = names.values().map(|n| n.chars().count()).sum();
+            (distinct, std::cmp::Reverse(total_chars))
+        })
+        .unwrap_or_default()
+}
+
+/// Names for `ids`: each name-table script is read with both shapes (ID register,
+/// string table); tables covering too few ids are dropped; the best-covering table wins
+/// (earlier scripts win ties) and the others only fill ids it lacks (Madou: CHINIT names
+/// every speaker, CNINIT misses a few).
+pub fn discover_speaker_names(scripts: &[(String, Vec<Instruction>)], ids: &[u32]) -> std::collections::HashMap<u32, String> {
+    if ids.is_empty() {
+        return Default::default();
+    }
+    let needed = ((ids.len() as f64 * MIN_NAME_COVERAGE).ceil() as usize).max(1);
+    let mut tables: Vec<std::collections::HashMap<u32, String>> = scripts
+        .iter()
+        .map(|(_, script)| {
+            let register = extract_chinit_id_name_map(script);
+            let by_register: std::collections::HashMap<u32, String> =
+                ids.iter().filter_map(|id| register.get(id).map(|n| (*id, n.clone()))).collect();
+            let by_table = string_table_names(script, ids);
+            if by_register.len() >= by_table.len() { by_register } else { by_table }
+        })
+        .filter(|table| table.len() >= needed)
+        .collect();
+    // Stable sort: highest coverage first, script order among equals.
+    tables.sort_by_key(|table| std::cmp::Reverse(table.len()));
+    let mut names = std::collections::HashMap::new();
+    for table in tables {
+        for (id, name) in table {
+            names.entry(id).or_insert(name);
+        }
+    }
+    names
+}
+
+#[cfg(test)]
+mod name_table_tests {
+    use super::*;
+    use crate::bin_format::instruction::Argument;
+
+    fn set_string(address: u32, name: &str) -> Instruction {
+        Instruction {
+            opcode: 0x192,
+            label: String::new(),
+            argument_count: 2,
+            arguments: vec![
+                Argument { arg_type: 5, raw_data: address, decoded_string: None, original_encoded_bytes: None, data_array: None },
+                Argument { arg_type: 2, raw_data: 0, decoded_string: Some(name.to_string()), original_encoded_bytes: None, data_array: None },
+            ],
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn finds_a_strided_string_table() {
+        // Hyakusen shape: base 43403, stride 6 (other fields of each record in between).
+        // Real scenes reference 20-35 ids; a coincidental stride-1 alignment through the
+        // records' description slots cannot match all of them.
+        let speakers = [(2u32, "ルイリ"), (3, "トキーグ"), (8, "ルーデンステルグ"), (10, "お淑やかな女性"), (31, "ガナシュ"), (104, "ミュラ"), (117, "レグナ"), (121, "トニア")];
+        let mut cninit = Vec::new();
+        for (id, name) in speakers {
+            cninit.push(set_string(43403 + 6 * id, name));
+            cninit.push(set_string(43403 + 6 * id + 1, "説明文"));
+        }
+        let ids: Vec<u32> = speakers.iter().map(|s| s.0).collect();
+        let names = string_table_names(&cninit, &ids);
+        assert_eq!(names.get(&8).map(String::as_str), Some("ルーデンステルグ"));
+        assert_eq!(names.len(), speakers.len());
+    }
+
+    #[test]
+    fn first_covering_file_wins_and_weak_tables_are_ignored() {
+        let unrelated = vec![set_string(10, "火炎噴射")];
+        let cninit = vec![set_string(224 + 1, "司祭"), set_string(224 + 20, "ダルノス"), set_string(224 + 40, "子供")];
+        let scripts = vec![("SKINIT.BIN".to_string(), unrelated), ("CNINIT.BIN".to_string(), cninit)];
+        let names = discover_speaker_names(&scripts, &[1, 20, 40]);
+        assert_eq!(names.get(&20).map(String::as_str), Some("ダルノス"));
+    }
+}
+
+// ---- Scene-local row speaker detection (shared by the app and the corpus audit) ----
+
+/// Which scene-local scheme supplied a scene's row speakers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowSpeakerScheme {
+    /// SYS3: names inline in show-text.
+    Sys3Inline,
+    /// SYS5: `lookup-array` character-id pattern (array address).
+    Sys5Lookup(u32),
+    /// g-int character-id register (SYS5 legacy, VERITA).
+    IdVariable(u32),
+    /// SYS4 set-string speaker register (global string).
+    Register(u32),
+    /// SYS4 `0x1D2` display slot (Megami Zero, Himegari).
+    DisplaySlot(u32),
+}
+
+/// Row speakers from the scene alone, trying each scheme in priority order for the
+/// SYS generation. (SYS4 talk-key scenes need the game's INIT tables and are handled
+/// before this — see `detect_talk_key_scheme`.)
+pub fn detect_row_speakers(instructions: &[Instruction], sys_version: u8) -> Option<(RowSpeakerScheme, BTreeMap<usize, SpeakerRef>)> {
+    detect_scheme_rows(instructions, sys_version).map(|(scheme, mut rows)| {
+        clear_narration_rows(instructions, &mut rows);
+        (scheme, rows)
+    })
+}
+
+fn detect_scheme_rows(instructions: &[Instruction], sys_version: u8) -> Option<(RowSpeakerScheme, BTreeMap<usize, SpeakerRef>)> {
+    if sys_version <= 3 {
+        return Some((RowSpeakerScheme::Sys3Inline, extract_row_speakers_sys3(instructions)));
+    }
+    if sys_version >= 5 {
+        if let Some((array, _)) = detect_speaker_lookup_array(instructions) {
+            return Some((RowSpeakerScheme::Sys5Lookup(array), extract_row_speakers_sys5(instructions, array)));
+        }
+        return detect_speaker_id_variable(instructions)
+            .map(|var| (RowSpeakerScheme::IdVariable(var), extract_row_speakers_sys5_legacy(instructions, var)));
+    }
+    let non_empty = |scheme: RowSpeakerScheme, rows: BTreeMap<usize, SpeakerRef>| (!rows.is_empty()).then_some((scheme, rows));
+    detect_speaker_register(instructions)
+        .and_then(|reg| non_empty(RowSpeakerScheme::Register(reg), extract_row_speakers(instructions, reg)))
+        .or_else(|| {
+            detect_speaker_display_slot(instructions)
+                .and_then(|slot| non_empty(RowSpeakerScheme::DisplaySlot(slot), extract_row_speakers_1d2(instructions, slot)))
+        })
+        .or_else(|| {
+            detect_speaker_id_variable(instructions)
+                .and_then(|var| non_empty(RowSpeakerScheme::IdVariable(var), extract_row_speakers_sys5_legacy(instructions, var)))
+        })
+}
+
+// ---- Narration boxes (engine-wide, SYS4 + SYS5) ------------------------------------
+//
+// Every box branches on its speaker variable before the text: `lt t9, SPK, 0` → no name
+// plate (narration). Spoken boxes assign it (`mov SPK, <id>`); narration boxes reset it,
+// usually inside a called box routine whose first ops are `sub SPK, 0, 1` (VERITA 13449,
+// Megami Zero 12240, Atelial 12608 — audit 2026-11-11). SYS5 (Hyakusen) keeps it in an
+// array slot: `lookup-array t12, 26147, idx` + `mov t12, <id>` / `lt t12, 0`, reset by
+// `sub 26147, 0, 1`. The scene-local schemes only track assignments, so without this pass
+// narration inherited the previous speaker.
+
+const OP_LT: u32 = 0x5c;
+const OP_LOOKUP: u32 = 0x61;
+const ARG_ARRAY_TEMP: u32 = 12;
+
+/// `lookup-array t12:N, X, _` → (N, X): the temp that aliases an element of array X.
+fn array_alias(instr: &Instruction) -> Option<(u32, u32)> {
+    if instr.opcode != OP_LOOKUP {
+        return None;
+    }
+    let temp = instr.arguments.first().filter(|a| a.arg_type == ARG_ARRAY_TEMP)?.raw_data;
+    let array = instr.arguments.get(1).filter(|a| a.arg_type == ARG_GLOBAL_INT)?.raw_data;
+    Some((temp, array))
+}
+
+/// Speaker variables, by role: g-ints (or arrays, SYS5) that the scene assigns positive
+/// ids, resets with `sub X, 0, 1`, and tests `< 0` (the box's name-plate branch). Position
+/// doesn't matter — Hyakusen tests its slot ~70 instructions before the text.
+pub fn speaker_state_variables(instructions: &[Instruction]) -> std::collections::HashSet<u32> {
+    let reset: std::collections::HashSet<u32> = instructions
+        .iter()
+        .filter(|i| i.opcode == OP_SUB && arg_is(i, 1, ARG_LITERAL, 0) && arg_is(i, 2, ARG_LITERAL, 1))
+        .filter_map(|i| i.arguments.first().filter(|a| a.arg_type == ARG_GLOBAL_INT).map(|a| a.raw_data))
+        .collect();
+    let positive_literal = |i: &Instruction| i.arguments.get(1).map(|a| a.arg_type == ARG_LITERAL && (a.raw_data as i32) > 0).unwrap_or(false);
+    let mut tested = std::collections::HashSet::new();
+    let mut assigned = std::collections::HashSet::new();
+    for (k, instr) in instructions.iter().enumerate() {
+        let alias = || k.checked_sub(1).and_then(|p| array_alias(&instructions[p]));
+        match instr.opcode {
+            OP_MOV if positive_literal(instr) => {
+                match instr.arguments.first() {
+                    Some(a) if a.arg_type == ARG_GLOBAL_INT => {
+                        assigned.insert(a.raw_data);
+                    }
+                    Some(a) if a.arg_type == ARG_ARRAY_TEMP => {
+                        if let Some((temp, array)) = alias().filter(|(temp, _)| *temp == a.raw_data) {
+                            let _ = temp;
+                            assigned.insert(array);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            OP_LT if arg_is(instr, 2, ARG_LITERAL, 0) => match instr.arguments.get(1) {
+                Some(a) if a.arg_type == ARG_GLOBAL_INT => {
+                    tested.insert(a.raw_data);
+                }
+                Some(a) if a.arg_type == ARG_ARRAY_TEMP => {
+                    if let Some((_, array)) = alias().filter(|(temp, _)| *temp == a.raw_data) {
+                        tested.insert(array);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    reset.into_iter().filter(|v| tested.contains(v) && assigned.contains(v)).collect()
+}
+
+/// What a called routine does to the speaker state, by its FIRST speaker write (calls
+/// followed `depth` levels): `Some(true)` reset (`sub X, 0, 1` / literal ≤ 0), `Some(false)`
+/// assignment (any other write — Madou/Hyakusen assign inside box routines), `None` neither.
+fn routine_speaker_effect(
+    instructions: &[Instruction],
+    target: u64,
+    vars: &std::collections::HashSet<u32>,
+    depth: usize,
+) -> Option<bool> {
+    let start = instructions.iter().position(|i| i.offset == target)?;
+    let body = &instructions[start..(start + ROUTINE_SCAN_LIMIT).min(instructions.len())];
+    for (k, instr) in body.iter().enumerate() {
+        if instr.opcode == OP_RET {
+            return None;
+        }
+        let writes_var = instr.arguments.first().map(|a| a.arg_type == ARG_GLOBAL_INT && vars.contains(&a.raw_data)).unwrap_or(false);
+        let writes_alias = instr.opcode == OP_MOV
+            && k > 0
+            && array_alias(&body[k - 1])
+                .map(|(temp, array)| vars.contains(&array) && arg_is(instr, 0, ARG_ARRAY_TEMP, temp))
+                .unwrap_or(false);
+        match instr.opcode {
+            OP_SUB if writes_var => return Some(true),
+            OP_MOV if writes_var || writes_alias => {
+                let literal_le_zero = instr.arguments.get(1).map(|a| a.arg_type == ARG_LITERAL && (a.raw_data as i32) <= 0).unwrap_or(false);
+                return Some(literal_le_zero);
+            }
+            OP_CALL if depth > 0 => {
+                if let Some(next) = instr.arguments.first().filter(|a| a.arg_type == ARG_LITERAL) {
+                    if let Some(effect) = routine_speaker_effect(instructions, next.raw_data as u64, vars, depth - 1) {
+                        return Some(effect);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Drop row speakers from narration boxes. Decided per box (click-wait to click-wait),
+/// because games keep more than one speaker variable and reset one while assigning
+/// another (Madou: `mov 14288, 2` then `sub 2169879, 0, 1` in a spoken box):
+/// any speaker assignment in the box (scene or called routine) → spoken; only resets →
+/// narration; neither → same as the previous box (continuation).
+pub fn clear_narration_rows(instructions: &[Instruction], rows: &mut BTreeMap<usize, SpeakerRef>) {
+    const OP_WAIT_FOR_INPUT: u32 = 0x72;
+    let vars = speaker_state_variables(instructions);
+    if vars.is_empty() || rows.is_empty() {
+        return;
+    }
+    let mut routine_effects: std::collections::HashMap<u32, Option<bool>> = std::collections::HashMap::new();
+    let (mut box_assigned, mut box_reset) = (false, false);
+    let mut previous_narration = false;
+    let mut alias: Option<(u32, u32)> = None; // last `lookup-array t12:N, X, _`
+    for (index, instr) in instructions.iter().enumerate() {
+        let writes_var = instr.arguments.first().map(|a| a.arg_type == ARG_GLOBAL_INT && vars.contains(&a.raw_data)).unwrap_or(false);
+        let writes_alias = instr.opcode == OP_MOV
+            && alias.map(|(temp, array)| vars.contains(&array) && arg_is(instr, 0, ARG_ARRAY_TEMP, temp)).unwrap_or(false);
+        alias = array_alias(instr).or(if instr.opcode == OP_LT { alias } else { None });
+        let mut record = |reset: bool| if reset { box_reset = true } else { box_assigned = true };
+        match instr.opcode {
+            OP_SUB if writes_var => record(true),
+            OP_MOV if writes_var || writes_alias => {
+                record(instr.arguments.get(1).map(|a| a.arg_type == ARG_LITERAL && (a.raw_data as i32) <= 0).unwrap_or(false))
+            }
+            OP_CALL => {
+                if let Some(call) = instr.arguments.first().filter(|a| a.arg_type == ARG_LITERAL) {
+                    let effect = *routine_effects
+                        .entry(call.raw_data)
+                        .or_insert_with(|| routine_speaker_effect(instructions, call.raw_data as u64, &vars, SPEAKER_RESET_CALL_DEPTH));
+                    if let Some(reset) = effect {
+                        record(reset);
+                    }
+                }
+            }
+            OP_SHOW_TEXT => {
+                let narration = if box_assigned { false } else if box_reset { true } else { previous_narration };
+                if narration {
+                    rows.remove(&index);
+                }
+            }
+            OP_WAIT_FOR_INPUT => {
+                previous_narration = if box_assigned { false } else if box_reset { true } else { previous_narration };
+                box_assigned = false;
+                box_reset = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod narration_tests {
+    use super::*;
+    use crate::bin_format::instruction::Argument;
+
+    fn op(opcode: u32, args: &[(u32, u32)]) -> Instruction {
+        Instruction {
+            opcode,
+            label: String::new(),
+            argument_count: args.len() as u32,
+            arguments: args
+                .iter()
+                .map(|&(t, v)| Argument { arg_type: t, raw_data: v, decoded_string: None, original_encoded_bytes: None, data_array: None })
+                .collect(),
+            offset: 0,
+        }
+    }
+
+    /// VERITA shape: spoken box `mov 13449, 926` → text; narration box calls a routine
+    /// `sub 13449, 0, 1` → text; both test `lt 13449, 0` first.
+    #[test]
+    fn narration_box_after_spoken_box_loses_the_speaker() {
+        let lt = || op(OP_LT, &[(9, 0), (3, 13449), (0, 0)]);
+        let mut reset_call = op(OP_CALL, &[(0, 500)]);
+        reset_call.offset = 40;
+        let mut routine = vec![op(OP_SUB, &[(3, 13449), (0, 0), (0, 1)]), op(OP_RET, &[])];
+        routine[0].offset = 500;
+        let mut script = vec![
+            op(OP_MOV, &[(3, 13449), (0, 926)]),
+            lt(),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]), // 2: spoken
+            op(0x72, &[(0, 0)]),                 // click-wait: next box
+            reset_call,
+            lt(),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]), // 6: narration
+        ];
+        script.extend(routine);
+        let mut rows: BTreeMap<usize, SpeakerRef> = [2usize, 6]
+            .into_iter()
+            .map(|i| (i, SpeakerRef { source_type: 3, source_raw_data: 926, literal_name: None }))
+            .collect();
+        clear_narration_rows(&script, &mut rows);
+        assert!(rows.contains_key(&2));
+        assert!(!rows.contains_key(&6));
+    }
+
+    /// Madou shape: a spoken box assigns one speaker variable and resets another.
+    #[test]
+    fn assignment_in_the_box_wins_over_a_reset_of_another_variable() {
+        let lt = |var: u32| op(OP_LT, &[(9, 0), (3, var), (0, 0)]);
+        let script = vec![
+            op(OP_SUB, &[(3, 14288), (0, 0), (0, 1)]),
+            op(OP_MOV, &[(3, 2169879), (0, 252)]),
+            lt(14288),
+            lt(2169879),
+            op(0x72, &[(0, 0)]),
+            op(OP_MOV, &[(3, 14288), (0, 2)]),          // box: assign the character …
+            op(OP_SUB, &[(3, 2169879), (0, 0), (0, 1)]), // … and reset the talk slot
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]),          // 7: spoken
+        ];
+        let mut rows: BTreeMap<usize, SpeakerRef> =
+            [(7usize, SpeakerRef { source_type: 3, source_raw_data: 2, literal_name: None })].into_iter().collect();
+        clear_narration_rows(&script, &mut rows);
+        assert!(rows.contains_key(&7));
+    }
+
+    /// Hyakusen shape: the speaker is an array slot (26147[26149]).
+    #[test]
+    fn array_slot_speaker() {
+        let lookup = || op(OP_LOOKUP, &[(12, 0), (3, 26147), (3, 26149)]);
+        let script = vec![
+            lookup(),
+            op(OP_MOV, &[(12, 0), (0, 39)]), // assign speaker 39
+            lookup(),
+            op(OP_LT, &[(9, 0), (12, 0), (0, 0)]),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]), // 4: spoken
+            op(0x72, &[(0, 0)]),
+            op(OP_SUB, &[(3, 26147), (0, 0), (0, 1)]), // narration reset
+            lookup(),
+            op(OP_LT, &[(9, 0), (12, 0), (0, 0)]),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]), // 9: narration
+            op(0x72, &[(0, 0)]),
+            lookup(),
+            op(OP_MOV, &[(12, 0), (0, 32)]),
+            op(OP_SHOW_TEXT, &[(0, 0), (2, 0)]), // 13: spoken again
+        ];
+        let mut rows: BTreeMap<usize, SpeakerRef> = [4usize, 9, 13]
+            .into_iter()
+            .map(|i| (i, SpeakerRef { source_type: 3, source_raw_data: 39, literal_name: None }))
+            .collect();
+        clear_narration_rows(&script, &mut rows);
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![4, 13]);
+    }
+}
+
+#[cfg(test)]
+mod sys3_box_tests {
+    use super::*;
+    use crate::bin_format::instruction::Argument;
+
+    fn arg(t: u32, v: u32, s: Option<&str>) -> Argument {
+        Argument { arg_type: t, raw_data: v, decoded_string: s.map(str::to_string), original_encoded_bytes: None, data_array: None }
+    }
+    fn op(opcode: u32, arguments: Vec<Argument>) -> Instruction {
+        Instruction { opcode, label: String::new(), argument_count: arguments.len() as u32, arguments, offset: 0 }
+    }
+    fn text(t: &str) -> Instruction {
+        op(0x6E, vec![arg(0, 0, None), arg(2, 0, Some(t))])
+    }
+    fn end_line() -> Instruction {
+        op(0x6F, vec![arg(0, 0, None)])
+    }
+    fn wait() -> Instruction {
+        op(0x72, vec![arg(0, 0, None)])
+    }
+
+    #[test]
+    fn minefuka_name_line_with_indented_dialogue() {
+        let script = vec![text("フィーノ"), end_line(), text("　うがぁぁ！"), end_line(), wait(), text("薄暗い迷宮の奥底。"), end_line(), wait()];
+        let rows = sys3_row_names(&script);
+        assert_eq!(rows.get(&2).map(String::as_str), Some("フィーノ"));
+        assert!(!rows.contains_key(&0)); // the name line itself
+        assert!(!rows.contains_key(&5)); // next box: narration
+    }
+
+    #[test]
+    fn kuutei_plate_name_persists_for_dialogue_boxes_only() {
+        let plate = || op(0x6E, vec![arg(0, 1, None), arg(5, 202, None)]); // box routine draws t5:202
+        let script = vec![
+            plate(),
+            wait(),
+            op(0x61, vec![arg(0xE, 0, None), arg(5, 202, None), arg(9, 1, None)]),
+            op(0x192, vec![arg(0xE, 0, None), arg(2, 0, Some("男"))]),
+            text("「君は器用だな。」"), // 4: 男
+            wait(),
+            text("「まだ話は終わっていない」"), // 6: same plate → 男
+            wait(),
+            text("そして、一人の男と出会う。"), // 8: narration
+            wait(),
+            op(0x61, vec![arg(0xE, 0, None), arg(5, 116, None), arg(9, 1, None)]),
+            op(0x192, vec![arg(0xE, 0, None), arg(2, 0, Some("キャンセル"))]), // menu array, not shown
+            text("「次へ」"), // 12: still the plate's 男
+        ];
+        let rows = sys3_row_names(&script);
+        assert_eq!(rows.get(&4).map(String::as_str), Some("男"));
+        assert_eq!(rows.get(&6).map(String::as_str), Some("男"));
+        assert!(!rows.contains_key(&8));
+        assert_eq!(rows.get(&12).map(String::as_str), Some("男"));
+    }
 }

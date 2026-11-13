@@ -585,13 +585,29 @@ pub fn definition_for_label(label: &str) -> Option<&'static InstructionDefinitio
 pub fn is_control_flow(opcode: u32) -> bool {
     matches!(
         opcode,
-        0x8C | 0x8F | 0xA0 | 0xCC | 0xFB | 0xD4 | 0x90 | 0x7B
+        0x8C | 0x8F | 0xA0 | 0xCC | 0xFB | 0xD4 | 0xD5 | 0x90 | 0x7B
     )
 }
 
+/// Argument type of an immediate literal. Code addresses are ALWAYS immediates;
+/// any other type is a register/variable operand (e.g. `call *G[0x6be]`, arg type
+/// 3) whose raw value is a register index, not an address.
+const ARG_TYPE_IMMEDIATE: u32 = 0;
+/// `-1` disables an optional code target (callbacks, timed sequences).
+const NO_CODE_TARGET: u32 = 0xFFFF_FFFF;
+
 /// Returns true if the argument at index `arg_idx` in the given instruction
-/// is a label reference (code location pointer).
-pub fn is_label_argument(opcode: u32, arg_idx: usize, raw_data: u32) -> bool {
+/// is a label reference (code location pointer) that the writer must remap.
+///
+/// Only IMMEDIATE args qualify: the writer used to ignore `arg_type` and remapped
+/// the register index of `call *G[reg]` whenever it happened to equal a real
+/// instruction offset — corrupting the scene-setup call in 113 scenes across
+/// VERITA/LaDEA/Conquista (6 shipped LaDEA v0.9 BINs). Verified on 5,989 BINs:
+/// every immediate code target resolves; every non-immediate one is a register.
+pub fn is_label_argument(opcode: u32, arg_idx: usize, arg_type: u32, raw_data: u32) -> bool {
+    if arg_type != ARG_TYPE_IMMEDIATE || raw_data == NO_CODE_TARGET {
+        return false;
+    }
     match opcode {
         // jmp, call: all args are labels (if not 0xFFFFFFFF)
         0x8C | 0x8F => raw_data != 0xFFFFFFFF,
@@ -605,6 +621,9 @@ pub fn is_label_argument(opcode: u32, arg_idx: usize, raw_data: u32) -> bool {
         0x90 => arg_idx >= 4 && raw_data != 0xFFFFFFFF,
         // u0041ADB0: all args are labels
         0x7B => raw_data != 0xFFFFFFFF,
+        // run-timed-callback-sequence: arg 0 = abort/fallback local code target
+        // (OpenMaidEngine opcodes.toml; corpus: -1 or a resolving offset).
+        0xD5 => arg_idx == 0,
         _ => false,
     }
 }
@@ -667,10 +686,14 @@ mod tests {
     #[test]
     fn test_label_arguments() {
         // jmp: arg 0 is a label
-        assert!(is_label_argument(0x8C, 0, 0x100));
-        assert!(!is_label_argument(0x8C, 0, 0xFFFFFFFF));
+        assert!(is_label_argument(0x8C, 0, 0, 0x100));
+        assert!(!is_label_argument(0x8C, 0, 0, 0xFFFFFFFF));
         // jcc: arg 0 is NOT a label, args 1+ are
-        assert!(!is_label_argument(0xA0, 0, 0x100));
-        assert!(is_label_argument(0xA0, 1, 0x100));
+        assert!(!is_label_argument(0xA0, 0, 0, 0x100));
+        assert!(is_label_argument(0xA0, 1, 0, 0x100));
+        // call through a register (`call *G[0x914]`, global-int type 3) is NOT an address
+        assert!(!is_label_argument(0x8F, 0, 3, 0x914));
+        // run-timed-callback-sequence fallback target
+        assert!(is_label_argument(0xD5, 0, 0, 0x9eb));
     }
 }

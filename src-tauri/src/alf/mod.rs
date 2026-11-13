@@ -97,7 +97,7 @@ pub fn lzss_store(data: &[u8]) -> Vec<u8> {
 /// `uncomp == uncomp2`, a sane uncompressed size, and a compressed size that is
 /// the tail of the file (the LZSS stream). Avoids hardcoding a wrong offset →
 /// garbage size → giant allocation hang.
-fn find_sys4_triple(data: &[u8]) -> Option<usize> {
+pub fn find_sys4_triple(data: &[u8]) -> Option<usize> {
     let mut o = 8usize;
     while o + 12 <= data.len() && o < 0x400 {
         let a = read_u32(data, o) as usize;
@@ -194,6 +194,44 @@ pub fn parse_sys4_index_blob(blob: &[u8]) -> Option<AlfIndex> {
     Some(AlfIndex { archives, entries })
 }
 
+/// Decode a NUL-terminated UTF-16LE string (SYS5 catalogs).
+pub fn utf16_cstr(bytes: &[u8]) -> String {
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Parse a *decompressed* SYS5 index blob (Hyakusen, build 502). Same shape as
+/// SYS4 with UTF-16LE names: u32 volume_count; × 0x200-byte volume names;
+/// u32 entry_count; × 0x90-byte entries = name (0x80) then u32 volume,
+/// file_index, offset, length.
+pub fn parse_sys5_index_blob(blob: &[u8]) -> Option<AlfIndex> {
+    let arc_count = read_u32(blob, 0) as usize;
+    if arc_count == 0 || arc_count > 256 || 4 + arc_count * 0x200 + 4 > blob.len() {
+        return None;
+    }
+    let archives = (0..arc_count).map(|i| utf16_cstr(&blob[4 + i * 0x200..4 + (i + 1) * 0x200])).collect();
+    let ec_off = 4 + arc_count * 0x200;
+    let entry_count = read_u32(blob, ec_off) as usize;
+    let entries = (0..entry_count)
+        .map(|k| ec_off + 4 + k * 0x90)
+        .take_while(|&p| p + 0x90 <= blob.len())
+        .map(|p| AlfEntry {
+            name: utf16_cstr(&blob[p..p + 0x80]),
+            archive_index: read_u32(blob, p + 0x80),
+            offset: read_u32(blob, p + 0x88) as u64,
+            length: read_u32(blob, p + 0x8c) as u64,
+        })
+        .collect();
+    Some(AlfIndex { archives, entries })
+}
+
+/// True for a SYS5 (UTF-16) catalog magic: `S5IC`/`S5AC` as UTF-16LE.
+pub fn is_sys5_catalog(data: &[u8]) -> bool {
+    const MASTER: [u8; 8] = [b'S', 0, b'5', 0, b'I', 0, b'C', 0];
+    const APPEND: [u8; 8] = [b'S', 0, b'5', 0, b'A', 0, b'C', 0];
+    data.len() >= 8 && (data[..8] == MASTER || data[..8] == APPEND)
+}
+
 /// Read + parse a SYS4 master index (`SYS4INI.BIN`). Handles `S4IC` (LZSS-
 /// compressed) and `S4IN` (uncompressed). Returns the volume list + entries.
 pub fn read_sys4_master(data: &[u8]) -> Option<AlfIndex> {
@@ -202,12 +240,17 @@ pub fn read_sys4_master(data: &[u8]) -> Option<AlfIndex> {
     }
     match &data[..4] {
         // S4IC = compressed master, S4AC = compressed append (.aai) — same body.
-        b"S4IC" | b"S4AC" => {
+        // SYS3 (S3IC/S3AC, builds 321/324) uses the identical layout (engine survey).
+        b"S4IC" | b"S4AC" | b"S3IC" | b"S3AC" => {
             let triple = find_sys4_triple(data)?;
             parse_sys4_index_blob(&inflate_sys4_index(data, triple)?)
         }
         // S4IN / S4AN = uncompressed (best-effort offset; not yet seen in the wild).
         b"S4IN" | b"S4AN" => parse_sys4_index_blob(&data[0x12c..]),
+        _ if is_sys5_catalog(data) => {
+            let triple = find_sys4_triple(data)?;
+            parse_sys5_index_blob(&inflate_sys4_index(data, triple)?)
+        }
         _ => None,
     }
 }

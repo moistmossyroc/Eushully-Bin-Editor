@@ -6,6 +6,7 @@
   import { confirmDialog } from "../lib/confirm";
   import { clampToViewport } from "../lib/clampMenu";
   import { toastError } from "../lib/toast";
+  import { opcodeDisplayName } from "../lib/opcodeNames";
 
   interface Props {
     entry: DialogueEntry;
@@ -128,8 +129,8 @@
   class:block-boundary={entry.label === "wait-for-input"}
   oncontextmenu={handleContextMenu}
 >
-  <td class="cell-label" title="Instruction #{entry.instruction_index}">
-    <span class="label-text">{entry.label}</span>
+  <td class="cell-label" title="Instruction #{entry.instruction_index} · {entry.label} (0x{entry.opcode.toString(16).toUpperCase()})">
+    <span class="label-text">{opcodeDisplayName(entry.opcode, entry.label)}</span>
     <span class="index-badge">#{entry.instruction_index}</span>
   </td>
   {#if charCount}

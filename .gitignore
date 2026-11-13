@@ -20,3 +20,6 @@ Thumbs.db
 sys3/
 sys4/
 sys5/
+
+# Vendored crates build output
+crates/*/target/

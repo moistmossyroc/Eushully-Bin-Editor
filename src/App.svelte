@@ -11,6 +11,7 @@
   import GlobalSearchPanel from "./components/GlobalSearchPanel.svelte";
   import StatsPanel from "./components/StatsPanel.svelte";
   import SettingsDialog from "./components/SettingsDialog.svelte";
+  import BrandingDialog from "./components/BrandingDialog.svelte";
   import InsertDialog from "./components/InsertDialog.svelte";
   import CloseConfirmDialog from "./components/CloseConfirmDialog.svelte";
   import GlossaryReviewDialog from "./components/GlossaryReviewDialog.svelte";
@@ -33,10 +34,20 @@
   import ConfirmDialog from "./components/ConfirmDialog.svelte";
   import ToastContainer from "./components/ToastContainer.svelte";
   import AutoSplitBadge from "./components/AutoSplitBadge.svelte";
+  import AssetsWorkspace from "./workspaces/assets/AssetsWorkspace.svelte";
+  import { openStartupFolder } from "./workspaces/assets/assetsActions";
   import { store } from "./lib/stores.svelte";
   import { doLoadFile, doAutoSaveAll, doRefreshTranslationStatus, doImportSingleFolder, doOpenParenteGameFolder, doOpenSysGameFolder } from "./lib/actions";
   import { loadSettings, fetchAvailableModels, getProviderConfig, setProviderConfig, getApiKey } from "./lib/ipc";
   import { detectMissingCJKFonts, isFontWarningDismissed, dismissFontWarning } from "./lib/fontCheck";
+  import { ensureTextLayout } from "./lib/engineMode";
+
+  // Game-accurate text layout (box geometry + loader metrics) for the active tab, needed by
+  // the preview AND by the engine-mode overflow counts — loaded whether or not the preview
+  // is open.
+  $effect(() => {
+    void ensureTextLayout(store.activeTab);
+  });
 
   // Auto-save when the user selects a different row
   $effect(() => {
@@ -109,6 +120,7 @@
     // function's resolved cleanup never reaches Svelte. Track listeners in a
     // closure-shared list, return a sync function that drains them.
     const cleanups: (() => void)[] = [];
+    void openStartupFolder();
     void (async () => {
     // Font detection — warn (once) if neither preferred CJK font is installed.
     // Defer one frame so canvas measurement runs after the page's font CSS has
@@ -125,6 +137,7 @@
       if (typeof settings.translatedCharCap === "number") store.translatedCharCap = settings.translatedCharCap;
       if (typeof settings.translatedLineCharCap === "number") store.translatedLineCharCap = settings.translatedLineCharCap;
       if (typeof settings.maxLinesPerBox === "number" && settings.maxLinesPerBox > 0) store.maxLinesPerBox = settings.maxLinesPerBox;
+      if (typeof settings.bottomLineCharCap === "number" && settings.bottomLineCharCap >= 0) store.bottomLineCharCap = settings.bottomLineCharCap;
       if (settings.binViewerMode === "scroll" || settings.binViewerMode === "paged") store.binViewerMode = settings.binViewerMode;
       if (typeof settings.enforceCharLimits === "boolean") store.enforceCharLimits = settings.enforceCharLimits;
       if (typeof settings.crossBinContext === "boolean") store.crossBinContext = settings.crossBinContext;
@@ -136,12 +149,24 @@
       if (typeof settings.contextBlocks === "number") store.contextBlocks = settings.contextBlocks;
       if (typeof settings.autoSplitEnabled === "boolean") store.autoSplitEnabled = settings.autoSplitEnabled;
       if (typeof settings.autoSplitOnImport === "boolean") store.autoSplitOnImport = settings.autoSplitOnImport;
+      if (settings.boxBridgeMode === "native" || settings.boxBridgeMode === "semantic") store.boxBridgeMode = settings.boxBridgeMode;
+      if (typeof settings.keepSpeakerPlateOnContinuation === "boolean") store.keepSpeakerPlateOnContinuation = settings.keepSpeakerPlateOnContinuation;
       if (typeof settings.lastParenteExportDir === "string") store.lastParenteExportDir = settings.lastParenteExportDir;
+      if (typeof settings.lastSysGameDir === "string") store.lastSysGameDir = settings.lastSysGameDir;
+      if (typeof settings.gameAccuratePreview === "boolean") store.gameAccuratePreview = settings.gameAccuratePreview;
+      if (settings.previewSlotByPrefix && typeof settings.previewSlotByPrefix === "object") store.previewSlotByPrefix = settings.previewSlotByPrefix as Record<string, number>;
+      if (settings.boxProfiles && typeof settings.boxProfiles === "object") store.boxProfiles = settings.boxProfiles as typeof store.boxProfiles;
+      if (typeof settings.lastParenteExportName === "string") store.lastParenteExportName = settings.lastParenteExportName;
       if (typeof settings.spScenePrefixes === "string") store.spScenePrefixes = settings.spScenePrefixes;
       if (settings.workspaceFolders && typeof settings.workspaceFolders === "object") store.workspaceFolders = settings.workspaceFolders as Record<string, string>;
+      if (settings.parenteProjectDirs && typeof settings.parenteProjectDirs === "object") store.parenteProjectDirs = settings.parenteProjectDirs as Record<string, string>;
       if (typeof settings.fanpatchTitle === "string") store.fanpatchTitle = settings.fanpatchTitle;
       if (typeof settings.fanpatchLabel === "string") store.fanpatchLabel = settings.fanpatchLabel;
       if (typeof settings.fanpatchUiConfigPath === "string") store.fanpatchUiConfigPath = settings.fanpatchUiConfigPath;
+      if (typeof settings.fanpatchResizableWindow === "boolean") store.fanpatchResizableWindow = settings.fanpatchResizableWindow;
+      if (typeof settings.fanpatchDevMenu === "boolean") store.fanpatchDevMenu = settings.fanpatchDevMenu;
+      if (typeof settings.fanpatchCrispHd === "boolean") store.fanpatchCrispHd = settings.fanpatchCrispHd;
+      if (typeof settings.fanpatchWordWrap === "boolean") store.fanpatchWordWrap = settings.fanpatchWordWrap;
       // Provider config — persisted in settings.json so it survives app restarts
       // (Rust state is in-memory only). We still push it to Rust below so
       // translation commands see the right provider on this session.
@@ -388,6 +413,9 @@
     </div>
   {/if}
   <Toolbar />
+  {#if store.workspace === "assets"}
+    <AssetsWorkspace />
+  {:else}
   <div class="tab-bar-row">
     <TabBar />
     <AutoSplitBadge />
@@ -416,6 +444,7 @@
       <p class="drop-hint">You can also drag and drop files here</p>
     </div>
   {/if}
+  {/if}
 
   {#if dragOver}
     <div class="drag-overlay">
@@ -439,6 +468,9 @@
     </div>
   </footer>
 
+  {#if store.brandingDialogOpen}
+    <BrandingDialog onClose={() => (store.brandingDialogOpen = false)} />
+  {/if}
   {#if store.settingsDialogOpen}
     <SettingsDialog onClose={() => (store.settingsDialogOpen = false)} />
   {/if}

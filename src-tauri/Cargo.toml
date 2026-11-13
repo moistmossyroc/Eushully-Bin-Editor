@@ -1,6 +1,6 @@
 [package]
 name = "eushully-bin-editor"
-version = "1.4.1"
+version = "1.5.0"
 edition = "2021"
 
 [lib]
@@ -25,8 +25,19 @@ sha2 = "0.10"
 hex = "0.4"
 keyring = { version = "3", features = ["windows-native"] }
 tokio-util = "0.7"
-lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+# Parente @ARCH000/UnityFS/TextAsset layers, shared with the Sys Decompiler
+parente-arc = { path = "../crates/parente-arc" }
+# Browse & Extract workspace engine (archives, previews, extraction, mods) — shared
+# with the Sys Decompiler's AGE Extractor and `eushully` CLI. See src/assets/.
+eushully-assets = { path = "../crates/eushully-assets" }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Fanpatch branding art: the UI renders PNG data URLs, engine::branding encodes AGF.
+png = "0.17"
+base64 = "0.22"
+# Parente CONFIG.DAT codec (AES-256-CBC + raw deflate) — see src/parente/config.rs
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+flate2 = "1"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -538,6 +538,25 @@
         </p>
 
         <label class="setting-field">
+          <span>Bottom-line cap (chars)</span>
+          <input
+            type="number"
+            min="0"
+            max="200"
+            bind:value={store.bottomLineCharCap}
+            onchange={persistSettings}
+            placeholder="0"
+          />
+        </label>
+
+        <p class="setting-hint">
+          For boxes whose last line shares its row with UI art (e.g. Atelial with a
+          3-line box: the Q.SAVE…✕ buttons). A box only fills its bottom line with a
+          line up to this many characters; longer lines start the next box instead.
+          0 = off (bottom line uses the normal line cap).
+        </p>
+
+        <label class="setting-field">
           <span>Special-scene file prefix(es)</span>
           <input
             type="text"
@@ -625,6 +644,42 @@
           Requires a per-line cap. Rows that can't be split (no bridge in that
           BIN) are still flagged for manual shortening. Default OFF.
         </p>
+
+        <label class="setting-field">
+          <span>Box-break bridge</span>
+          <select bind:value={store.boxBridgeMode} onchange={persistSettings}>
+            <option value="native">Native — clone the scene's own transition</option>
+            <option value="semantic">Semantic — minimal, no scene calls (experimental)</option>
+          </select>
+        </label>
+
+        <p class="setting-hint">
+          What <strong>Paginate</strong> inserts between boxes. <em>Native</em> copies the
+          scene's transition (proven in-game, but carries scene-specific calls and is
+          unavailable in some scenes). <em>Semantic</em> builds the break from what the
+          opcodes do — clear the text layout (<code>0x71</code>), re-enable presentation
+          (<code>0x21B</code>) inside a statement block — so it works in every scene.
+          Verify in-game before bulk use. Affects new breaks only.
+        </p>
+
+        {#if store.boxBridgeMode === "semantic"}
+          <label class="setting-field checkbox-field">
+            <input
+              type="checkbox"
+              bind:checked={store.keepSpeakerPlateOnContinuation}
+              onchange={persistSettings}
+            />
+            <span>Keep speaker name on continuation boxes</span>
+          </label>
+
+          <p class="setting-hint">
+            The continuation box calls the scene's own speaker routine again, so it keeps
+            the name and text colour of the box it continues (no voice replay, no portrait
+            change). Narration boxes stay nameless — decided per box at export. Games that
+            draw the name as a sprite (Megami Zero, Himegari) just keep it. Experimental —
+            verify in-game.
+          </p>
+        {/if}
       </section>
 
       <section class="setting-group">
@@ -682,6 +737,58 @@
           Optional. Bundled into the <code>.fanpatch</code> as
           <code>fanpatch_ui.txt</code> — the loader swaps menu/system UI strings
           with the in-game language toggle. Leave empty to skip.
+        </p>
+
+        <label class="setting-field checkbox-field">
+          <input type="checkbox" bind:checked={store.fanpatchResizableWindow} onchange={persistSettings} />
+          <span>Resizable HQ window (loader)</span>
+        </label>
+        <p class="setting-hint">
+          Players can resize/maximize the game window (aspect locked); the picture is
+          upscaled with a sharpening filter and clicks stay exact. Bundled into the
+          <code>.fanpatch</code> as <code>fanpatch_features.txt</code>. Verified on SYS4
+          438/443 (Direct3D 9 builds); fullscreen is unchanged.
+        </p>
+
+        <label class="setting-field checkbox-field">
+          <input
+            type="checkbox"
+            bind:checked={store.fanpatchCrispHd}
+            disabled={!store.fanpatchResizableWindow}
+            onchange={persistSettings}
+          />
+          <span>Crisp HD rendering (loader)</span>
+        </label>
+        <p class="setting-hint">
+          The game renders at monitor resolution with natively sharp text inside the
+          resizable window (the engine's own hi-res mode); Full Screen becomes
+          borderless, and the player's mode, monitor and window size are remembered.
+          Builds without that mode get a sharper internal resolution instead. Needs the
+          resizable window. Verified on SYS4 438 (Atelial).
+        </p>
+
+        <label class="setting-field checkbox-field">
+          <input type="checkbox" bind:checked={store.fanpatchWordWrap} onchange={persistSettings} />
+          <span>English word wrap (loader)</span>
+        </label>
+        <p class="setting-hint">
+          The engine wraps English lines at word boundaries itself (it normally breaks
+          mid-word), measured with the game's own font, so the editor only needs to split
+          boxes, not lines. SYS4 builds with the known typewriter (Atelial, Madou, Sankai);
+          other builds ignore it. Verified on Atelial. After one launch with it, the game
+          reports its text metrics (fanpatch_layout.txt) and the preview and re-flow follow
+          the engine exactly.
+        </p>
+
+        <label class="setting-field checkbox-field">
+          <input type="checkbox" bind:checked={store.fanpatchDevMenu} onchange={persistSettings} />
+          <span>Developer menu (testing builds)</span>
+        </label>
+        <p class="setting-hint">
+          Adds a "Fanpatch Dev" menu + F5 reload scene, F6 reload/back 10 lines, F8
+          show line, F2 debug report, F11 title, F9 upscaler A/B — and unlocks the
+          game's own developer menu behind the title's Quit button (scene jump via the
+          SC????.BIN picker; adds TITLE.BIN). Leave off for player releases.
         </p>
       </section>
       {:else if activeTab === "translation"}

@@ -1,6 +1,7 @@
 import type { DialogueEntry } from "./types";
 import { furiganaDisplayLength, stripQuoteBrackets } from "./types";
 import { isAutoSplitContinuation } from "./insertions";
+import { bottomSlotOverflows } from "./boxPlan";
 
 /** Labels eligible for overflow detection / auto-split. Limited to in-game
  *  rendered dialogue only — comments are translator notes (not shown), and
@@ -170,6 +171,9 @@ export interface BoxOverflow {
   tooManyLines: boolean;
   /** True when the box's total chars exceed the per-box cap. */
   overTotalCap: boolean;
+  /** True when the box fills its bottom slot with a line wider than the bottom-line
+   *  cap (that row is shared with UI art, e.g. Atelial's button row). */
+  bottomLineTooLong: boolean;
   /** First-line text, for a readable preview in the review dialog. */
   preview: string;
 }
@@ -191,6 +195,7 @@ export function findBoxOverflows(
   entries: DialogueEntry[],
   totalCap: number,
   maxLinesPerBox: number,
+  bottomLineCap = 0,
 ): BoxOverflow[] {
   const checkLines = maxLinesPerBox >= 1;
   const checkChars = totalCap > 0;
@@ -198,7 +203,7 @@ export function findBoxOverflows(
 
   const out: BoxOverflow[] = [];
   let box:
-    | { index: number; id: number; lines: number; chars: number; preview: string; inLine: boolean }
+    | { index: number; id: number; lines: number; chars: number; preview: string; inLine: boolean; lineLengths: number[] }
     | null = null;
 
   const finalize = () => {
@@ -208,7 +213,8 @@ export function findBoxOverflows(
     }
     const tooManyLines = checkLines && box.lines > maxLinesPerBox;
     const overTotalCap = checkChars && box.chars > totalCap;
-    if (tooManyLines || overTotalCap) {
+    const bottomLineTooLong = checkLines && bottomSlotOverflows(box.lineLengths, maxLinesPerBox, bottomLineCap);
+    if (tooManyLines || overTotalCap || bottomLineTooLong) {
       out.push({
         index: box.index,
         id: box.id,
@@ -218,6 +224,7 @@ export function findBoxOverflows(
         totalCap,
         tooManyLines,
         overTotalCap,
+        bottomLineTooLong,
         preview: box.preview,
       });
     }
@@ -242,13 +249,16 @@ export function findBoxOverflows(
     if (e.label === "show-text" || e.label === "display-furigana") {
       if (e.translated_text.trim() === "") continue;
       if (!box) {
-        box = { index: i, id: e.instruction_index, lines: 0, chars: 0, preview: "", inLine: false };
+        box = { index: i, id: e.instruction_index, lines: 0, chars: 0, preview: "", inLine: false, lineLengths: [] };
       }
       if (!box.inLine) {
         box.lines++;
         box.inLine = true;
+        box.lineLengths.push(0);
       }
-      box.chars += entryDisplayLength(e);
+      const length = entryDisplayLength(e);
+      box.chars += length;
+      box.lineLengths[box.lineLengths.length - 1] += length;
       if (!box.preview) box.preview = e.translated_text;
     }
   }

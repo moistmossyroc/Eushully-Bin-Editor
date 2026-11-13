@@ -4,7 +4,10 @@
   import { confirmDialog } from "../lib/confirm";
   import { findOverflows, findBoxOverflows, entryDisplayLength, type OverflowRow, type BoxOverflow } from "../lib/overflow";
   import { autoSplitEntry, optimizeEntry } from "../lib/ipc";
-  import { applySplitPlan, splitOverflowingGroup, paginateBox } from "../lib/insertions";
+  import { applySplitPlan, splitBoxBridge, splitOverflowingGroup, paginateBox, canInsertBoxBreak } from "../lib/insertions";
+  import { dialogueBoxCaps, type GameBoxCaps } from "../lib/gameLayout";
+  import { engineBoxRulesFor, engineMetricsFor } from "../lib/engineMode";
+  import { findEngineBoxOverflows, type EngineBoxOverflow } from "../lib/engineOverflow";
 
   interface Props {
     onClose: () => void;
@@ -25,16 +28,38 @@
   let boxOverflows = $derived.by<BoxOverflow[]>(() => {
     const tab = store.activeTab;
     if (!tab) return [];
-    return findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox);
+    return findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox, store.bottomLineCharCap);
+  });
+
+  // Engine box mode (loader word wrap on + metrics reported): the engine wraps rows itself,
+  // so only whole boxes can overflow and the fix is more boxes, never 0x6F line breaks.
+  let engineRules = $derived(engineBoxRulesFor(store.activeTab));
+  let engineOverflows = $derived.by<EngineBoxOverflow[]>(() => {
+    const tab = store.activeTab;
+    return tab && engineRules ? findEngineBoxOverflows(tab.entries, engineRules) : [];
   });
 
   let working = $state(false);
   let progress = $state<{ current: number; total: number; action: string; cancellable?: boolean } | null>(null);
 
-  // Re-flow inputs — pre-filled from the current caps; the user corrects them to
-  // the game's real box geometry (e.g. 47 × 2) before rebuilding the layout.
-  let reflowLineCap = $state(store.translatedLineCharCap > 0 ? store.translatedLineCharCap : 47);
-  let reflowLinesPerBox = $state(store.maxLinesPerBox > 0 ? store.maxLinesPerBox : 2);
+  // Caps measured from the game's dialogue box (engine wrap width + rows, with the
+  // game's enabled text box profile) — null when no game folder is known for this tab.
+  let gameCaps = $derived.by<GameBoxCaps | null>(() => {
+    const tab = store.activeTab;
+    const layout = tab ? store.textLayoutByTab[tab.id] : null;
+    if (!layout) return null;
+    return dialogueBoxCaps(layout, layout.gameDir ? store.boxProfiles[layout.gameDir] : undefined);
+  });
+
+  // Re-flow inputs — pre-filled from the game's measured box when known, else the
+  // current caps; the user can still correct them before rebuilding the layout.
+  const initialCaps = (() => {
+    const tab = store.activeTab;
+    const layout = tab ? store.textLayoutByTab[tab.id] : null;
+    return layout ? dialogueBoxCaps(layout, layout.gameDir ? store.boxProfiles[layout.gameDir] : undefined) : null;
+  })();
+  let reflowLineCap = $state(initialCaps?.charsPerLine ?? (store.translatedLineCharCap > 0 ? store.translatedLineCharCap : 47));
+  let reflowLinesPerBox = $state(initialCaps?.linesPerBox ?? (store.maxLinesPerBox > 0 ? store.maxLinesPerBox : 2));
 
   /** Close the dialog; if a bulk pass is running, request its cancel too so
    *  closing it doesn't orphan a long run (it stops after the current file). */
@@ -51,7 +76,7 @@
   // Pagination (adding boxes) clones the BIN's box-transition bridge — which
   // carries the engine "advance box" call — so it needs a usable bridge.
   let templateQuality = $derived(store.activeTab?.bridgeTemplateQuality);
-  let canAddBoxes = $derived(templateQuality === "clean" || templateQuality === "degraded");
+  let canAddBoxes = $derived(canInsertBoxBreak(templateQuality));
 
   /** Name of the first OTHER open tab whose bridge we could borrow (donor), or null. */
   let donorName = $derived.by<string | null>(() => {
@@ -80,8 +105,8 @@
   let globalBoxOverflowCount = $derived.by<number>(() => {
     let n = 0;
     for (const tab of store.tabs) {
-      n += findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox)
-        .filter((b) => b.tooManyLines).length;
+      n += findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox, store.bottomLineCharCap)
+        .filter((b) => b.tooManyLines || b.bottomLineTooLong).length;
     }
     return n;
   });
@@ -108,8 +133,9 @@
           store.translatedLineCharCap,
           store.translatedCharCap,
           store.maxLinesPerBox,
+          store.bottomLineCharCap,
         );
-        const result = applySplitPlan(plan);
+        const result = applySplitPlan(plan, await splitBoxBridge(tab.id));
         if (typeof result === "string") {
           store.statusMessage = result;
         }
@@ -128,6 +154,34 @@
     working = false;
   }
 
+  /** Engine mode: split single-text boxes that don't fit into balanced engine boxes. */
+  async function handleEngineSplit(boxes: EngineBoxOverflow[]) {
+    const tab = store.activeTab;
+    const metrics = engineMetricsFor(tab);
+    if (!tab || !metrics || !engineRules || working) return;
+    const ids = boxes.filter((b) => b.singleText).map((b) => b.id);
+    if (ids.length === 0) return;
+    store.captureBulkUndo(ids.length === 1 ? "Split into boxes" : "Split into boxes (all)", [tab]);
+    working = true;
+    progress = { current: 0, total: 0, action: "Splitting into boxes" };
+    await tick();
+    const { engineSplitEntries } = await import("../lib/actions");
+    const r = await engineSplitEntries(tab, ids, metrics, engineRules.rowsPerBox, engineRules.bottomCap);
+    working = false;
+    progress = null;
+    let msg = `Split ${r.split} text(s) into ${r.paginated > 0 ? "balanced boxes" : "boxes"}`;
+    if (r.errors.length > 0) msg += ` (${r.errors.length} issue(s), e.g. ${r.errors[0]})`;
+    store.statusMessage = msg;
+  }
+
+  function jumpToEngineBox(box: EngineBoxOverflow) {
+    const tab = store.activeTab;
+    if (!tab) return;
+    tab.selectedRowIndex = box.index;
+    store.pendingScrollRequest = { tabId: tab.id, rowIndex: box.index, nonce: Date.now() };
+    onClose();
+  }
+
   /** Paginate a single over-long box — clone the box-transition bridge every
    *  maxLinesPerBox lines so it splits into multiple boxes. */
   async function handlePaginateBox(box: BoxOverflow) {
@@ -136,7 +190,7 @@
     const startEntry = tab.entries[box.index];
     if (!startEntry) return;
     working = true;
-    const result = await paginateBox(startEntry, store.maxLinesPerBox);
+    const result = await paginateBox(startEntry, store.maxLinesPerBox, store.bottomLineCharCap);
     if (typeof result === "string") store.statusMessage = result;
     tab.entries = [...tab.entries]; // nudge reactivity after in-place inserts
     tab.isDirty = true;
@@ -148,7 +202,7 @@
   async function handlePaginateAll() {
     const tab = store.activeTab;
     if (!tab || working) return;
-    const tooLong = boxOverflows.filter((b) => b.tooManyLines);
+    const tooLong = boxOverflows.filter((b) => b.tooManyLines || b.bottomLineTooLong);
     if (tooLong.length === 0) {
       store.statusMessage = "No boxes exceed the line limit.";
       return;
@@ -446,6 +500,14 @@
       <div class="reflow-controls">
         <label>Chars/line <input type="number" min="1" max="200" bind:value={reflowLineCap} disabled={working} /></label>
         <label>Lines/box <input type="number" min="1" max="10" bind:value={reflowLinesPerBox} disabled={working} /></label>
+        {#if gameCaps}
+          <button
+            class="game-caps"
+            disabled={working || (reflowLineCap === gameCaps.charsPerLine && reflowLinesPerBox === gameCaps.linesPerBox)}
+            onclick={() => { reflowLineCap = gameCaps.charsPerLine; reflowLinesPerBox = gameCaps.linesPerBox; }}
+            title="Measured from the game's dialogue box (engine wrap width; includes the text box profile when enabled)"
+          >Game box: {gameCaps.charsPerLine} × {gameCaps.linesPerBox}</button>
+        {/if}
         <button class="btn split" onclick={() => handleReflow(false)} disabled={working} title="Revert all splits in this tab and re-wrap at the caps above">
           Re-flow this tab
         </button>
@@ -458,6 +520,9 @@
           <span class="no-bridge">No box bridge in this BIN — re-flow wraps lines only (no pagination).</span>
         {/if}
       </div>
+      {#if engineRules}
+        <div class="engine-note">English word wrap: the engine breaks rows itself — re-flow only splits texts into balanced boxes of {reflowLinesPerBox} rows (chars/line is not used).</div>
+      {/if}
     </div>
 
     {#if progress}
@@ -477,6 +542,42 @@
       </div>
     {/if}
 
+    {#if engineRules}
+      <div class="box-section">
+        <div class="box-section-head">
+          {#if engineOverflows.length === 0}
+            ✓ Every box fits the game's box ({engineRules.rowsPerBox} rows{engineRules.bottomCap > 0 ? `, bottom row ≤ ${engineRules.bottomCap}` : ""}) — the engine wraps the rows itself.
+          {:else}
+            ⚠ <strong>{engineOverflows.length}</strong> box{engineOverflows.length === 1 ? "" : "es"} don't fit the game's box
+            ({engineRules.rowsPerBox} rows{engineRules.bottomCap > 0 ? `, bottom row ≤ ${engineRules.bottomCap}` : ""}). The engine wraps rows itself, so the fix is more boxes, not line breaks.
+            {#if engineOverflows.some((b) => b.singleText)}
+              <button class="paginate-all" onclick={() => handleEngineSplit(engineOverflows)} disabled={working} title="Split every single-text box that doesn't fit into balanced boxes at word boundaries (adds a click per box)">
+                Split into boxes (all)
+              </button>
+            {/if}
+          {/if}
+        </div>
+        <div class="box-list">
+          {#each engineOverflows as box (box.id)}
+            <div class="box-row">
+              <span class="box-badges">
+                {#if box.bottomRowTooLong}
+                  <span class="box-badge bad" title="The bottom row shares its row with UI art (Settings ▸ Bottom-line cap)">bottom row &gt; {engineRules.bottomCap}</span>
+                {:else}
+                  <span class="box-badge bad">{box.rows} rows &gt; {box.rowsPerBox}</span>
+                {/if}
+              </span>
+              <button class="box-preview-btn" onclick={() => jumpToEngineBox(box)} title={`Go to this box (starts at row #${box.id})`}>{truncate(box.preview, 78)}</button>
+              {#if box.singleText}
+                <button class="row-btn" onclick={() => handleEngineSplit([box])} disabled={working} title="Split this text into balanced boxes at word boundaries">Split into boxes</button>
+              {:else}
+                <span class="no-bridge" title="This box holds several lines separated by the game's own line breaks (0x6F); each starts a new row. Shorten them, or move the text into the first line (go to the box to edit).">several lines: shorten</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </div>
+    {:else}
     {#if store.tabs.length > 1 && (globalOverflowCount > 0 || globalBoxOverflowCount > 0)}
       <div class="global-bar">
         <span>
@@ -513,11 +614,11 @@
         <div class="box-section-head">
           ⚠ <strong>{boxOverflows.length}</strong> text box{boxOverflows.length === 1 ? "" : "es"}
           exceed the per-box limits — extra lines render off-screen in-game.
-          {#if boxOverflows.some((b) => b.tooManyLines) && canAddBoxes}
+          {#if boxOverflows.some((b) => b.tooManyLines || b.bottomLineTooLong) && canAddBoxes}
             <button class="paginate-all" onclick={handlePaginateAll} disabled={working} title="Split every over-long box into multiple boxes (clones the box-transition bridge; adds a click per box)">
               Paginate all
             </button>
-          {:else if boxOverflows.some((b) => b.tooManyLines) && !canAddBoxes}
+          {:else if boxOverflows.some((b) => b.tooManyLines || b.bottomLineTooLong) && !canAddBoxes}
             {#if donorName}
               <button
                 class="paginate-all"
@@ -542,9 +643,12 @@
                 {#if box.overTotalCap}
                   <span class="box-badge bad">{box.totalChars}/{box.totalCap} chars</span>
                 {/if}
+                {#if box.bottomLineTooLong}
+                  <span class="box-badge bad" title="The bottom line shares its row with UI art (Settings ▸ Bottom-line cap)">bottom line &gt; {store.bottomLineCharCap} chars</span>
+                {/if}
               </span>
               <button class="box-preview-btn" onclick={() => jumpToBox(box)} title={`Go to this box (starts at row #${box.id})`}>{truncate(box.preview, 78)}</button>
-              {#if box.tooManyLines && canAddBoxes}
+              {#if (box.tooManyLines || box.bottomLineTooLong) && canAddBoxes}
                 <button class="row-btn" onclick={() => handlePaginateBox(box)} disabled={working} title="Split this box into multiple boxes every {store.maxLinesPerBox} lines (clones the box-transition bridge)">Paginate</button>
               {/if}
             </div>
@@ -630,6 +734,7 @@
         </table>
       </div>
     {/if}
+    {/if}
 
     <footer>
       <button class="btn cancel" onclick={handleClose}>Close</button>
@@ -638,6 +743,12 @@
 </div>
 
 <style>
+  .engine-note {
+    margin-top: 6px;
+    font-size: 0.8rem;
+    color: #9ad0a0;
+  }
+
   .dialog-backdrop {
     position: fixed;
     inset: 0;

@@ -42,6 +42,8 @@ struct Span {
     /// the first arg of a lang-capable call. When present, translations are
     /// written here (non-destructive); otherwise slot 1 is replaced in place.
     slot2: Option<(usize, usize)>,
+    /// A `text()` message (rendered by the message window, which parses `<…>` commands).
+    message: bool,
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -208,7 +210,7 @@ fn scan(text: &str) -> (Vec<ParenteString>, Vec<Span>) {
                     block: block.clone(),
                     speaker: speaker.clone(),
                 });
-                spans.push(Span { start: inner_start, len: j - inner_start, slot2 });
+                spans.push(Span { start: inner_start, len: j - inner_start, slot2, message: is_dialogue_call });
                 ordinal += 1;
                 // Consume through slot 2 so it isn't captured as its own entry.
                 i = after2;
@@ -224,7 +226,7 @@ fn scan(text: &str) -> (Vec<ParenteString>, Vec<Span>) {
                     block: block.clone(),
                     speaker: speaker.clone(),
                 });
-                spans.push(Span { start: inner_start, len: j - inner_start, slot2: None });
+                spans.push(Span { start: inner_start, len: j - inner_start, slot2: None, message: is_dialogue_call });
                 ordinal += 1;
             }
             i = after;
@@ -280,13 +282,44 @@ pub fn parse_script(text: &str) -> Vec<ParenteString> {
     scan(text).0
 }
 
+/// Escape a translated string for embedding inside a Lua double-quoted string
+/// literal (`text("...", "<here>", ...)`). Three classes of hazard, all of which
+/// otherwise abort the scene with a SyntaxError in-game:
+///  - `\` and `"` — standard Lua string escaping.
+///  - CR/LF — a raw newline makes Lua report `unfinished string` (the string runs
+///    off the end of the source line). Some CC translations carry line breaks.
+///  - `--` — the AGE engine's Lua treats `--` as a comment EVEN INSIDE a string,
+///    swallowing the rest of the line incl. the closing quote → `unfinished string`
+///    (observed: sc0001 `"...my father too--was I..."`). Convert each `--` to an
+///    em-dash `—` (renders the same, isn't a comment). Iterates chars (not bytes)
+///    so multibyte UTF-8 and the `--` look-ahead are handled correctly.
 fn escape_into(out: &mut Vec<u8>, s: &str) {
-    for ch in s.bytes() {
-        match ch {
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            _ => out.push(ch),
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '"' => out.extend_from_slice(b"\\\""),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '-' if chars.peek() == Some(&'-') => {
+                chars.next(); // consume the paired '-'
+                out.extend_from_slice("—".as_bytes());
+            }
+            _ => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
         }
+    }
+}
+
+/// The translation as written into the script: message text is made safe for the message
+/// window's command parser (`message_layout::message_safe_text`).
+fn export_text(translation: &str, message: bool) -> std::borrow::Cow<'_, str> {
+    if message {
+        std::borrow::Cow::Owned(crate::parente::message_layout::message_safe_text(translation))
+    } else {
+        std::borrow::Cow::Borrowed(translation)
     }
 }
 
@@ -303,7 +336,7 @@ pub fn apply_translations(text: &str, translations: &[(usize, String)]) -> Strin
         if let Some(repl) = map.get(&ordinal) {
             if !repl.is_empty() {
                 out.extend_from_slice(&d[cursor..span.start]);
-                escape_into(&mut out, repl);
+                escape_into(&mut out, &export_text(repl, span.message));
                 cursor = span.start + span.len;
             }
         }
@@ -331,7 +364,7 @@ pub fn apply_english(text: &str, translations: &[(usize, String)]) -> String {
             continue;
         }
         let mut repl = Vec::new();
-        escape_into(&mut repl, en);
+        escape_into(&mut repl, &export_text(en, span.message));
         if let Some((s2, l2)) = span.slot2 {
             // Fill slot 2 (replace its inner content, keeping slot 1 intact).
             edits.push(Edit { start: s2, end: s2 + l2, repl });
@@ -354,4 +387,19 @@ pub fn apply_english(text: &str, translations: &[(usize, String)]) -> String {
     }
     out.extend_from_slice(&d[cursor..]);
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exported_message_text_has_no_command_brackets() {
+        let script = "text(\"テスト\", \"\", \"\", \"\")\r\nLangArray(\"名前\", \"\")\r\n";
+        let strings = parse_script(script);
+        assert_eq!(strings.len(), 2);
+        let out = apply_english(script, &[(0, "BP (Bonus Points) < 5".into()), (1, "Name (UI)".into())]);
+        assert!(out.contains("BP [Bonus Points] ＜ 5"), "{out}");
+        assert!(out.contains("Name (UI)"), "non-message strings keep their parentheses: {out}");
+    }
 }

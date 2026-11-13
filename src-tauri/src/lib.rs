@@ -1,8 +1,11 @@
+pub mod agf;
 pub mod alf;
+pub mod assets;
 pub mod bin_format;
 pub mod claude;
 pub mod commands;
 pub mod editor;
+pub mod engine;
 pub mod parente;
 pub mod project;
 pub mod state;
@@ -24,6 +27,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(app_state)
+        .manage(assets::AssetsState::default())
+        .register_asynchronous_uri_scheme_protocol(assets::protocol::SCHEME, assets::protocol::handle_request)
         .invoke_handler(tauri::generate_handler![
             commands::load_bin,
             commands::get_engine_info,
@@ -67,11 +72,11 @@ pub fn run() {
             commands::export_for_translation,
             commands::import_translations,
             commands::get_bridge_clone,
+            commands::get_semantic_bridge,
             commands::export_glossary_cli,
             commands::read_glossary_cli_results,
             commands::lookup_character_names_for_pointers,
             commands::list_init_bin_names,
-            commands::extract_chinit_id_name_map,
             commands::open_folder_in_explorer,
             commands::scan_bin_folder,
             commands::extract_alf_to_folder,
@@ -91,6 +96,16 @@ pub fn run() {
             parente::parente_load_entry,
             parente::parente_export_arc,
             parente::parente_list_game,
+            parente::parente_get_game_language,
+            parente::parente_set_game_language,
+            parente::parente_upgrade_patch,
+            parente::parente_apply_font_fix,
+            parente::parente_revert_font_fix,
+            engine::engine_inspect_branding,
+            engine::engine_text_layout,
+            commands::resolve_speaker_names,
+            engine::engine_build_branding,
+            engine::engine_read_image_data_url,
             parente::parente_load_game_entry,
             parente::parente_export_patch,
             parente::parente_export_full,
@@ -98,6 +113,15 @@ pub fn run() {
             parente::parente_suggested_patch_path,
             parente::parente_save_project,
             parente::parente_load_project,
+            assets::commands::assets_startup_request,
+            assets::commands::assets_find_entry,
+            assets::commands::assets_open_game,
+            assets::commands::assets_close_game,
+            assets::commands::assets_list,
+            assets::commands::assets_list_indices,
+            assets::commands::assets_preview,
+            assets::commands::assets_extract,
+            assets::commands::assets_cancel_extract,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -148,7 +148,7 @@ fn clone_region(ins: &[Instruction], region: &[usize], synth: &mut u32) -> Vec<I
             let mut args: Vec<Argument> = src.arguments.iter().map(|a| clone_arg(a, true)).collect();
             if is_control_flow(src.opcode) {
                 for (ai, a) in args.iter_mut().enumerate() {
-                    if is_label_argument(src.opcode, ai, a.raw_data) {
+                    if is_label_argument(src.opcode, ai, a.arg_type, a.raw_data) {
                         if let Some(&n) = off_map.get(&a.raw_data) {
                             a.raw_data = n; // internal target → cloned copy
                         }

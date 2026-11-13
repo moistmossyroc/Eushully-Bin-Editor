@@ -1,13 +1,17 @@
 {
   "name": "eushully-bin-editor-gui",
   "private": true,
-  "version": "1.4.1",
+  "version": "1.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:relink": "node --experimental-strip-types --no-warnings src/lib/insertionRelink.test.mts",
+    "test:boxplan": "node --experimental-strip-types --no-warnings src/lib/boxPlan.test.mts",
+    "test:gamelayout": "node --experimental-strip-types --no-warnings src/lib/gameLayout.test.mts",
+    "test:engineoverflow": "node --experimental-strip-types --no-warnings src/lib/engineOverflow.test.mts",
     "tauri": "tauri"
   },
   "devDependencies": {

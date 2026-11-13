@@ -10,8 +10,10 @@
     autoSplitEntry,
   } from "../lib/ipc";
   import { store } from "../lib/stores.svelte";
-  import { applySplitPlan, isAutoSplitContinuation } from "../lib/insertions";
-  import { findOverflows, findBoxOverflows, EDITABLE_OVERFLOW_LABELS } from "../lib/overflow";
+  import { applySplitPlan, splitBoxBridge, isAutoSplitContinuation } from "../lib/insertions";
+  import { findBoxOverflows, EDITABLE_OVERFLOW_LABELS } from "../lib/overflow";
+  import { engineBoxRulesFor, engineMetricsFor, tabOverflowCounts } from "../lib/engineMode";
+  import { engineBoxFits } from "../lib/gameLayout";
   import { toastWarn } from "../lib/toast";
   import { computeEmptyStats, isStructuralOnly } from "../lib/exportOmit";
   import { furiganaDisplayLength, stripQuoteBrackets } from "../lib/types";
@@ -83,19 +85,12 @@
 
   /** Count over-limit entries for the review-overflows button badge.
    *  Uses the same line-group logic as the visual indicator and the dialog. */
-  let overLimitCount = $derived.by(() => {
-    const tab = store.activeTab;
-    if (!tab) return 0;
-    return findOverflows(tab.entries, store.translatedLineCharCap).length;
-  });
+  let overflowCounts = $derived(store.activeTab ? tabOverflowCounts(store.activeTab) : null);
+  let overLimitCount = $derived(overflowCounts?.line ?? 0);
 
   /** Boxes over the per-box limits (line count / total chars) — usually a
    *  by-product of auto-split. Surfaced in the same Review overflows button. */
-  let boxOverLimitCount = $derived.by(() => {
-    const tab = store.activeTab;
-    if (!tab) return 0;
-    return findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox).length;
-  });
+  let boxOverLimitCount = $derived(overflowCounts?.box ?? 0);
 
   /** Count of entries whose original_text matches a glossary japanese key and have no translation yet */
   let glossaryMatchCount = $derived.by(() => {
@@ -338,9 +333,26 @@
         // Post-translation auto-split: if enabled and the row overflows, split it.
         // Restricted to rendered dialogue labels (show-text, display-furigana) —
         // comments/set-string/draw-string don't render in-game so they have no
-        // line cap concept.
-        if (
+        // line cap concept. Engine word-wrap mode: split into boxes only when the
+        // text doesn't fit one engine box (the engine wraps the rows).
+        const engineRules = store.autoSplitEnabled ? engineBoxRulesFor(tab) : null;
+        const engineMetrics = engineRules ? engineMetricsFor(tab) : null;
+        if (engineRules && engineMetrics) {
+          if (
+            tab === store.activeTab && // the split helpers edit store.activeTab
+            entry.label === "show-text" &&
+            entry.translated_text.trim() !== "" &&
+            !entry.is_context_row &&
+            !entry.deleted &&
+            !engineBoxFits(entry.translated_text, engineMetrics, true, engineRules.rowsPerBox, engineRules.bottomCap)
+          ) {
+            void import("../lib/actions").then(({ engineSplitEntries }) =>
+              engineSplitEntries(tab, [entry.instruction_index], engineMetrics, engineRules.rowsPerBox, engineRules.bottomCap),
+            );
+          }
+        } else if (
           store.autoSplitEnabled &&
+          tab === store.activeTab && // applySplitPlan edits store.activeTab: background tabs stay flagged
           store.translatedLineCharCap > 0 &&
           entry.translated_text.trim() !== "" &&
           !entry.is_context_row &&
@@ -370,6 +382,7 @@
                 tab.entries,
                 store.translatedCharCap,
                 store.maxLinesPerBox,
+              store.bottomLineCharCap,
               ).length;
               autoSplitEntry(
                 tab.id,
@@ -378,13 +391,17 @@
                 lineCap,
                 store.translatedCharCap,
                 store.maxLinesPerBox,
+                store.bottomLineCharCap,
               )
-                .then((plan) => {
-                  applySplitPlan(plan);
+                .then(async (plan) => {
+                  const boxBridge = await splitBoxBridge(tab.id);
+                  if (tab !== store.activeTab) return; // switched tabs while the plan was built
+                  applySplitPlan(plan, boxBridge);
                   const boxAfter = findBoxOverflows(
                     tab.entries,
                     store.translatedCharCap,
                     store.maxLinesPerBox,
+                  store.bottomLineCharCap,
                   ).length;
                   if (boxAfter > boxBefore) {
                     toastWarn(

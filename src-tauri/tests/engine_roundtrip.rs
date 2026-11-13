@@ -149,12 +149,14 @@ fn synthetic_insertion_ordering_contract() {
                 SerializedArg { arg_type: 0, raw_value: 0, string_value: None },
                 SerializedArg { arg_type: 2, raw_value: 0, string_value: Some("CONT".into()) },
             ],
+            synthetic_index: None,
         },
         InsertedInstruction {
             after_index: x,
             opcode: 0x6F,
             label: "end-text-line".into(),
             arguments: vec![SerializedArg { arg_type: 0, raw_value: 0, string_value: None }],
+            synthetic_index: None,
         },
     ];
 

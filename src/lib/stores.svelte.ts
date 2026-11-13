@@ -175,6 +175,9 @@ export class TabState {
  * Holds the tab array and shared state that spans all tabs.
  */
 class AppStore {
+  /** Active workspace: the translation editor, or Browse & Extract (game archives). */
+  workspace = $state<"translate" | "assets">("translate");
+
   /** All open tabs */
   tabs = $state<TabState[]>([]);
 
@@ -246,6 +249,10 @@ class AppStore {
    *  Default 3 (covers most Eushully VNs); override per-project as needed. */
   maxLinesPerBox = $state(3);
 
+  /** Char cap for a box's BOTTOM line when that row is shared with UI art (e.g.
+   *  Atelial's button row under a 3-line profile). 0 = same as the line cap. */
+  bottomLineCharCap = $state(0);
+
   /** Whether Claude should enforce character limits during translation. When off, Claude translates freely and flags lines that exceed limits. */
   enforceCharLimits = $state(true);
 
@@ -283,10 +290,42 @@ class AppStore {
    *  (notably auto-wrap SYS4 titles like Sankai where boxes carry long lines). */
   autoSplitOnImport = $state(false);
 
+  /** Which bridge a box break inserts. "native" clones the scene's own
+   *  transition (scene-specific calls included; proven in-game). "semantic"
+   *  builds one from opcode semantics (0x71 clear + presentation/statement
+   *  block, no calls) — works in every scene incl. Degraded/Unavailable ones.
+   *  EXPERIMENTAL until verified in-game per engine. */
+  boxBridgeMode = $state<"native" | "semantic">("native");
+
+  /** Semantic bridge only: don't clear the speaker-plate layout (slot 2) so a
+   *  same-speaker continuation box keeps its name. Hypothesis — verify in-game. */
+  keepSpeakerPlateOnContinuation = $state(true);
+
+
+  /** Last installed SYS game folder opened (game-accurate preview finds the box
+   *  geometry here for workspace tabs, which are copies outside the game). */
+  lastSysGameDir = $state<string | null>(null);
+
+  /** Text layouts per tab id (null = looked up, not available). Session cache. */
+  textLayoutByTab = $state<Record<string, import("./ipc").TextLayout | null>>({});
+
+  /** Text box profile per installed game folder (applied on .fanpatch export when enabled). */
+  boxProfiles = $state<Record<string, { profile: import("./ipc").BoxProfile; enabled: boolean }>>({});
+
+  /** Preview text slot per BIN name prefix ("SC", "SN", "CIMES", …); default 1 (ADV body). */
+  previewSlotByPrefix = $state<Record<string, number>>({});
+
+  /** Show the dialog preview at the game's real box geometry when known. */
+  gameAccuratePreview = $state(true);
+
   /** Last folder a Parente patch was exported to. Used as the save-dialog
    *  default so it doesn't open inside the game's admin-protected Archives
    *  folder (which the user usually can't write to without elevation). */
   lastParenteExportDir = $state<string | null>(null);
+
+  /** Last Parente patch file name (e.g. "moist English TL v1.2.arc"). The game
+   *  ignores the name, so it carries the TL version players see. */
+  lastParenteExportName = $state<string | null>(null);
 
   /** Comma-separated filename prefix(es) that mark "special scene" BINs in the
    *  game-folder picker (the SP category). Passed (split + trimmed) to
@@ -300,6 +339,13 @@ class AppStore {
    *  loaded from read-only folders (e.g. VERITA in Program Files). Persisted. */
   workspaceFolders = $state<Record<string, string>>({});
 
+  /** Remembered Parente translation-project folder per game. Key = the game's
+   *  arc directory (`parenteArcDir(tab)`, normalized), value = a writable folder
+   *  the user picked when the co-located game folder was read-only. Asked ONCE
+   *  per game (see `resolveParenteProjectBase`); routes all that game's project
+   *  saves/loads there instead of the hidden app-data fallback. Persisted. */
+  parenteProjectDirs = $state<Record<string, string>>({});
+
   /** Fanpatch title-bar customization, bundled INSIDE the exported `.fanpatch`
    *  as `fanpatch_title.txt`. Title = the game's English name; label = the patch
    *  label (e.g. a version). Empty = the loader falls back to its own defaults. */
@@ -309,6 +355,19 @@ class AppStore {
   /** Optional path to a UI translation table file, bundled into the `.fanpatch`
    *  as `fanpatch_ui.txt` when set. Empty = not bundled. */
   fanpatchUiConfigPath = $state("");
+
+  /** Bundle "resizable window + HQ upscaler" into exported .fanpatch files
+   *  (loader feature; verified on SYS4 438/443). */
+  fanpatchResizableWindow = $state(true);
+
+  /** Bundle the developer menu + F-key hotkeys (testing builds only). */
+  fanpatchDevMenu = $state(false);
+
+  /** Bundle crisp HD rendering (engine hi-res mode in the resizable window +
+   *  internal-resolution fallback). Needs the resizable window. */
+  fanpatchCrispHd = $state(true);
+  /** Loader English word wrap (engine wraps at word boundaries; verified in-game on Atelial 2026-11-12). */
+  fanpatchWordWrap = $state(true);
 
   /** Whether the characters panel is visible */
   charactersPanelOpen = $state(false);
@@ -412,6 +471,9 @@ class AppStore {
 
   /** Whether the settings dialog is open */
   settingsDialogOpen = $state(false);
+
+  /** Fanpatch branding dialog (SYS4 title badge + boot splash). */
+  brandingDialogOpen = $state(false);
   /** Cooperative cancel flag for long bulk passes (re-flow / split / paginate
    *  across all tabs). The all-tabs loops check it between tabs and stop early;
    *  the progress UI's Cancel button sets it. Reset to false at each run's start. */

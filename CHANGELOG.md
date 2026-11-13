@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.5.0 — 2026-11-13
+
+### New — box splits that keep the speaker (in-game verified on 16 games)
+- **Keep-speaker continuation boxes.** When a translated line is split into more
+  boxes, every continuation box keeps the speaker's name plate, text colour and
+  backlog entry, and does not replay the voice line. Narration continuations stay
+  nameless. Verified in-game on Arterial, VERITA, Megami Zero, Tenmei, Hyakusen,
+  Madou, LaDEA, Sankai, Kamidori, Rhapsody, Castle Meister, Grasesta, Labyrinth
+  Meister, Meishoku and Minefuka, including save/load on a continuation box.
+- Classic auto-split, the row menu, overflow review, live auto-split and bulk split
+  all use this box break in Semantic mode.
+- **SYS3 support for box splits** (Kuutei, Meishoku, Minefuka): the old engine has
+  no statement-block opcodes and needs the line closed before the click and the
+  window redrawn after the clear — the export now does both, and repeats the
+  in-text name line on speech continuations.
+- **Export lint**: warn-only checks against the original (text drawn while the
+  window is hidden, unbalanced statement blocks, clicks that don't clear the box).
+
+### New — engine word-wrap mode
+- With the fan-patch loader's English word wrap on, the game breaks rows at word
+  boundaries itself; the editor then measures overflow in whole boxes and splits
+  into balanced boxes instead of hard line breaks.
+
+### New — Browse & Extract workspace
+- Browse, preview (images as PNG) and extract assets of AGE (SYS3–5 .alf) and
+  Parente (.arc) games from the editor (`--browse <folder>` at launch too).
+
+### Parente
+- **Message-window model** measured in-game: 3 rows × 52 half-width / 26
+  full-width characters; English is pre-broken at word boundaries.
+- **Fixed: ASCII parentheses froze the game.** Parente turns `( )` into its
+  inline-command brackets, so a line like "BP (Bonus Points)" hung the message.
+  Export now writes `[ ]` instead (and full-width `＜ ＞` for stray `< >`); ruby
+  markup is kept. Re-export existing patches to apply.
+- Config language switch (CONFIG.DAT), runtime font fix, timestamp-safe patch export.
+
+### Fixed
+- Splits made in the first box of a scene could lose the speaker (the redraw call
+  was matched against the scene's voiced start-up routine).
+- Tests that need sample game files now skip cleanly when the files are absent.
+
+### Build
+- The shared `parente-arc` and `eushully-assets` crates are vendored under
+  `crates/`, so a fresh clone builds on its own.
+
 ## 1.4.1 — 2026-07-04
 
 ### Fixed — in-game render correctness

@@ -7,7 +7,9 @@
     doExportAllTabsForTranslation, doImportAllTranslations, doCheckTranslationStatus,
     forgetRecentFile, clearRecentFiles, doOpenParenteGameFolder, doOpenSysGameFolder,
     doExportFanpatchFromTabs, doPackFanpatchFromFolder, doPackDualLanguageFanpatch,
-    doSaveProject,
+    doSaveProject, doBuildParenteArcFromCcFolders, doExportParenteTab,
+    doSetParenteGameLanguage, PARENTE_LANGUAGE, doUpgradeParentePatch,
+    doApplyParenteFontFix, doRevertParenteFontFix,
   } from "../lib/actions";
   import SaveExportPromptDialog from "./SaveExportPromptDialog.svelte";
   import AboutDialog from "./AboutDialog.svelte";
@@ -71,11 +73,60 @@
     title: "Game build",
     items: [
       {
-        label: "Export to game files… (native)",
-        desc: "Rebuild the Parente .arc with your translated Lua scripts, ready to drop into the game.",
+        label: "Export to game files… (bilingual toggle)",
+        desc: "Rebuild the .arc with English in slot 2 (Japanese kept in slot 1). Pick the language with 'Set game language' below — the in-game language button crashes.",
         disabled: !hasActiveTab,
         reason: "Open a tab first",
         run: handleExport,
+      },
+      {
+        label: "Export to game files — English only (no toggle)…",
+        desc: "Rebuild the .arc with English written OVER the Japanese, so it shows with no in-game language switch. Use this if the toggle misbehaves.",
+        disabled: !hasActiveTab,
+        reason: "Open a tab first",
+        run: () => doExportParenteTab(store.activeTab!, { destructive: true }),
+      },
+      {
+        label: "Build arc from CC folders (bilingual toggle)…",
+        desc: "Build the patch arc (any name, e.g. moist English TL v1.0.arc) straight from a folder of translated CC projects — no need to open every scene as a tab.",
+        disabled: false,
+        run: () => doBuildParenteArcFromCcFolders(),
+      },
+      {
+        label: "Build arc from CC folders — English only (no toggle)…",
+        desc: "Same as above but English replaces Japanese (no in-game language switch needed).",
+        disabled: false,
+        run: () => doBuildParenteArcFromCcFolders({ destructive: true }),
+      },
+      {
+        label: "Upgrade an existing patch (engine fixes)…",
+        desc: "Re-apply the latest engine fixes to an already-exported patch arc — re-stamps it to outrank the official patches and slims it (drops files identical to the installed official copy); 'Non' UI placeholders; removes the crash-prone language buttons and obsolete font bundles. Keep the official patches (ver102/ver103) installed. Scenes are untouched; the original is kept as .pre-upgrade.bak.",
+        disabled: false,
+        run: () => void doUpgradeParentePatch(),
+      },
+      {
+        label: "Apply dialogue font fix…",
+        desc: "Fix uneven English spacing: redraws the dialogue font's English letters with the game's own half-width M+ font (START_Data, originals backed up). Close the game first.",
+        disabled: false,
+        run: () => void doApplyParenteFontFix(),
+      },
+      {
+        label: "Restore original dialogue font…",
+        desc: "Undo the dialogue font fix from its .pre-fontfix.bak backups.",
+        disabled: false,
+        run: () => void doRevertParenteFontFix(),
+      },
+      {
+        label: "Set game language: English",
+        desc: "Write English into the game's saved config (CONFIG.DAT, backed up once). Close the game first, then launch it normally — no in-game button needed.",
+        disabled: false,
+        run: () => void doSetParenteGameLanguage(PARENTE_LANGUAGE.english),
+      },
+      {
+        label: "Set game language: Japanese",
+        desc: "Switch the saved config back to Japanese (the bilingual patch keeps both).",
+        disabled: false,
+        run: () => void doSetParenteGameLanguage(PARENTE_LANGUAGE.japanese),
       },
     ],
   });
@@ -96,6 +147,12 @@
         disabled: !hasBinTabs,
         reason: "No BIN tabs open",
         run: doExportFanpatchFromTabs,
+      },
+      {
+        label: "Fanpatch branding (title badge + boot splash)…",
+        desc: "SYS4: add an append-style title badge and/or an extra boot splash for your patch (zz_branding.fanpatch). The game folder is inspected first; unsupported parts are explained.",
+        disabled: false,
+        run: () => (store.brandingDialogOpen = true),
       },
       {
         label: "Build .fanpatch from folder…",
@@ -179,6 +236,14 @@
   }
 
   function handleExport() {
+    // Parente rebuilds ONE .arc from all its tabs (doExportBin → doExportParenteTab),
+    // so there's no per-tab "current vs all tabs" choice — skip the BIN-oriented
+    // prompt, whose "All tabs" path (doExportAllBins) would try to BIN-export the
+    // Parente scenes and export 0.
+    if (store.activeTab?.format === "parente") {
+      doExportBin();
+      return;
+    }
     if (store.tabs.length > 1) {
       promptOpen = true;
     } else {
@@ -204,6 +269,25 @@
 />
 
 <div class="toolbar">
+  <div class="workspace-switch" role="tablist" aria-label="Workspace">
+    <button
+      class="workspace-tab"
+      class:active={store.workspace === "translate"}
+      role="tab"
+      aria-selected={store.workspace === "translate"}
+      onclick={() => (store.workspace = "translate")}
+      title="Translate BIN / Parente scripts"
+    >Translate</button>
+    <button
+      class="workspace-tab"
+      class:active={store.workspace === "assets"}
+      role="tab"
+      aria-selected={store.workspace === "assets"}
+      onclick={() => (store.workspace = "assets")}
+      title="Browse game archives, preview and extract files (AGE SYS3-5, Parente, .fanpatch mods)"
+    >Browse &amp; Extract</button>
+  </div>
+  {#if store.workspace === "translate"}
   <div class="toolbar-group">
     <div class="open-menu-wrapper">
       <button class="toolbar-btn" onclick={() => (openMenuOpen = !openMenuOpen)}>
@@ -404,6 +488,7 @@
       {/if}
     </div>
   {/if}
+  {/if}
 </div>
 
 {#if promptOpen}
@@ -595,6 +680,36 @@
   }
   .menu-help-link:hover {
     text-decoration: underline;
+  }
+
+  .workspace-switch {
+    display: flex;
+    border: 1px solid #3a3a5a;
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .workspace-tab {
+    padding: 6px 12px;
+    border: none;
+    background: #1a1a3e;
+    color: #9a9ab8;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+
+  .workspace-tab + .workspace-tab {
+    border-left: 1px solid #3a3a5a;
+  }
+
+  .workspace-tab:hover {
+    background: #2a2a5e;
+  }
+
+  .workspace-tab.active {
+    background: #2a3a6e;
+    color: #fff;
   }
 
   .toolbar-btn {

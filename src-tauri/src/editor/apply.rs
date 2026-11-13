@@ -57,34 +57,39 @@ pub fn apply_changes(
         }
     }
 
-    // Phase 2: Remove deleted instructions (process in reverse to preserve indices).
-    let mut deleted_indices: Vec<usize> = dialogue_entries
+    // Phase 2: one merge pass over ORIGINAL indices — keep or drop each original
+    // instruction, then emit the insertions anchored after it. Both deletions
+    // and `after_index` refer to original indices, so neither can shift the
+    // other. (The old remove-then-insert passes applied original-index
+    // insertions to the post-deletion list → every insert after a deleted row
+    // landed one slot early per deletion.)
+    let deleted: std::collections::HashSet<usize> = dialogue_entries
         .iter()
         .filter(|e| e.deleted && e.instruction_index >= 0)
         .map(|e| e.instruction_index as usize)
         .collect();
-    deleted_indices.sort_unstable();
-    deleted_indices.dedup();
-    for &idx in deleted_indices.iter().rev() {
-        if idx < instructions.len() {
-            instructions.remove(idx);
-        }
+
+    // Group insertions by anchor, keeping list order. The frontend contract
+    // (resolveInsertionsForExport) lists each group in REVERSE visual order —
+    // it was written for back-to-front insertion — so emit each group reversed.
+    let mut insertions_after: std::collections::HashMap<usize, Vec<&InsertedInstruction>> =
+        std::collections::HashMap::new();
+    for insertion in inserted_instructions {
+        insertions_after.entry(insertion.after_index).or_default().push(insertion);
     }
 
-    // Phase 3: Insert new instructions (process in reverse to preserve indices).
-    let mut sorted_insertions: Vec<&InsertedInstruction> = inserted_instructions.iter().collect();
-    sorted_insertions.sort_by(|a, b| b.after_index.cmp(&a.after_index));
-
-    for insertion in sorted_insertions {
-        let insert_at = insertion.after_index + 1;
-        // Account for any prior deletions that shifted indices
-        // (Since we process deletions first, the after_index in InsertedInstruction
-        //  should reference the post-deletion instruction list)
-        if insert_at <= instructions.len() {
-            let new_instr = build_instruction_from_insertion(insertion);
-            instructions.insert(insert_at, new_instr);
+    let mut merged: Vec<Instruction> = Vec::with_capacity(instructions.len() + inserted_instructions.len());
+    for (index, instruction) in instructions.into_iter().enumerate() {
+        if !deleted.contains(&index) {
+            merged.push(instruction);
+        }
+        if let Some(group) = insertions_after.get(&index) {
+            merged.extend(group.iter().rev().map(|insertion| build_instruction_from_insertion(insertion)));
         }
     }
+    // Anchors past the end of the script have nowhere to go (same as before:
+    // they were dropped by the `insert_at <= len` guard).
+    let instructions = merged;
 
     // Original instructions keep their parse-time `offset` values so the
     // writer's label-resolution map (old_offset → new_byte_position) stays
@@ -232,5 +237,53 @@ fn build_instruction_from_insertion(insertion: &InsertedInstruction) -> Instruct
         // Writer skips these when building the label-resolution map so they
         // don't collide with real offsets (especially offset 0 = first instr).
         offset: u64::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::types::SerializedArg;
+
+    fn instr(opcode: u32, offset: u64) -> Instruction {
+        Instruction { opcode, label: String::new(), argument_count: 0, arguments: Vec::new(), offset }
+    }
+    fn insertion(after_index: usize, opcode: u32) -> InsertedInstruction {
+        InsertedInstruction { after_index, opcode, label: String::new(), arguments: Vec::<SerializedArg>::new(), synthetic_index: None }
+    }
+    fn deleted_entry(instruction_index: i64) -> DialogueEntry {
+        serde_json::from_value(serde_json::json!({
+            "instruction_index": instruction_index, "opcode": 0x6E, "label": "show-text",
+            "original_text": "", "translated_text": "", "notes": "",
+            "is_context_row": false, "string_arg_indices": [], "deleted": true
+        }))
+        .expect("DialogueEntry shape")
+    }
+    fn opcodes(list: &[Instruction]) -> Vec<u32> {
+        list.iter().map(|i| i.opcode).collect()
+    }
+
+    #[test]
+    fn insert_after_deleted_row_keeps_its_anchor() {
+        // originals: 0xA0(0) 0xA1(1) 0xA2(2) 0xA3(3); delete #1; insert X after #2.
+        let originals: Vec<Instruction> = (0..4).map(|i| instr(0xA0 + i as u32, i)).collect();
+        let result = apply_changes(&originals, &[deleted_entry(1)], &[insertion(2, 0xEE)]);
+        assert_eq!(opcodes(&result), vec![0xA0, 0xA2, 0xEE, 0xA3]);
+    }
+
+    #[test]
+    fn group_is_emitted_in_reverse_list_order() {
+        // Frontend contract: same-anchor group arrives in REVERSE visual order.
+        let originals: Vec<Instruction> = (0..2).map(|i| instr(0xA0 + i as u32, i)).collect();
+        let reverse_visual = [insertion(0, 0xC3), insertion(0, 0xC2), insertion(0, 0xC1)];
+        let result = apply_changes(&originals, &[], &reverse_visual);
+        assert_eq!(opcodes(&result), vec![0xA0, 0xC1, 0xC2, 0xC3, 0xA1]);
+    }
+
+    #[test]
+    fn insertion_after_a_deleted_anchor_still_lands_in_place() {
+        let originals: Vec<Instruction> = (0..3).map(|i| instr(0xA0 + i as u32, i)).collect();
+        let result = apply_changes(&originals, &[deleted_entry(1)], &[insertion(1, 0xEE)]);
+        assert_eq!(opcodes(&result), vec![0xA0, 0xEE, 0xA2]);
     }
 }

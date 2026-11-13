@@ -6,7 +6,7 @@
   import { doSaveProject, doExportBin, doLoadFile, saveParenteProject } from "../lib/actions";
   import BackupHistoryDialog from "./BackupHistoryDialog.svelte";
   import { hasTranslatableContent } from "../lib/exportOmit";
-  import { findOverflows, findBoxOverflows } from "../lib/overflow";
+  import { tabOverflowCounts } from "../lib/engineMode";
 
   /** Tab whose backup history dialog is currently open, if any. */
   let backupTabIndex = $state<number | null>(null);
@@ -199,15 +199,10 @@
       if (e.translated_text.trim().length > 0) done++;
     }
     const pct = total === 0 ? 0 : Math.round((done / total) * 100);
-    // Match the Stats panel + Review-overflows toolbar count: uses
-    // findOverflows which respects line-group totals and furigana stripping.
-    // Also count boxes over the per-box limits (line count / total chars) so
-    // auto-split overfills surface on the tab dot too.
-    const lineOver = store.translatedLineCharCap > 0
-      ? findOverflows(tab.entries, store.translatedLineCharCap).length
-      : 0;
-    const boxOver = findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox).length;
-    const overCap = lineOver + boxOver;
+    // Same counts as the Stats panel + Review-overflows button (engineMode): line +
+    // box overflows, or engine boxes that don't fit when the loader wraps rows itself.
+    const counts = tabOverflowCounts(tab);
+    const overCap = counts.line + counts.box;
     return { pct, translated: done, total, overCap };
   }
   function statusColor(pct: number, total: number): string {

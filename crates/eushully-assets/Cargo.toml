@@ -1,0 +1,23 @@
+[package]
+name = "eushully-assets"
+version = "0.1.0"
+edition = "2021"
+description = "UI-agnostic engine for browsing / previewing / extracting Eushully game assets (AGE SYS3-5 ALF archives, Parente @ARCH000). Used by the egui AGE Extractor; intended for the Eushully suite (Tauri) later."
+
+[dependencies]
+# Image decoding/encoding (previews, AGF conversion, thumbnails)
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "tga", "tiff"] }
+# Shift-JIS / UTF-16 text
+encoding_rs = "0.8"
+# Extraction progress channel
+crossbeam-channel = "0.5"
+# Serializable option types (persisted by front-ends)
+serde = { version = "1", features = ["derive"] }
+# Line diffs (Base vs Patch)
+similar = "2"
+# Palette quantization when writing edited images back into 8bpp AGFs
+exoquant = "0.2"
+# .fanpatch mod archives (plain ZIPs read by the eushully patch loader)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Unity-era Parente archives; shared with the BIN editor
+parente-arc = { path = "../parente-arc" }

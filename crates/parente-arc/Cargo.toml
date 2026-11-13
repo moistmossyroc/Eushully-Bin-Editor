@@ -1,0 +1,9 @@
+[package]
+name = "parente-arc"
+version = "0.1.0"
+edition = "2021"
+description = "Readers/writers for Unity-era Eushully archives (@ARCH000 .arc -> UnityFS bundle -> SerializedFile TextAsset). Shared by the bin editor and age-extractor."
+
+[dependencies]
+encoding_rs = "0.8"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }

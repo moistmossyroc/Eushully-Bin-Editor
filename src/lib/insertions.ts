@@ -1,6 +1,8 @@
 import { store } from "./stores.svelte";
 import type { DialogueEntry, InsertedInstruction, SerializedArg, SerializedInstruction, SplitPlan } from "./types";
-import { getBridgeClone } from "./ipc";
+import { getBridgeClone, getSemanticBridge } from "./ipc";
+import { planBoxSizes } from "./boxPlan";
+import { furiganaDisplayLength, stripQuoteBrackets } from "./types";
 
 /**
  * Insert an instruction both visually (into entries array) and for export
@@ -141,6 +143,9 @@ export function resolveInsertionsForExport(
     opcode: ins.opcode,
     label: ins.label,
     arguments: ins.arguments,
+    // Persist the visual link so project reload relinks exactly (see
+    // relinkInsertedInstructions). Rust export ignores it.
+    synthetic_index: ins._syntheticIndex,
     _visualOrder: ins._syntheticIndex !== undefined
       ? (entryOrder.get(ins._syntheticIndex) ?? 0)
       : 0,
@@ -240,7 +245,7 @@ function parseAutoSplitSource(notes: string): number | null {
  * or an error string. Returns 0 when nothing was inserted (source already
  * matched, shouldn't happen but defensive).
  */
-export function applySplitPlan(plan: SplitPlan): string | number {
+export function applySplitPlan(plan: SplitPlan, boxBridge?: SerializedInstruction[]): string | number {
   const tab = store.activeTab;
   if (!tab) return "No active tab.";
 
@@ -329,12 +334,22 @@ export function applySplitPlan(plan: SplitPlan): string | number {
 
   // Boxes 1..N: terminate previous box with ETL, then bridge, then (ST, [ETL, ST]…)
   for (let boxNum = 1; boxNum < totalBoxes; boxNum++) {
-    // End the previous box's last line with an ETL (so the bridge has a
-    // clean termination before it).
-    insertETL();
-
-    // Bridge instructions for this box transition.
-    const bridgeInstrs = plan.bridge_instructions_per_split[boxNum - 1] ?? [];
+    let bridgeInstrs: SerializedInstruction[];
+    if (boxBridge) {
+      // Semantic mode (keep-speaker): the in-game-verified box break, same shape as
+      // insertTextBoxBridge — click-wait, then the bridge (which opens with its own ETL).
+      // The SYS3 line close before the wait is added at export (close_lines_before_inserted_waits).
+      prevInstructionIndex = insertInstructionVisually(
+        prevInstructionIndex, "wait-for-input", OP_WAIT_FOR_INPUT, [{ arg_type: 0, raw_value: 0 }], true,
+      );
+      inserted++;
+      bridgeInstrs = boxBridge;
+    } else {
+      // Native clone: end the previous box's last line with an ETL (so the bridge has a
+      // clean termination before it), then the template window.
+      insertETL();
+      bridgeInstrs = plan.bridge_instructions_per_split[boxNum - 1] ?? [];
+    }
     for (const bi of bridgeInstrs) {
       const args: SerializedArg[] = bi.arguments.map((a) => ({
         arg_type: a.arg_type,
@@ -593,6 +608,31 @@ export function insertTextBoxBridge(
 }
 
 /**
+ * The box-break bridge per the user's `boxBridgeMode` setting: the scene's
+ * cloned native transition, or the semantic one (always available). Rejects when
+ * native is requested but the scene has no usable template.
+ */
+export function fetchBoxBridge(tabId: string): Promise<SerializedInstruction[]> {
+  return store.boxBridgeMode === "semantic"
+    ? getSemanticBridge(tabId, store.keepSpeakerPlateOnContinuation)
+    : getBridgeClone(tabId);
+}
+
+/**
+ * The box bridge an auto-split should use: the semantic (keep-speaker) bridge in semantic
+ * mode — the in-game-verified box break (2026-11-13) — else undefined, meaning the split
+ * plan's own native template clones.
+ */
+export async function splitBoxBridge(tabId: string): Promise<SerializedInstruction[] | undefined> {
+  return store.boxBridgeMode === "semantic" ? getSemanticBridge(tabId, store.keepSpeakerPlateOnContinuation) : undefined;
+}
+
+/** True when a box break can be inserted in a tab (semantic mode always can). */
+export function canInsertBoxBreak(bridgeTemplateQuality: string | null | undefined): boolean {
+  return store.boxBridgeMode === "semantic" || bridgeTemplateQuality === "clean" || bridgeTemplateQuality === "degraded";
+}
+
+/**
  * Paginate an over-long text box: insert a native box break (wait-for-input +
  * end-text-line) after every `maxLinesPerBox`-th display line, so a box that
  * wrapped past its line limit splits into multiple boxes the player clicks
@@ -604,33 +644,36 @@ export function insertTextBoxBridge(
  *
  * Returns the number of box breaks inserted, or an error string.
  */
-export async function paginateBox(boxStartEntry: DialogueEntry, maxLinesPerBox: number): Promise<string | number> {
+export async function paginateBox(boxStartEntry: DialogueEntry, maxLinesPerBox: number, bottomLineCap = 0): Promise<string | number> {
   const tab = store.activeTab;
   if (!tab) return "No active tab.";
   // Fetch the box-transition bridge once, then delegate to the sync core.
   let bridge: SerializedInstruction[];
   try {
-    bridge = await getBridgeClone(tab.id);
+    bridge = await fetchBoxBridge(tab.id);
   } catch (err) {
     return `No usable textbox bridge in this BIN: ${err}`;
   }
-  return paginateBoxWithBridge(boxStartEntry, maxLinesPerBox, bridge);
+  return paginateBoxWithBridge(boxStartEntry, maxLinesPerBox, bridge, [], bottomLineCap);
 }
 
 /**
  * Sync core of {@link paginateBox}: the caller supplies the box-transition
  * `bridge` so a bulk pass can fetch it ONCE (getBridgeClone) and paginate many
  * boxes with no IPC round-trip and no Svelte repaint per box — every insert
- * coalesces into a single repaint. `speakerSetup` is empty by default: speaker
- * carry-over to continuation boxes isn't possible (in Sankai the name plate +
- * color + portrait are established per-box by the voice block, which can't be
- * cloned), so continuation boxes render in narrator color (text stays correct).
+ * coalesces into a single repaint. `speakerSetup` is empty by default (cloning the
+ * voice block crashes). Speaker carry-over comes from the bridge instead: the
+ * semantic bridge with "keep speaker" calls the scene's speaker box-begin routine
+ * (bridge.rs `find_speaker_redraw_procedure`, age-sys.md §7e). The native clone
+ * replays whatever its template transition did (branches stripped), which in Sankai
+ * gave narrator-coloured continuations.
  */
 export function paginateBoxWithBridge(
   boxStartEntry: DialogueEntry,
   maxLinesPerBox: number,
   bridge: SerializedInstruction[],
   speakerSetup: SerializedInstruction[] = [],
+  bottomLineCap = 0,
 ): string | number {
   const tab = store.activeTab;
   if (!tab) return "No active tab.";
@@ -640,38 +683,37 @@ export function paginateBoxWithBridge(
   const startIdx = tab.entries.indexOf(boxStartEntry);
   if (startIdx === -1) return "Box start not found.";
 
-  // Walk the box, recording the LAST content entry of each completed line.
+  // Walk the box, recording the LAST content entry (and display length) of each line.
   const lineLastEntry: DialogueEntry[] = [];
+  const lineLengths: number[] = [];
   let curLast: DialogueEntry | null = null;
+  let curLength = 0;
   for (let i = startIdx; i < tab.entries.length; i++) {
     const e = tab.entries[i];
     if (e.deleted) continue;
     if (e.label === "wait-for-input" || e.opcode === OP_NEW_BOX_OPEN) break; // box end
     if (e.label === "end-text-line") {
-      if (curLast) { lineLastEntry.push(curLast); curLast = null; }
+      if (curLast) { lineLastEntry.push(curLast); lineLengths.push(curLength); curLast = null; curLength = 0; }
       continue;
     }
     if (e.label === "show-text" || e.label === "display-furigana") {
       if (e.translated_text.trim() === "") continue;
       curLast = e;
+      // Same metric as overflow.ts entryDisplayLength (not imported: overflow imports this module).
+      const base = e.label === "display-furigana" ? furiganaDisplayLength(e.translated_text) : e.translated_text.length;
+      curLength += stripQuoteBrackets(base, e.translated_text);
     }
   }
-  if (curLast) lineLastEntry.push(curLast); // trailing line (no 0x6F before box end)
+  if (curLast) { lineLastEntry.push(curLast); lineLengths.push(curLength); } // trailing line (no 0x6F before box end)
 
-  // Balanced distribution: split into the MINIMUM number of boxes, with lines
-  // spread as evenly as possible — so 4 lines/3-max → 2+2 (not 3+1), 7 → 3+2+2,
-  // never an orphan single-line box. Each box stays within maxLinesPerBox.
-  const total = lineLastEntry.length;
-  const numBoxes = Math.ceil(total / maxLinesPerBox);
+  // Fewest boxes with lines spread evenly (4 lines/3-max → 2+2, never an orphan), unless
+  // that would put a too-long line in a bottom slot shared with UI art (boxPlan.ts).
+  const sizes = planBoxSizes(lineLengths, maxLinesPerBox, bottomLineCap);
   const breakAfter: DialogueEntry[] = [];
-  if (numBoxes > 1) {
-    const base = Math.floor(total / numBoxes);
-    const rem = total % numBoxes; // first `rem` boxes get one extra line
-    let cum = 0;
-    for (let b = 0; b < numBoxes - 1; b++) {
-      cum += base + (b < rem ? 1 : 0);
-      breakAfter.push(lineLastEntry[cum - 1]); // break after this box's last line
-    }
+  let cum = 0;
+  for (const size of sizes.slice(0, -1)) {
+    cum += size;
+    breakAfter.push(lineLastEntry[cum - 1]); // break after this box's last line
   }
   if (breakAfter.length === 0) return "Box already fits the line limit.";
 

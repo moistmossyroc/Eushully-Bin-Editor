@@ -5,10 +5,14 @@
 //! drag in an `.arc`, pick scene files to translate, and export a rebuilt
 //! `.arc` — no external tools (UABEA / python) required.
 
-pub mod archive;
-pub mod bundle;
+// Format layers live in the shared `parente-arc` crate (also used by the
+// Sys Decompiler's age-extractor); re-exported so `parente::archive` etc. keep working.
+pub use parente_arc::{archive, bundle, serialized, typetree};
+pub mod config;
+pub mod font_patch;
+pub mod message_layout;
+pub mod patch_stamp;
 pub mod script;
-pub mod serialized;
 
 use crate::editor::extract::DialogueEntry;
 
@@ -269,37 +273,44 @@ fn find_archives_dir(dropped: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Collect every `.arc` under the Archives dir with a load-order priority
-/// (base root < Append < Patch; ties broken by filename ascending).
+/// Collect the game's OFFICIAL `.arc` files under the Archives dir, ordered
+/// lowest → highest priority the way the engine ranks them
+/// (`Filemapper.AddArchive`: newer header timestamp wins per file; ties keep the
+/// first-loaded arc, approximated by base root < Append < Patch, then filename).
+/// Translation patches built by this editor are excluded — they must never be
+/// a source for a new export (see `patch_stamp::is_translation_patch`).
 fn collect_archives(archives_dir: &std::path::Path) -> Vec<(u32, String, String)> {
-    let mut arcs: Vec<(u32, String, String)> = Vec::new(); // (tier, path, label)
+    struct Found { timestamp: u64, tier: u32, path: String, label: String }
+    let mut arcs: Vec<Found> = Vec::new();
     let tiers = [
         (0u32, archives_dir.to_path_buf(), ""),
         (1, archives_dir.join("Append"), "Append/"),
         (2, archives_dir.join("Patch"), "Patch/"),
     ];
     for (tier, dir, prefix) in tiers {
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            let mut found: Vec<String> = rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|x| x == "arc").unwrap_or(false))
-                .filter_map(|p| p.to_str().map(|s| s.to_string()))
-                .collect();
-            found.sort();
-            for p in found {
-                let fname = std::path::Path::new(&p)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                arcs.push((tier, p, format!("{}{}", prefix, fname)));
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for path in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+            if !path.extension().map(|x| x.eq_ignore_ascii_case("arc")).unwrap_or(false) {
+                continue;
             }
+            let (Some(path_str), Some(file_name)) = (path.to_str(), path.file_name().and_then(|s| s.to_str())) else {
+                continue;
+            };
+            let Ok(index) = archive::read_index(path_str) else { continue };
+            if patch_stamp::is_translation_patch(file_name, &index) {
+                continue;
+            }
+            arcs.push(Found {
+                timestamp: patch_stamp::archive_timestamp_value(&index.timestamp).unwrap_or(0),
+                tier,
+                path: path_str.to_string(),
+                label: format!("{prefix}{file_name}"),
+            });
         }
     }
-    // Stable order: tier, then filename — assign final rank by this order.
-    arcs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
-    arcs
+    // Rank: (timestamp, tier, label) — later in the list wins.
+    arcs.sort_by(|a, b| (a.timestamp, a.tier, &a.label).cmp(&(b.timestamp, b.tier, &b.label)));
+    arcs.into_iter().map(|f| (f.tier, f.path, f.label)).collect()
 }
 
 /// Resolve the effective scene files across the whole game and count dialogue.
@@ -393,16 +404,16 @@ pub struct ParentePatchFile {
     pub translations: Vec<(usize, String)>,
 }
 
-/// Build a single patch archive (`ver999.arc`) containing only the translated
+/// Build a single patch archive (any `*.arc` name) containing only the translated
 /// scenes, each pulled from its source archive and re-encoded with edits. Drop
 /// this in `Start\Archives\Patch\` — it outranks the official patches per-file
-/// (highest archive wins) without removing anything.
+/// (newest header timestamp wins, see `patch_stamp`) without removing anything.
 pub fn export_patch(files: &[ParentePatchFile], out_path: &str) -> Result<usize, String> {
     if files.is_empty() {
         return Err("Nothing translated to export.".to_string());
     }
-    // Carry a timestamp from one source archive's header.
-    let timestamp = archive::read_index(&files[0].arc_path)
+    // Outrank the source archives (see `patch_stamp`).
+    let source_timestamp = archive::read_index(&files[0].arc_path)
         .map(|a| a.timestamp)
         .unwrap_or_default();
 
@@ -418,16 +429,16 @@ pub fn export_patch(files: &[ParentePatchFile], out_path: &str) -> Result<usize,
         pack.push(archive::PackFile { name: f.name.clone(), path: f.path.clone(), data });
         changed += 1;
     }
-    let packed = archive::pack_arc(&timestamp, &pack);
-    std::fs::write(out_path, &packed).map_err(|e| format!("Failed to write patch: {}", e))?;
+    patch_stamp::write_patch(out_path, &[&source_timestamp], pack)?;
     Ok(changed)
 }
 
-/// Build a FULL replacement patch: rebuild `primary_arc` (the current official
-/// patch, e.g. ver103) applying every edit by (path,name), copying all other
-/// files verbatim, and appending any edited file that isn't in the primary arc
-/// (pulled from its own source). Output replaces the official patch (drop as
-/// ver999.arc and move ver102/ver103 out) — the proven ZAP-style install.
+/// Build a SLIM destructive patch (English replaces Japanese in slot 1): every
+/// edited file, taken from `primary_arc` (the current official patch, e.g.
+/// ver103) when it has it, else from its own source archive. Untouched files
+/// are NOT copied — the export-time header timestamp (see `patch_stamp`) makes
+/// this arc win per file over the official archives, which stay installed and
+/// keep serving everything else. Drop it in `Patch` under any `*.arc` name.
 pub fn export_full(primary_arc: &str, files: &[ParentePatchFile], out_path: &str) -> Result<usize, String> {
     let data = std::fs::read(primary_arc).map_err(|e| format!("Failed to read {}: {}", primary_arc, e))?;
     let arc = archive::unpack_arc(&data)?;
@@ -438,23 +449,22 @@ pub fn export_full(primary_arc: &str, files: &[ParentePatchFile], out_path: &str
         by_key.insert((f.path.clone(), f.name.clone()), f);
     }
 
-    let mut out_files = Vec::with_capacity(arc.entries.len());
+    let mut out_files = Vec::with_capacity(files.len());
     let mut used: HashSet<(String, String)> = HashSet::new();
     let mut changed = 0usize;
     for entry in &arc.entries {
         let raw = archive::entry_data(&data, entry)?;
         let key = (entry.path.clone(), entry.name.clone());
-        let fdata = if let Some(f) = by_key.get(&key) {
-            let b = bundle::unpack_bundle(raw)?;
-            let (text, enc) = serialized::read_textasset(&b.blob)?;
-            let new_text = script::apply_translations(&text, &f.translations);
-            let new_blob = serialized::patch_textasset(&b.blob, &new_text, enc)?;
-            used.insert(key);
-            changed += 1;
-            bundle::pack_bundle(&b, &new_blob)
-        } else {
-            raw.to_vec()
+        let Some(f) = by_key.get(&key) else {
+            continue; // untouched: the official archive keeps serving it
         };
+        let b = bundle::unpack_bundle(raw)?;
+        let (text, enc) = serialized::read_textasset(&b.blob)?;
+        let new_text = script::apply_translations(&text, &f.translations);
+        let new_blob = serialized::patch_textasset(&b.blob, &new_text, enc)?;
+        used.insert(key);
+        changed += 1;
+        let fdata = bundle::pack_bundle(&b, &new_blob);
         out_files.push(archive::PackFile {
             name: entry.name.clone(),
             path: entry.path.clone(),
@@ -482,9 +492,169 @@ pub fn export_full(primary_arc: &str, files: &[ParentePatchFile], out_path: &str
         changed += 1;
     }
 
-    let packed = archive::pack_arc(&arc.timestamp, &out_files);
-    std::fs::write(out_path, &packed).map_err(|e| format!("Failed to write patch: {}", e))?;
+    patch_stamp::write_patch(out_path, &[&arc.timestamp], out_files)?;
     Ok(changed)
+}
+
+/// Suffix of the one-time pristine backups taken before the runtime font fix.
+const FONT_FIX_BACKUP_SUFFIX: &str = ".pre-fontfix.bak";
+
+/// Locate `START_Data` from a dropped game folder, its `Start` folder, or itself.
+fn find_start_data(dir: &str) -> Option<std::path::PathBuf> {
+    let d = std::path::Path::new(dir);
+    [d.join("START_Data"), d.join("Start").join("START_Data"), d.to_path_buf()]
+        .into_iter()
+        .find(|p| p.join(font_patch::RUNTIME_FONT_ASSETS).is_file())
+}
+
+fn backup_path(p: &std::path::Path) -> std::path::PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(FONT_FIX_BACKUP_SUFFIX);
+    std::path::PathBuf::from(s)
+}
+
+/// Apply the monospace dialogue font to the game's RUNTIME fonts
+/// (`START_Data/sharedassets0.assets` + `.resS`, loaded by FontManager — the
+/// arc prefab copies are unused). Always patches from the pristine one-time
+/// backup, so re-applying never stacks. Returns glyphs replaced.
+pub fn apply_runtime_font_fix(game_dir: &str) -> Result<usize, String> {
+    let start_data = find_start_data(game_dir).ok_or("Could not find START_Data (drop the game folder or its Start folder).")?;
+    let archives_dir = find_archives_dir(game_dir).ok_or("Could not find the game's Archives folder.")?;
+    let (assets_path, stream_path) = font_patch::runtime_font_paths(&start_data);
+    for p in [&assets_path, &stream_path] {
+        let b = backup_path(p);
+        if !b.exists() {
+            std::fs::copy(p, &b).map_err(|e| format!("Backup failed ({}): {e}", b.display()))?;
+        }
+    }
+    let (da, doff, dsize) = find_file_across(&archives_dir, font_patch::DONOR_BUNDLE).ok_or("Donor font bundle (ui_battlemap) not found in the game.")?;
+    let donor = archive::read_entry_at(&da, doff, dsize)?;
+    let mut assets = std::fs::read(backup_path(&assets_path)).map_err(|e| format!("Read failed: {e}"))?;
+    let mut stream = std::fs::read(backup_path(&stream_path)).map_err(|e| format!("Read failed: {e}"))?;
+    let glyphs = font_patch::patch_runtime_fonts(&mut assets, &mut stream, &donor)?;
+    if glyphs == 0 {
+        return Err("No runtime font was patched (unexpected game data) — files left untouched.".into());
+    }
+    std::fs::write(&stream_path, &stream).map_err(|e| format!("Write failed ({}): {e}", stream_path.display()))?;
+    std::fs::write(&assets_path, &assets).map_err(|e| format!("Write failed ({}): {e}", assets_path.display()))?;
+    Ok(glyphs)
+}
+
+/// Undo `apply_runtime_font_fix` by restoring the pristine backups.
+pub fn revert_runtime_font_fix(game_dir: &str) -> Result<(), String> {
+    let start_data = find_start_data(game_dir).ok_or("Could not find START_Data.")?;
+    let (assets_path, stream_path) = font_patch::runtime_font_paths(&start_data);
+    for p in [&assets_path, &stream_path] {
+        let b = backup_path(p);
+        if !b.exists() {
+            return Err(format!("No backup found ({}) — font fix was never applied here.", b.display()));
+        }
+        std::fs::copy(&b, p).map_err(|e| format!("Restore failed ({}): {e}", p.display()))?;
+    }
+    Ok(())
+}
+
+/// Prefab bundles an earlier build font-patched into exports. The game draws
+/// dialogue with START_Data's runtime fonts, so these copies did nothing but
+/// add ~59 MB; upgrades drop them (the base archives still provide originals).
+const LEGACY_FONT_BUNDLES: &[&str] = &["ui_message", "ui_history"];
+
+/// Prefab that older exports added with the (crashing) language buttons enabled.
+const LANG_BUTTON_PREFAB: &str = "ui_config_basic";
+
+/// Where the official game serves each file: (path, name) → (arc, offset, size)
+/// of the highest-priority OFFICIAL copy, ignoring `exclude` (the patch being
+/// processed, which may predate the marker entry).
+fn official_file_sources(
+    archives_dir: &std::path::Path,
+    exclude: &str,
+) -> std::collections::HashMap<(String, String), (String, u64, u64)> {
+    let same_file = |a: &str| a.replace('\\', "/").eq_ignore_ascii_case(&exclude.replace('\\', "/"));
+    let mut sources = std::collections::HashMap::new();
+    for (_tier, arc_path, _label) in collect_archives(archives_dir) {
+        if same_file(&arc_path) {
+            continue;
+        }
+        let Ok(index) = archive::read_index(&arc_path) else { continue };
+        for e in index.entries {
+            sources.insert((e.path, e.name), (arc_path.clone(), e.offset, e.size));
+        }
+    }
+    sources
+}
+
+/// True if `raw` is byte-identical to the official copy the game would load
+/// anyway — such entries are dead weight in a patch.
+fn matches_official(
+    raw: &[u8],
+    official: Option<&(String, u64, u64)>,
+) -> bool {
+    match official {
+        Some((arc_path, offset, size)) if *size == raw.len() as u64 => {
+            archive::read_entry_at(arc_path, *offset, *size).map(|o| o == raw).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Re-apply the engine-level fixes to an ALREADY-EXPORTED patch arc without
+/// re-exporting any scenes: fill LTSINIT's English placeholders, drop bundles
+/// older exports added that are crash-prone (the language-button prefab) or
+/// dead weight (prefab font copies — the dialogue renders with the RUNTIME
+/// fonts in START_Data, see `apply_runtime_font_fix`), SLIM it by dropping
+/// entries byte-identical to the installed official copy (old full-size
+/// exports carried all of ver103), then re-stamp + mark it (`patch_stamp`).
+/// Scene translations are kept byte-for-byte. Returns how many entries were dropped.
+pub fn upgrade_existing_patch(patch_arc: &str, out_path: &str) -> Result<usize, String> {
+    let data = std::fs::read(patch_arc).map_err(|e| format!("Failed to read {patch_arc}: {e}"))?;
+    let arc = archive::unpack_arc(&data)?;
+    let archives_dir = archives_dir_for(patch_arc);
+    let official = official_file_sources(&archives_dir, patch_arc);
+    let mut out_files = Vec::with_capacity(arc.entries.len());
+    let mut have_ltsinit = false;
+    let mut dropped = 0;
+    for entry in &arc.entries {
+        let is_marker = entry.path == patch_stamp::MARKER_PATH && entry.name == patch_stamp::MARKER_NAME;
+        if is_marker {
+            continue; // re-written by `write_patch`
+        }
+        if entry.name == LANG_BUTTON_PREFAB || LEGACY_FONT_BUNDLES.contains(&entry.name.as_str()) {
+            dropped += 1;
+            continue;
+        }
+        let raw = archive::entry_data(&data, entry)?;
+        if entry.name != LTSINIT_FILE
+            && matches_official(raw, official.get(&(entry.path.clone(), entry.name.clone())))
+        {
+            dropped += 1;
+            continue;
+        }
+        let data = if entry.name == LTSINIT_FILE {
+            have_ltsinit = true;
+            rebundle(raw, fill_ltsinit_english)?
+        } else {
+            raw.to_vec()
+        };
+        out_files.push(archive::PackFile { name: entry.name.clone(), path: entry.path.clone(), data });
+    }
+    if !have_ltsinit {
+        if let Some((a, o, s)) = find_file_across(&archives_dir, LTSINIT_FILE) {
+            let raw = archive::read_entry_at(&a, o, s)?;
+            out_files.push(archive::PackFile { name: LTSINIT_FILE.into(), path: "/src/sys".into(), data: rebundle(&raw, fill_ltsinit_english)? });
+        }
+    }
+    patch_stamp::write_patch(out_path, &[&arc.timestamp], out_files)?;
+    Ok(dropped)
+}
+
+/// The game's `Archives` dir for a primary arc (which may sit in `Patch`/`Append`).
+fn archives_dir_for(primary_arc: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(primary_arc);
+    let parent = p.parent().unwrap_or(std::path::Path::new("."));
+    match parent.file_name().and_then(|s| s.to_str()) {
+        Some("Patch") | Some("Append") => parent.parent().unwrap_or(parent).to_path_buf(),
+        _ => parent.to_path_buf(),
+    }
 }
 
 // --- English (non-destructive, slot-2) patch -------------------------------
@@ -503,6 +673,8 @@ fn english_patch_system(t: &str) -> String {
 
 /// Patch `LangArray()` to return English (key2) when present under English mode,
 /// else Japanese (key1) — the JP fallback so partial translations never blank.
+/// Also patch `DrawChapter`'s per-language image lookups to fall back to the JP
+/// image so English mode doesn't hang on the chapter-title sequence (see below).
 fn english_patch_systemex(t: &str) -> String {
     let t = t.replacen(
         "if(LangNo==1) then return key1 end",
@@ -511,41 +683,89 @@ fn english_patch_systemex(t: &str) -> String {
     );
     let t = t.replacen("if(LangNo==2) then return key2 end", "", 1);
     let t = t.replacen("if(LangNo==3) then return key3 end", "", 1);
-    t.replacen("if(LangNo==4) then return key4 end", "", 1)
+    let t = t.replacen("if(LangNo==4) then return key4 end", "", 1);
+    // Chapter-title images (`DrawChapter`) are per-language PNGs, but ONLY slot 1
+    // (Japanese) is filled — slots 2-4 are "". Under English (LangNo==2) the raw
+    // `ckeyX[key][LangNo]` yields "", and `set(C,"")` stalls the title sequence
+    // (never reaching EndProcessSkip / isMenu=0) → the game hangs with input
+    // frozen. Fall back to the JP image (index 1) when the language slot is
+    // empty/nil. Idempotent: a re-export won't re-match the already-rewritten line.
+    let t = patch_chapter_lang_fallback(&t, "C2", "ckeyA");
+    let t = patch_chapter_lang_fallback(&t, "C3", "ckeyB");
+    patch_chapter_lang_fallback(&t, "C4", "ckeyC")
 }
 
-/// Enable the dormant in-config language buttons by flipping `bt_lang1..4`
-/// `m_IsActive` false→true inside the `ui_config_basic` prefab (in-place byte
-/// edits; blob size unchanged). The button sets the native `LangNo` and the
-/// engine persists it in CONFIG.DAT, giving a native, persistent language menu.
-fn enable_lang_buttons(raw: &[u8]) -> Result<Vec<u8>, String> {
-    let mut b = bundle::unpack_bundle(raw)?;
-    let mut blob = b.blob.clone();
-    // Force the EXACT desired state: Japanese (1) + English (2) ON, Chinese (3)
-    // and Traditional (4) OFF — set explicitly so we don't inherit a wrong
-    // state if the source prefab was already edited (e.g. a prior ver999).
-    for n in 1..=4u8 {
-        let want: u8 = if n == 1 || n == 2 { 1 } else { 0 };
-        let needle = format!("bt_lang{}", n).into_bytes();
-        let mut i = 0;
-        while i + needle.len() <= blob.len() {
-            if blob[i..i + needle.len()] == needle[..]
-                && i >= 4
-                && blob[i - 4..i] == [8, 0, 0, 0]
-            {
-                // GameObject layout: name(8) + m_Tag(u16) + m_IsActive(u8).
-                let active = i + 8 + 2;
-                if active < blob.len() {
-                    blob[active] = want;
-                }
+/// Rewrite `set(<cvar>,<arr>[key][LangNo])` so an empty/nil per-language slot
+/// falls back to the Japanese image (`<arr>[key][1]`).
+fn patch_chapter_lang_fallback(t: &str, cvar: &str, arr: &str) -> String {
+    let from = format!("set({cvar},{arr}[key][LangNo])");
+    let to = format!(
+        "set({cvar},({arr}[key][LangNo]~=nil and {arr}[key][LangNo]~=\"\" and {arr}[key][LangNo]) or {arr}[key][1])"
+    );
+    t.replacen(&from, &to, 1)
+}
+
+/// Placeholder the developers left in unfilled `LTSINIT` language slots.
+const LTSINIT_PLACEHOLDER: &str = "Non";
+/// UI string table (`LTSINIT[key][LangNo]`, read by `Framework.GetLangTable`).
+const LTSINIT_FILE: &str = "ltsinit.txt";
+
+/// Byte ranges of the quoted string contents in a Lua table row body
+/// (`{"a","b",...}`), honouring `\"` escapes. Pure helper for LTSINIT rows.
+fn quoted_ranges(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            if j >= bytes.len() {
                 break;
             }
+            ranges.push((start, j));
+            i = j + 1;
+        } else {
             i += 1;
         }
     }
-    b.blob = blob;
-    let new = b.blob.clone();
-    Ok(bundle::pack_bundle(&b, &new))
+    ranges
+}
+
+/// Fill the English slot of every `LTSINIT["key"]={jp,en,cn,tw}` UI-string row
+/// whose English is the dev placeholder `"Non"` or empty, with slot 1's text.
+/// All 45 such rows in the shipped table already carry English (or a neutral
+/// placeholder like `－－`) in slot 1 — the developers wrote English into the
+/// wrong column — so English mode stops rendering literal "Non" in popups and
+/// the battle UI. Pure; idempotent; lines other than LTSINIT rows untouched.
+fn fill_ltsinit_english(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let Some(body_start) = trimmed.starts_with("LTSINIT[").then(|| line.find("={")).flatten() else {
+            out.push_str(line);
+            continue;
+        };
+        let ranges = quoted_ranges(&line[body_start..]);
+        let (Some(&(s1, e1)), Some(&(s2, e2))) = (ranges.first(), ranges.get(1)) else {
+            out.push_str(line);
+            continue;
+        };
+        let body = &line[body_start..];
+        let slot1 = &body[s1..e1];
+        let slot2 = &body[s2..e2];
+        if slot1.is_empty() || !(slot2 == LTSINIT_PLACEHOLDER || slot2.is_empty()) {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&line[..body_start + s2]);
+        out.push_str(slot1);
+        out.push_str(&line[body_start + e2..]);
+    }
+    out
 }
 
 /// Re-bundle a file after transforming its decoded script text.
@@ -570,11 +790,13 @@ fn find_file_across(archives_dir: &std::path::Path, name: &str) -> Option<(Strin
     found
 }
 
-/// Build the NON-DESTRUCTIVE English patch: rebuild `primary_arc` with English
-/// written into slot 2 of every edited scene (Japanese preserved in slot 1),
-/// and the `system.txt` / `systemex.txt` functions patched so the engine renders
-/// slot 2. Pulls `system.txt`/`systemex.txt` from elsewhere in the game if the
-/// primary archive doesn't contain them. Output is a complete `ver999.arc`.
+/// Build the SLIM NON-DESTRUCTIVE English patch: English written into slot 2 of
+/// every edited scene (Japanese preserved in slot 1), the `system.txt` /
+/// `systemex.txt` functions patched so the engine renders slot 2, and LTSINIT's
+/// English placeholders filled. Each file comes from `primary_arc` (the current
+/// official patch) when it has it, else from elsewhere in the game. Untouched
+/// files are NOT copied — the export-time header timestamp (see `patch_stamp`)
+/// makes this arc win per file while the official archives serve the rest.
 pub fn export_english(primary_arc: &str, files: &[ParentePatchFile], out_path: &str) -> Result<usize, String> {
     let data = std::fs::read(primary_arc).map_err(|e| format!("Failed to read {}: {}", primary_arc, e))?;
     let arc = archive::unpack_arc(&data)?;
@@ -589,10 +811,14 @@ pub fn export_english(primary_arc: &str, files: &[ParentePatchFile], out_path: &
     let mut used: HashSet<(String, String)> = HashSet::new();
     let mut have_system = false;
     let mut have_systemex = false;
+    let mut have_ltsinit = false;
     let mut changed = 0usize;
     for entry in &arc.entries {
         let raw = archive::entry_data(&data, entry)?;
-        let fdata = if entry.name == "system.txt" {
+        let fdata = if entry.name == LTSINIT_FILE {
+            have_ltsinit = true;
+            rebundle(raw, fill_ltsinit_english)?
+        } else if entry.name == "system.txt" {
             have_system = true;
             rebundle(raw, english_patch_system)?
         } else if entry.name == "systemex.txt" {
@@ -604,7 +830,7 @@ pub fn export_english(primary_arc: &str, files: &[ParentePatchFile], out_path: &
             let trans = f.translations.clone();
             rebundle(raw, move |t| script::apply_english(t, &trans))?
         } else {
-            raw.to_vec()
+            continue; // untouched: the official archive keeps serving it
         };
         out_files.push(archive::PackFile { name: entry.name.clone(), path: entry.path.clone(), data: fdata });
     }
@@ -622,14 +848,7 @@ pub fn export_english(primary_arc: &str, files: &[ParentePatchFile], out_path: &
     }
 
     // Ensure the two patched engine functions are present (add from elsewhere).
-    let archives_dir = {
-        let p = std::path::Path::new(primary_arc);
-        let parent = p.parent().unwrap_or(std::path::Path::new("."));
-        match parent.file_name().and_then(|s| s.to_str()) {
-            Some("Patch") | Some("Append") => parent.parent().unwrap_or(parent).to_path_buf(),
-            _ => parent.to_path_buf(),
-        }
-    };
+    let archives_dir = archives_dir_for(primary_arc);
     if !have_system {
         let (a, o, s) = find_file_across(&archives_dir, "system.txt").ok_or("system.txt not found in game")?;
         let raw = archive::read_entry_at(&a, o, s)?;
@@ -640,34 +859,36 @@ pub fn export_english(primary_arc: &str, files: &[ParentePatchFile], out_path: &
         let raw = archive::read_entry_at(&a, o, s)?;
         out_files.push(archive::PackFile { name: "systemex.txt".into(), path: "/src/sys".into(), data: rebundle(&raw, english_patch_systemex)? });
     }
-    // Enable the in-config language buttons (native persistent toggle). The
-    // prefab lives in a base archive; pull it, flip the buttons, and add it so
-    // our copy overrides. Non-fatal if absent (just no in-game toggle then).
-    let already_basic = out_files.iter().any(|f| f.name == "ui_config_basic");
-    if !already_basic {
-        if let Some((a, o, s)) = find_file_across(&archives_dir, "ui_config_basic") {
-            if let Ok(raw) = archive::read_entry_at(&a, o, s) {
-                if let Ok(data) = enable_lang_buttons(&raw) {
-                    out_files.push(archive::PackFile { name: "ui_config_basic".into(), path: "/pfb/ui".into(), data });
-                }
-            }
+    if !have_ltsinit {
+        // Non-fatal: without it English mode just shows the dev "Non" placeholders.
+        if let Some((a, o, s)) = find_file_across(&archives_dir, LTSINIT_FILE) {
+            let raw = archive::read_entry_at(&a, o, s)?;
+            out_files.push(archive::PackFile { name: LTSINIT_FILE.into(), path: "/src/sys".into(), data: rebundle(&raw, fill_ltsinit_english)? });
         }
     }
+    // The in-config language buttons (`bt_langN` in `ui_config_basic`) are
+    // deliberately LEFT HIDDEN: clicking them crashes the game
+    // (NullReferenceException in ui_allmap.UpdateString via
+    // ui_config_basic.OnClickBut → input frozen). Language is set via
+    // CONFIG.DAT instead (`config::set_language_at`, "Set game language").
 
-    let packed = archive::pack_arc(&arc.timestamp, &out_files);
-    std::fs::write(out_path, &packed).map_err(|e| format!("Failed to write patch: {}", e))?;
+    patch_stamp::write_patch(out_path, &[&arc.timestamp], out_files)?;
     Ok(changed)
 }
 
+/// Default patch file name. The loader takes every `*.arc` recursively, so the
+/// name is free — put the version in it so players can tell which one they have.
+pub const DEFAULT_PATCH_FILE_NAME: &str = "moist English TL v1.0.arc";
+
 /// If the dropped folder is a game install, return the path where a patch
-/// should be written (`…\Start\Archives\Patch\ver999.arc`).
+/// should be written (`…\Start\Archives\Patch\<DEFAULT_PATCH_FILE_NAME>`).
 pub fn suggested_patch_path(dropped_dir: &str) -> Option<String> {
     let archives = find_archives_dir(dropped_dir)?;
     let patch = archives.join("Patch");
     if patch.is_dir() {
-        patch.join("ver999.arc").to_str().map(|s| s.to_string())
+        patch.join(DEFAULT_PATCH_FILE_NAME).to_str().map(|s| s.to_string())
     } else {
-        archives.join("ver999.arc").to_str().map(|s| s.to_string())
+        archives.join(DEFAULT_PATCH_FILE_NAME).to_str().map(|s| s.to_string())
     }
 }
 
@@ -692,6 +913,47 @@ pub async fn parente_export_arc(
     out_path: String,
 ) -> Result<usize, String> {
     export_arc(&arc_path, &edits, &out_path)
+}
+
+/// Apply the monospace dialogue font to the game's runtime fonts (START_Data).
+#[tauri::command]
+pub async fn parente_apply_font_fix(game_dir: String) -> Result<usize, String> {
+    apply_runtime_font_fix(&game_dir)
+}
+
+/// Restore the game's original runtime fonts from the pre-fix backups.
+#[tauri::command]
+pub async fn parente_revert_font_fix(game_dir: String) -> Result<(), String> {
+    revert_runtime_font_fix(&game_dir)
+}
+
+/// Upgrade an exported patch IN PLACE (see `upgrade_existing_patch`): writes a
+/// temp file, keeps the first original as `<arc>.pre-upgrade.bak`, then swaps.
+#[tauri::command]
+pub async fn parente_upgrade_patch(patch_arc: String) -> Result<usize, String> {
+    let tmp = format!("{patch_arc}.upgrading");
+    let dropped = upgrade_existing_patch(&patch_arc, &tmp)?;
+    let backup = format!("{patch_arc}.pre-upgrade.bak");
+    if !std::path::Path::new(&backup).exists() {
+        std::fs::copy(&patch_arc, &backup).map_err(|e| format!("Backup failed ({backup}): {e}"))?;
+    }
+    std::fs::rename(&tmp, &patch_arc).map_err(|e| format!("Replace failed ({patch_arc}): {e}"))?;
+    Ok(dropped)
+}
+
+/// Saved game language from CONFIG.DAT (1 = Japanese, 2 = English). `None` if
+/// the file has no LangNo yet. Errors if the game was never launched.
+#[tauri::command]
+pub async fn parente_get_game_language() -> Result<Option<u8>, String> {
+    config::get_language_at(&config::default_config_path()?)
+}
+
+/// Write the game language straight into CONFIG.DAT (bypasses the crashing
+/// in-game language button). Returns the one-time backup path.
+#[tauri::command]
+pub async fn parente_set_game_language(lang: u8) -> Result<String, String> {
+    let backup = config::set_language_at(&config::default_config_path()?, lang)?;
+    Ok(backup.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -738,8 +1000,10 @@ pub async fn parente_suggested_patch_path(dir: String) -> Result<Option<String>,
     Ok(suggested_patch_path(&dir))
 }
 
-/// Directory where Parente per-scene project files live (translations survive
-/// closing/reopening). Under the app config dir, same as settings.json.
+/// Legacy directory where Parente per-scene project files lived (under the app
+/// config dir, next to settings.json). Still used as the read-only-folder save
+/// fallback and to migrate projects saved by older builds. New saves go to a
+/// visible "Parente Projects" folder next to the game's `.arc` instead.
 fn projects_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
     let d = app
@@ -751,25 +1015,145 @@ fn projects_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(d)
 }
 
-#[tauri::command]
-pub async fn parente_save_project(app: tauri::AppHandle, key: String, content: String) -> Result<(), String> {
-    let path = projects_dir(&app)?.join(format!("{}.json", key));
-    std::fs::write(&path, content).map_err(|e| format!("save project: {}", e))
+/// Sanitize a scene name into a safe JSON filename component: keep
+/// `[A-Za-z0-9._-]`, map everything else to `_`. Same character class the
+/// frontend's legacy project key used, so migrated filenames line up.
+fn sanitize_project_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect()
 }
 
+/// Persist one Parente scene's translation project. Preferred target is a
+/// visible `<base_dir>/Parente Projects/<clean-name>.json` next to the game's
+/// `.arc`; if that folder can't be created/written (e.g. an admin-locked game
+/// install) we fall back to the legacy app-data dir. A save must NEVER error out
+/// — the user's in-session translations depend on it — so this always returns Ok.
 #[tauri::command]
-pub async fn parente_load_project(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
-    let path = projects_dir(&app)?.join(format!("{}.json", key));
-    if path.exists() {
-        Ok(Some(std::fs::read_to_string(&path).map_err(|e| format!("load project: {}", e))?))
-    } else {
-        Ok(None)
+pub async fn parente_save_project(
+    app: tauri::AppHandle,
+    base_dir: String,
+    name: String,
+    content: String,
+) -> Result<(), String> {
+    let clean = sanitize_project_name(&name);
+    // Preferred: the visible folder beside the .arc.
+    if !base_dir.is_empty() {
+        let dir = std::path::Path::new(&base_dir).join("Parente Projects");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let target = dir.join(format!("{}.json", clean));
+            if std::fs::write(&target, &content).is_ok() {
+                return Ok(());
+            }
+        }
     }
+    // Fallback: the legacy app-data dir (read-only game folder, etc.). Reloadable
+    // via `parente_load_project`'s sanitized-name check below. Swallow errors so a
+    // failed save never surfaces as lost work in the UI.
+    if let Ok(dir) = projects_dir(&app) {
+        let target = dir.join(format!("{}.json", clean));
+        let _ = std::fs::write(&target, &content);
+    }
+    Ok(())
+}
+
+/// Load one Parente scene's saved project, or `None`. Checks the new visible
+/// folder first, then the legacy app-data dir — by `legacy_key` (migrates
+/// projects saved by older builds keyed on `path/name`) and by the sanitized
+/// `name` (reloads anything the read-only-folder save fallback wrote).
+#[tauri::command]
+pub async fn parente_load_project(
+    app: tauri::AppHandle,
+    base_dir: String,
+    name: String,
+    legacy_key: String,
+) -> Result<Option<String>, String> {
+    let clean = sanitize_project_name(&name);
+    // 1) New visible folder next to the .arc.
+    if !base_dir.is_empty() {
+        let p = std::path::Path::new(&base_dir)
+            .join("Parente Projects")
+            .join(format!("{}.json", clean));
+        if p.exists() {
+            return Ok(Some(
+                std::fs::read_to_string(&p).map_err(|e| format!("load project: {}", e))?,
+            ));
+        }
+    }
+    // 2) Legacy app-data dir: legacy_key (older-build filenames) then sanitized
+    //    name (read-only-folder save fallback). First hit wins; re-saved to the
+    //    new folder on the next save.
+    if let Ok(dir) = projects_dir(&app) {
+        for fname in [format!("{}.json", legacy_key), format!("{}.json", clean)] {
+            let p = dir.join(&fname);
+            if p.exists() {
+                return Ok(Some(
+                    std::fs::read_to_string(&p).map_err(|e| format!("load project: {}", e))?,
+                ));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ltsinit_placeholder_slots_take_slot1() {
+        let src = concat!(
+            "LTSINIT ={}\n",
+            "LTSINIT[\"bm4\"]={\"Terrain\",\"Non\",\"Non\",\"Non\",}\n",
+            "LTSINIT[\"1\"]={\"はい\", \"Yes\", \"是\", \"是\"}\n",
+            "LTSINIT[\"ope2\"]={\"\",\"\",\"\",\"\",}\n",
+            "LTSINIT[\"x\"]={\"A \\\"q\\\"\",\"\",\"\",\"\",}\n",
+        );
+        let out = super::fill_ltsinit_english(src);
+        assert!(out.contains("LTSINIT[\"bm4\"]={\"Terrain\",\"Terrain\",\"Non\",\"Non\",}"), "{out}");
+        assert!(out.contains("{\"はい\", \"Yes\","), "real English untouched");
+        assert!(out.contains("LTSINIT[\"ope2\"]={\"\",\"\","), "empty slot 1 left alone");
+        assert!(out.contains("{\"A \\\"q\\\"\",\"A \\\"q\\\"\","), "escaped quotes copied verbatim: {out}");
+        assert_eq!(super::fill_ltsinit_english(&out), out, "idempotent");
+    }
+
+    #[test]
+    fn english_patch_systemex_falls_back_for_chapter_images() {
+        // Under English (LangNo==2) the per-language chapter images are empty, so
+        // the raw `ckeyX[key][LangNo]` must fall back to the JP image (index 1) or
+        // the chapter-title sequence stalls and freezes input.
+        let out = super::english_patch_systemex(
+            "set(C2,ckeyA[key][LangNo])\nset(C3,ckeyB[key][LangNo])\nset(C4,ckeyC[key][LangNo])",
+        );
+        assert!(!out.contains("set(C2,ckeyA[key][LangNo])"), "C2 not patched: {out}");
+        assert!(out.contains("or ckeyA[key][1])"), "no JP fallback for ckeyA: {out}");
+        assert!(out.contains("or ckeyB[key][1])"), "no JP fallback for ckeyB: {out}");
+        assert!(out.contains("or ckeyC[key][1])"), "no JP fallback for ckeyC: {out}");
+    }
+
+    #[test]
+    fn apply_english_escapes_lua_string_specials() {
+        // Regression: an embedded newline/quote/backslash in a translation must be
+        // escaped, or Lua aborts in-game with `unfinished string` (sc0001 SyntaxError).
+        let out = script::apply_english(
+            "text(\"x\",\"\",\"\",\"\")",
+            &[(0, "a\nb \"q\" c\\d".to_string())],
+        );
+        assert!(out.contains("a\\nb"), "newline not escaped: {out}");
+        assert!(!out.contains("a\nb"), "raw newline leaked into Lua string: {out}");
+        assert!(out.contains("\\\"q\\\""), "quote not escaped: {out}");
+        assert!(out.contains("c\\\\d"), "backslash not escaped: {out}");
+    }
+
+    #[test]
+    fn apply_english_converts_double_hyphen_to_em_dash() {
+        // The game's Lua treats `--` as a comment EVEN INSIDE a string, truncating
+        // the closing quote → `unfinished string` (sc0001 "...father too--was I..."),
+        // so `--` must never survive into the emitted Lua string.
+        let out = script::apply_english("text(\"x\",\"\",\"\",\"\")", &[(0, "too--was".to_string())]);
+        assert!(!out.contains("--"), "double-hyphen survived into Lua: {out}");
+        assert!(out.contains("too—was"), "not converted to em-dash: {out}");
+    }
 
     #[test]
     fn script_round_trip_identity() {

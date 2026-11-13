@@ -43,11 +43,10 @@ pub struct AppState {
     pub api_provider: Mutex<ApiProvider>,
     /// Custom endpoint URL for OpenAI-compatible providers
     pub custom_endpoint: Mutex<Option<String>>,
-    /// Cache of CHINIT ID→name maps keyed by file SHA-256. Lets every scene
-    /// load from the same game folder skip re-parsing CHINIT.BIN (an 80k+
-    /// instruction file). Hash-keyed so the cache invalidates automatically
-    /// if the user replaces CHINIT.BIN.
-    pub chinit_cache: Mutex<HashMap<String, HashMap<u32, String>>>,
+    /// Per-game speaker tables (name-table scripts, talk-key owners) keyed by game folder
+    /// + a change stamp (`engine::game_files_stamp`). Every scene of a game shares one
+    /// parse of CNINIT/CHINIT/INIT2/… (CHINIT alone can be 80k+ instructions).
+    pub speaker_tables: Mutex<HashMap<String, std::sync::Arc<crate::engine::GameSpeakerTables>>>,
 }
 
 impl AppState {
@@ -57,7 +56,7 @@ impl AppState {
             api_key: Mutex::new(None),
             api_provider: Mutex::new(ApiProvider::default()),
             custom_endpoint: Mutex::new(None),
-            chinit_cache: Mutex::new(HashMap::new()),
+            speaker_tables: Mutex::new(HashMap::new()),
         }
     }
 

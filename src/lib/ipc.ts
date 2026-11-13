@@ -9,6 +9,7 @@ import type {
   TranslationResult,
 } from "./types";
 import { resolveInsertionsForExport } from "./insertions";
+import { store } from "./stores.svelte";
 
 /** Load a BIN file and return extracted dialogue entries + metadata. */
 export function loadBin(tabId: string, path: string): Promise<LoadBinResult> {
@@ -64,6 +65,17 @@ export function parenteListArc(path: string): Promise<ParenteGameFile[]> {
 }
 
 /** Resolve the effective (latest) dialogue scenes across a whole game folder. */
+/** Saved Parente game language from CONFIG.DAT (1 = Japanese, 2 = English). */
+export function parenteGetGameLanguage(): Promise<number | null> {
+  return invoke<number | null>("parente_get_game_language");
+}
+
+/** Write the Parente game language into CONFIG.DAT (bypasses the crashing
+ *  in-game language button). Resolves to the one-time backup path. */
+export function parenteSetGameLanguage(lang: number): Promise<string> {
+  return invoke<string>("parente_set_game_language", { lang });
+}
+
 export function parenteListGame(dir: string): Promise<ParenteGameFile[]> {
   return invoke<ParenteGameFile[]>("parente_list_game", { dir });
 }
@@ -108,6 +120,26 @@ export function parenteExportFull(primaryArc: string, files: ParentePatchFile[],
   return invoke<number>("parente_export_full", { primaryArc, files, outPath });
 }
 
+/** Re-apply engine-level fixes (LTSINIT placeholders, drop crash-prone /
+ *  dead-weight bundles and entries identical to the official copy, re-stamp +
+ *  mark) to an already-exported patch arc — translations untouched.
+ *  Resolves to the number of entries dropped. */
+export function parenteUpgradePatch(patchArc: string): Promise<number> {
+  return invoke<number>("parente_upgrade_patch", { patchArc });
+}
+
+/** Redraw the dialogue font's English glyphs with the game's half-width M+ font
+ *  in START_Data (runtime fonts; one-time .pre-fontfix.bak backups). Resolves to
+ *  glyphs replaced. `gameDir` = game folder, its Start folder or START_Data. */
+export function parenteApplyFontFix(gameDir: string): Promise<number> {
+  return invoke<number>("parente_apply_font_fix", { gameDir });
+}
+
+/** Restore the original runtime fonts from the .pre-fontfix.bak backups. */
+export function parenteRevertFontFix(gameDir: string): Promise<void> {
+  return invoke<void>("parente_revert_font_fix", { gameDir });
+}
+
 /** Build a NON-DESTRUCTIVE English patch: English goes in slot 2 (Japanese
  *  preserved in slot 1), with `text`/`LangArray` patched so the game renders
  *  English where present and falls back to Japanese otherwise. Returns scenes
@@ -121,15 +153,18 @@ export function parenteSuggestedPatchPath(dir: string): Promise<string | null> {
   return invoke<string | null>("parente_suggested_patch_path", { dir });
 }
 
-/** Save a Parente scene's translation project (keyed per scene) so progress
- *  survives closing/reopening. */
-export function parenteSaveProject(key: string, content: string): Promise<void> {
-  return invoke<void>("parente_save_project", { key, content });
+/** Save a Parente scene's translation project into a visible "Parente Projects"
+ *  folder next to the game's .arc (`baseDir`), named after the scene. Falls back
+ *  to app-data if that folder is read-only. Progress survives closing/reopening. */
+export function parenteSaveProject(baseDir: string, name: string, content: string): Promise<void> {
+  return invoke<void>("parente_save_project", { baseDir, name, content });
 }
 
-/** Load a saved Parente scene project, or null if none exists. */
-export function parenteLoadProject(key: string): Promise<string | null> {
-  return invoke<string | null>("parente_load_project", { key });
+/** Load a saved Parente scene project, or null if none exists. Checks the new
+ *  `baseDir/Parente Projects/<name>.json` first, then the legacy app-data
+ *  location (`legacyKey`) for migration. */
+export function parenteLoadProject(baseDir: string, name: string, legacyKey: string): Promise<string | null> {
+  return invoke<string | null>("parente_load_project", { baseDir, name, legacyKey });
 }
 
 /** Load the BIN file for an existing project, verifying its hash. */
@@ -179,8 +214,9 @@ export function exportBin(
   outputPath: string,
   entries: DialogueEntry[],
   insertedInstructions: InsertedInstruction[]
-): Promise<void> {
-  return invoke("export_bin", {
+): Promise<string[]> {
+  // Resolves to the warn-only export-lint findings (editor/lint.rs).
+  return invoke<string[]>("export_bin", {
     tabId,
     outputPath,
     entries,
@@ -202,6 +238,18 @@ export interface FanpatchResult {
   skipped: string[];
   /** True if version.dll (the drop-in loader) was written next to the patch. */
   loader_written: boolean;
+  /** "<NAME>: <warning>" export-lint findings (warn-only; BINs were still written). */
+  lint_warnings: string[];
+  /** Files the text box profile added (system script + untranslated dialogue scenes). */
+  box_profile_files: number;
+}
+
+/** Text box profile (engine/box_profile.rs BoxProfile): move the body text up inside its
+ *  surface, grow the surface, set the ADV line spacing — same font size, more lines. */
+export interface BoxProfile {
+  liftPx: number;
+  growPx: number;
+  lineSpacing: number;
 }
 
 /**
@@ -209,14 +257,31 @@ export interface FanpatchResult {
  * version.dll fanpatch loader. Each item's insertions are resolved for export
  * exactly like {@link exportBin}, so ordering/continuation text stay correct.
  */
+/** Opt-in loader features bundled into a `.fanpatch` (commands.rs FanpatchFeatures). */
+export interface FanpatchFeatures {
+  /** Resizable, aspect-locked window + HQ upscaler. */
+  resizableWindow: boolean;
+  /** Developer menu + F2/F5/F6/F8/F11 hotkeys (testing builds). */
+  devMenu: boolean;
+  /** Crisp HD rendering (engine hi-res mode in the window + internal-resolution fallback). */
+  crispHd: boolean;
+  /** The engine wraps English at word boundaries (loader typewriter hook, SYS4). */
+  englishWordWrap: boolean;
+}
+
 export function exportFanpatch(
   items: FanpatchItem[],
   outputPath: string,
   title: string,
   label: string,
-  uiConfigPath: string
+  uiConfigPath: string,
+  features: FanpatchFeatures,
+  boxProfile: BoxProfile | null = null,
+  gameDirHint: string | null = null,
 ): Promise<FanpatchResult> {
   return invoke("export_fanpatch", {
+    boxProfile,
+    gameDirHint,
     items: items.map((it) => ({
       tabId: it.tabId,
       filename: it.filename,
@@ -227,6 +292,7 @@ export function exportFanpatch(
     title,
     label,
     uiConfigPath,
+    features,
   });
 }
 
@@ -239,9 +305,12 @@ export function packFanpatchFromDir(
   outputPath: string,
   title: string,
   label: string,
-  uiConfigPath: string
+  uiConfigPath: string,
+  features: FanpatchFeatures,
+  boxProfile: BoxProfile | null,
+  gameDirHint: string | null
 ): Promise<FanpatchResult> {
-  return invoke("pack_fanpatch_from_dir", { sourceDir, outputPath, title, label, uiConfigPath });
+  return invoke("pack_fanpatch_from_dir", { sourceDir, outputPath, title, label, uiConfigPath, features, boxProfile, gameDirHint });
 }
 
 /**
@@ -258,7 +327,8 @@ export function packDualLanguageFanpatch(
   outputPath: string,
   title: string,
   label: string,
-  uiConfigPath: string
+  uiConfigPath: string,
+  features: FanpatchFeatures
 ): Promise<FanpatchResult> {
   return invoke("pack_dual_language_fanpatch", {
     enDir,
@@ -269,6 +339,7 @@ export function packDualLanguageFanpatch(
     title,
     label,
     uiConfigPath,
+    features,
   });
 }
 
@@ -431,8 +502,10 @@ export function stopTranslation(tabId: string): Promise<void> {
 }
 
 /** Extract all referenced speaker pointers from the loaded BIN. */
-export function getReferencedSpeakers(tabId: string): Promise<CharacterEntry[]> {
-  return invoke<CharacterEntry[]>("get_referenced_speakers", { tabId });
+/** `gameDirHint`: the installed game, for scenes whose speakers are resolved through the
+ *  game's INIT tables (SYS4 talk keys) when the tab's BIN is a workspace copy. */
+export function getReferencedSpeakers(tabId: string, gameDirHint: string | null = store.lastSysGameDir): Promise<CharacterEntry[]> {
+  return invoke<CharacterEntry[]>("get_referenced_speakers", { tabId, gameDirHint });
 }
 
 /** Scan a BIN file for character definitions (set-string pairs). */
@@ -450,8 +523,14 @@ export interface SpeakerRef {
 }
 
 /** Get speaker references for each dialogue row from the loaded BIN. */
-export function getRowSpeakers(tabId: string): Promise<Record<string, SpeakerRef>> {
-  return invoke<Record<string, SpeakerRef>>("get_row_speakers", { tabId });
+/** Names for numeric speaker ids from the game's own name tables (CNINIT / CHINIT,
+ *  discovered per game). */
+export function resolveSpeakerNames(tabId: string, ids: number[], gameDirHint: string | null = store.lastSysGameDir): Promise<Record<string, string>> {
+  return invoke<Record<string, string>>("resolve_speaker_names", { tabId, ids, gameDirHint });
+}
+
+export function getRowSpeakers(tabId: string, gameDirHint: string | null = store.lastSysGameDir): Promise<Record<string, SpeakerRef>> {
+  return invoke<Record<string, SpeakerRef>>("get_row_speakers", { tabId, gameDirHint });
 }
 
 /** Instruction argument from the BIN file */
@@ -513,6 +592,8 @@ export function autoSplitEntry(
   lineCharCap: number,
   blockCharCap: number,
   maxLinesPerBox: number,
+  /** Bottom row of each box holds only this many chars (UI art); 0 = off. */
+  bottomLineCap: number,
 ): Promise<import("./types").SplitPlan> {
   return invoke<import("./types").SplitPlan>("auto_split_entry", {
     tabId,
@@ -521,6 +602,7 @@ export function autoSplitEntry(
     lineCharCap,
     blockCharCap,
     maxLinesPerBox,
+    bottomLineCap,
   });
 }
 
@@ -540,8 +622,11 @@ export function autoSplitEntriesBatch(
   tabId: string,
   items: SplitRequest[],
   lineCharCap: number,
+  maxLinesPerBox: number,
+  bottomLineCap: number,
+  engine: EngineSplit | null = null,
 ): Promise<SplitOutcome[]> {
-  return invoke<SplitOutcome[]>("auto_split_entries_batch", { tabId, items, lineCharCap });
+  return invoke<SplitOutcome[]>("auto_split_entries_batch", { tabId, items, lineCharCap, maxLinesPerBox, bottomLineCap, engine });
 }
 
 /** Get the bridge template quality for a tab's loaded BIN. */
@@ -553,6 +638,12 @@ export function getBridgeTemplateStatus(tabId: string): Promise<string> {
  *  group splits that need to cross a textbox boundary. */
 export function getBridgeClone(tabId: string): Promise<import("./types").SerializedInstruction[]> {
   return invoke<import("./types").SerializedInstruction[]>("get_bridge_clone", { tabId });
+}
+
+/** Semantic box-break bridge built from opcode semantics (no scene-specific
+ *  calls; available in every scene). See bridge.rs build_semantic_bridge. */
+export function getSemanticBridge(tabId: string, keepSpeakerPlate: boolean): Promise<import("./types").SerializedInstruction[]> {
+  return invoke<import("./types").SerializedInstruction[]>("get_semantic_bridge", { tabId, keepSpeakerPlate });
 }
 
 /** A term to send to the Claude CLI for glossary translation. */
@@ -726,9 +817,6 @@ export function relaunchTranslationFolder(folderPath: string): Promise<void> {
 /** Build a `character_id → name` map for a CHINIT-style init BIN by detecting
  *  its consecutive-register character table. Keys are decimal stringified IDs
  *  (serde quirk for integer-keyed maps). */
-export function extractChinitIdNameMap(binPath: string): Promise<Record<string, string>> {
-  return invoke<Record<string, string>>("extract_chinit_id_name_map", { binPath });
-}
 
 /** Per-folder translation progress entry from scan_translation_project_status. */
 export interface TranslationFolderStatus {
@@ -869,4 +957,138 @@ export function importTranslations(
     mode,
     entries,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Engine branding (SYS4 fanpatch title badge + boot splash) — engine/mod.rs
+// ---------------------------------------------------------------------------
+
+/** How a game's title can show a fanpatch badge (engine::branding::BadgePlan). */
+export type BadgePlan =
+  | { kind: "bannerArray"; arrayBase: number; insertAt: number; width: number; height: number }
+  | { kind: "tileRow"; insertAt: number; objectId: number; textureSlot: number; xLocal: number; y: number; width: number; height: number }
+  | { kind: "unsupported"; reason: string };
+
+/** Whether a game's boot logo can take one more splash (engine::branding::SplashPlan). */
+export type SplashPlan =
+  | { kind: "imageCycles"; textureSlot: number; lastLoad: number; cycleEnd: number; reveal: number; hide: number }
+  | { kind: "singleCycle"; textureSlot: number; reveal: number; revealObject: number; hide: number; hideObject: number; wait: number }
+  | { kind: "crossfadeCycles"; textureSlot: number; copy: number[]; load: number; insertAt: number }
+  | { kind: "unsupported"; reason: string };
+
+export interface BrandingProfile {
+  title: string;
+  build: string;
+  screenWidth: number;
+  screenHeight: number;
+  badge: BadgePlan;
+  splash: SplashPlan;
+}
+
+/** Identity, canvas size and supported branding for a SYS3/SYS4 game folder. */
+/** ADV body box of a game (engine/box_profile.rs BoxGeometry), canvas pixels. */
+export interface BoxGeometry {
+  /** Text surface (layout slot 1): glyphs are clipped at its edges. */
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  /** Text origin inside the surface. */
+  textX: number;
+  textY: number;
+  originPatchable: boolean;
+  fontPx: number;
+  lineSpacing: number;
+  spacingPatchable: boolean;
+}
+
+/** One text layout slot (engine/box_profile.rs TextSlot): 1 = ADV body, others =
+ *  speaker plate, history, UI, battle/info text. Canvas pixels. */
+export interface TextSlot {
+  slot: number;
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  textX: number;
+  textY: number;
+}
+
+/** One atlas rectangle the system script draws around the message box (engine/box_art.rs). */
+export interface BoxArtSprite {
+  texture: number;
+  srcX: number;
+  srcY: number;
+  width: number;
+  height: number;
+  dstX: number;
+  dstY: number;
+}
+
+/** An atlas bound to a texture slot, decoded to a PNG data URL. */
+export interface BoxAtlas {
+  texture: number;
+  name: string;
+  width: number;
+  height: number;
+  dataUrl: string;
+}
+
+/** Every text layout of a tab's game + the font its own BIN sets (engine/mod.rs TextLayout). */
+export interface TextLayout {
+  body: BoxGeometry;
+  slots: TextSlot[];
+  scriptFontPx: number | null;
+  scriptLineSpacing: number | null;
+  /** Message-window art (band, name-plate frame, buttons) in canvas pixels. */
+  art: BoxArtSprite[];
+  atlases: BoxAtlas[];
+  /** Installed game folder (key for per-game settings), when known. */
+  gameDir: string | null;
+  /** Body box of the base game (no .fanpatch): what a text box profile applies to. */
+  baseBody: BoxGeometry | null;
+  /** The engine's dialogue text metrics from the loader's fanpatch_layout.txt (word-wrap hook ran). */
+  metrics: EngineTextMetrics | null;
+}
+
+/** engine/text_metrics.rs EngineTextMetrics (px, message-window coordinates). */
+export interface EngineTextMetrics {
+  face: string;
+  fontHeight: number;
+  fontWidth: number;
+  weight: number;
+  advanceHalf: number;
+  advanceFull: number;
+  checkHalf: number;
+  checkFull: number;
+  rowLeft: number;
+  rowRight: number;
+}
+
+/** commands.rs EngineSplit: re-flow against the engine's own (word-wrapping) rows. */
+export interface EngineSplit {
+  metrics: EngineTextMetrics;
+  wordWrap: boolean;
+  rowsPerBox: number;
+  bottomCap: number;
+}
+
+/** Text layouts for a tab's game (rejects when the game folder can't be found). */
+export function engineTextLayout(tabId: string, gameDirHint: string | null): Promise<TextLayout> {
+  return invoke<TextLayout>("engine_text_layout", { tabId, gameDirHint });
+}
+
+export function engineInspectBranding(gameDir: string): Promise<BrandingProfile> {
+  return invoke<BrandingProfile>("engine_inspect_branding", { gameDir });
+}
+
+/** Write `zz_branding.fanpatch` into the game folder. Art = PNG data URLs
+ *  rendered by the UI at the profile's sizes. Resolves to the written path. */
+export function engineBuildBranding(gameDir: string, badgePng: string | null, splashPng: string | null): Promise<string> {
+  return invoke<string>("engine_build_branding", { gameDir, badgePng, splashPng });
+}
+
+/** Read an image file as a data URL (splash art picker). */
+export function engineReadImageDataUrl(path: string): Promise<string> {
+  return invoke<string>("engine_read_image_data_url", { path });
 }

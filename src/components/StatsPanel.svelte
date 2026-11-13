@@ -10,7 +10,7 @@
    */
   import { store } from "../lib/stores.svelte";
   import { hasTranslatableContent } from "../lib/exportOmit";
-  import { findOverflows, findBoxOverflows } from "../lib/overflow";
+  import { tabOverflowCounts } from "../lib/engineMode";
   import ResizeHandle from "./ResizeHandle.svelte";
   import { persistAllSettingsDebounced } from "../lib/settings";
 
@@ -30,7 +30,6 @@
   }
 
   let perTab = $derived.by<PerTab[]>(() => {
-    const lineCap = store.translatedLineCharCap;
     return store.tabs.map((tab, ti) => {
       // Parente (Unity-era) rows aren't AGE opcodes — they carry block labels,
       // not show-text/furigana/comment — so the EDITABLE label filter would
@@ -44,16 +43,12 @@
         total++;
         if (e.translated_text.trim().length > 0) done++;
       }
-      // Use findOverflows to match the "Review overflows" toolbar count
-      // exactly. It measures LINE-GROUP totals (show-text + display-furigana
-      // siblings between end-text-line opcodes), strips quote brackets and
-      // furigana annotations — same calc the in-game engine uses for width.
-      // Counting raw `translated_text.length` (the bug) over-reported by
-      // ~10–50× because every furigana annotation and bracket inflated it.
-      const overCap = lineCap > 0 ? findOverflows(tab.entries, lineCap).length : 0;
-      // Box overflows: a text box exceeding maxLinesPerBox or the per-box char
-      // cap (often a side effect of auto-split) — won't render fully in-game.
-      const boxOver = findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox).length;
+      // Same counts as the "Review overflows" button (engineMode.tabOverflowCounts):
+      // classic = line-group totals over the line cap + boxes over the per-box limits;
+      // engine word-wrap mode = boxes the engine can't show (no per-line overflows).
+      const counts = tabOverflowCounts(tab);
+      const overCap = counts.line;
+      const boxOver = counts.box;
       const resolved = tab.characters.filter((c) => c.name.length > 0).length;
       return {
         tabIndex: ti,

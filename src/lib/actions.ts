@@ -19,13 +19,14 @@ import {
   fileExists,
   scanBinForCharacters,
   getBridgeTemplateStatus,
+  getBridgeClone,
   exportForTranslation,
   getSplitCapability,
   autoSplitEntry,
   autoSplitEntriesBatch,
   importTranslations,
   lookupCharacterNamesForPointers,
-  extractChinitIdNameMap,
+  resolveSpeakerNames,
   readPriorTranslationMap,
   loadFolderGlossary,
   scanTranslationProjectStatus,
@@ -37,8 +38,14 @@ import {
   writeMultiTranslateLaunchers,
   parenteListArc,
   parenteListGame,
+  parenteGetGameLanguage,
+  parenteSetGameLanguage,
+  parenteUpgradePatch,
+  parenteApplyFontFix,
+  parenteRevertFontFix,
   parenteLoadGameEntry,
   parenteExportEnglish,
+  parenteExportFull,
   parenteSaveProject,
   parenteLoadProject,
   type TranslationRow,
@@ -47,11 +54,15 @@ import {
   type SysBinFile,
   type ParenteGameFile,
   type ParentePatchFile,
+  type FanpatchFeatures,
 } from "./ipc";
 import { isStructuralOnly, hasTranslatableContent } from "./exportOmit";
 import { isNameItemFile, isDialogueBin, isUiAbbreviation } from "./fileCategory";
 import { resolveInsertionsForExport } from "./insertions";
+import { relinkInsertedInstructions, repairScrambledBridges } from "./insertionRelink";
+import { parentePatchInstallHint, parentePatchSaveDefault, splitExportPath } from "./parentePatchPath";
 import { store } from "./stores.svelte";
+import { toastInfo, toastWarn } from "./toast";
 import type { CharacterEntry } from "./types";
 
 /** Fetch and cache bridge template quality for auto-split badge. */
@@ -62,6 +73,29 @@ async function fetchBridgeQuality(tab: TabState): Promise<void> {
   } catch {
     tab.bridgeTemplateQuality = "unavailable";
   }
+}
+
+/**
+ * After a project load + relink, rewrite any inserted box-bridge run whose args
+ * a legacy (scrambled) save permuted — see insertionRelink.ts. Needs the tab's
+ * BIN already loaded in Rust (for the bridge template). No template → no-op.
+ * Marks the tab dirty on repair so autosave persists the fixed project.
+ */
+async function repairScrambledBridgesOnLoad(tab: TabState): Promise<void> {
+  if (tab.insertedInstructions.length === 0) return;
+  let bridgeTemplate: import("./types").SerializedInstruction[];
+  try {
+    bridgeTemplate = await getBridgeClone(tab.id);
+  } catch {
+    return; // scene has no native bridge (nothing to compare against)
+  }
+  const repair = repairScrambledBridges(tab.entries, tab.insertedInstructions, bridgeTemplate);
+  if (repair.repairedRuns === 0) return;
+  tab.insertedInstructions = [...tab.insertedInstructions];
+  tab.isDirty = true;
+  const message = `Repaired ${repair.repairedRuns} scrambled box bridge(s) in ${tab.sourceBinFilename || "scene"} — re-export to fix in-game`;
+  console.warn(message, repair);
+  store.statusMessage = message;
 }
 
 /**
@@ -227,64 +261,27 @@ async function tryDirectPointerLookup(tab: import("./stores.svelte").TabState): 
 }
 
 /**
- * Third-pass character name resolution via CHINIT's consecutive-register
- * character table.
- *
- * Some characters (notably SYS4 NPCs and side-cast) appear in scene BINs as
- * small literal IDs (e.g. `mov g-int:0x37D0, lit:0x61`) that aren't a direct
- * address or a CVINIT/CIINIT-style ID. The engine resolves them at runtime by
- * indexing into a table CHINIT initializes via the pattern
- * `mov g-int:<R>, lit:<ID>` immediately followed by `set-string g-str:<A>,
- * str:"<name>"`. We extract that table once and use it to fill in any IDs the
- * first two passes missed.
- *
- * Additive only — never overrides an already-resolved name. Returns the count
- * of newly resolved names.
+ * Fill still-empty speaker names from the game's own name tables: the backend tries
+ * CNINIT (string table at base + stride·id) and CHINIT (ID register), discovered per
+ * game against this scene's ids. Works for workspace tabs via the last game folder.
+ * Additive only. Returns the count of newly resolved names.
  */
-async function tryChinitIdMapLookup(tab: import("./stores.svelte").TabState): Promise<number> {
-  if (!tab.binPath || tab.characters.length === 0) return 0;
+async function tryGameNameTables(tab: import("./stores.svelte").TabState): Promise<number> {
   const unresolved = tab.characters.filter((c) => !c.name && c.pointer < 0x10000);
-  if (unresolved.length === 0) return 0;
-
-  const normalized = tab.binPath.replace(/\\/g, "/");
-  const dir = normalized.substring(0, normalized.lastIndexOf("/"));
-  const binFilename = normalized.substring(normalized.lastIndexOf("/") + 1);
-
-  // ID→name tables in priority order: CHINIT (canonical for triplet/CVINIT
-  // games), then CNINIT/CIINIT — where `0x1D2` display-slot games (e.g. Megami
-  // Zero) store their character names in the SAME mov-lit-then-set-string pattern
-  // `extract_chinit_id_name_map` reads. For each, the `$N$` append variant takes
-  // precedence over base (appends add new characters / rebind base IDs).
-  const idTableCandidates = ["CHINIT.BIN", "CNINIT.BIN", "CIINIT.BIN"].flatMap(
-    (n) => getInitFilenameCandidates(binFilename, [n]),
-  );
-  const mergedMap: Record<string, string> = {};
-  // Iterate high-priority first; first write wins (so CHINIT, and append-over-base,
-  // are not overwritten by lower-priority tables).
-  for (const fn of idTableCandidates) {
-    const path = `${dir}/${fn}`;
-    if (!(await fileExists(path))) continue;
-    try {
-      const m = await extractChinitIdNameMap(path);
-      for (const [k, v] of Object.entries(m)) {
-        if (!(k in mergedMap)) mergedMap[k] = v;
-      }
-    } catch {
-      // skip unreadable file
-    }
+  if (unresolved.length === 0 || tab.format === "parente") return 0;
+  let names: Record<string, string>;
+  try {
+    names = await resolveSpeakerNames(tab.id, unresolved.map((c) => c.pointer));
+  } catch {
+    return 0;
   }
-  const map = mergedMap;
-  if (!map || Object.keys(map).length === 0) return 0;
-
   let resolved = 0;
   tab.characters = tab.characters.map((c) => {
     if (c.name) return c;
-    const name = map[String(c.pointer)];
-    if (name) {
-      resolved++;
-      return { ...c, name };
-    }
-    return c;
+    const name = names[String(c.pointer)];
+    if (!name) return c;
+    resolved++;
+    return { ...c, name };
   });
   return resolved;
 }
@@ -320,20 +317,56 @@ async function autoSaveTab(tab: TabState): Promise<boolean> {
   }
 }
 
-/** Auto-save all dirty tabs that have a projectPath. Called reactively on row/tab changes. */
-export async function doAutoSaveAll(): Promise<void> {
+// Autosave runs from a reactive $effect (every row/tab change) AND on app close.
+// With hundreds of Parente tabs, one click right after a bulk import can find
+// ALL of them dirty — draining that many saves back-to-back can starve the event
+// loop and, if a native dialog is open, hang the window. So: (1) never run two
+// passes at once — a re-fire mid-run just requests one more pass, and concurrent
+// callers (e.g. the close handler) await the SAME in-flight promise so nothing is
+// lost; (2) yield a macrotask between saves so the UI stays paintable.
+let autoSavePromise: Promise<void> | null = null;
+let autoSaveRerun = false;
+
+/** Yield a macrotask so a large dirty-tab batch can't block paint/input. */
+const yieldMacrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Auto-save all dirty tabs that have a save target. Non-reentrant; a re-fire
+ *  while running is coalesced into one follow-up pass. Returns the in-flight
+ *  promise so a caller that needs the drain complete (app close) can await it. */
+export function doAutoSaveAll(): Promise<void> {
+  if (autoSavePromise) {
+    autoSaveRerun = true;
+    return autoSavePromise;
+  }
+  autoSavePromise = (async () => {
+    try {
+      do {
+        autoSaveRerun = false;
+        await autoSaveAllOnce();
+      } while (autoSaveRerun);
+    } finally {
+      autoSavePromise = null;
+    }
+  })();
+  return autoSavePromise;
+}
+
+/** One pass: save every currently-dirty tab, yielding between each. */
+async function autoSaveAllOnce(): Promise<void> {
   // BIN tabs autosave to their project JSON next to the BIN.
   const dirtyTabs = store.tabs.filter((t) => t.format !== "parente" && t.isDirty && t.projectPath);
-  // Parente tabs autosave to a per-scene project in the app data dir.
+  // Parente tabs autosave to their per-scene project (co-located folder / app data).
   const dirtyParente = store.tabs.filter((t) => t.format === "parente" && t.isDirty && t.parenteArcPath);
   if (dirtyTabs.length === 0 && dirtyParente.length === 0) return;
 
   let savedCount = 0;
   for (const tab of dirtyTabs) {
     if (await autoSaveTab(tab)) savedCount++;
+    await yieldMacrotask();
   }
   for (const tab of dirtyParente) {
     if (await saveParenteProject(tab)) savedCount++;
+    await yieldMacrotask();
   }
   if (savedCount > 0) {
     const now = new Date();
@@ -341,10 +374,67 @@ export async function doAutoSaveAll(): Promise<void> {
   }
 }
 
-/** Stable per-scene key for a Parente tab's saved project. Keyed by scene
- *  path+name (stable across arc versions); sanitized for use as a filename. */
+/** LEGACY per-scene key for a Parente tab's saved project (app-data filename).
+ *  Kept only to migrate/read projects saved by older builds — new saves live in
+ *  a visible folder next to the .arc (see {@link parenteArcDir}). */
 function parenteProjectKey(tab: TabState): string {
   return `${tab.parentePath}/${tab.parenteName}`.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+
+/** Directory holding a Parente tab's source .arc — where its visible
+ *  "Parente Projects" folder lives. Empty string if the arc path is unknown
+ *  (caller then falls back to legacy app-data storage). */
+function parenteArcDir(tab: TabState): string {
+  const p = (tab.parenteArcPath ?? "").replace(/\\/g, "/");
+  const cut = p.lastIndexOf("/");
+  return cut === -1 ? "" : p.slice(0, cut);
+}
+
+// --- Parente project base-dir resolution ------------------------------------
+// Projects normally save into a visible "Parente Projects" folder next to the
+// game's .arc. Games under a read-only root (e.g. Program Files) can't create
+// that folder; for those the user is asked ONCE, at game-load time, for a
+// writable folder, remembered per game (`store.parenteProjectDirs`, persisted).
+//
+// CRITICAL: the SAVE path (`resolveParenteProjectBase`) is deliberately pure and
+// dialog-free. Autosave fires reactively on every row/tab-selection change
+// (App.svelte) — if it opened a native dialog it could race another open dialog
+// (e.g. an import file picker) and HANG the WebView. So resolution never prompts;
+// the one-time prompt lives in `ensureParenteProjectDir`, called only from the
+// user-initiated load flow.
+
+/** Base dir a Parente tab's project saves into: the per-game override if the user
+ *  chose one, else the co-located arc dir (the Rust save falls back to app-data
+ *  if that's read-only). Pure + synchronous — safe to call from autosave. Returns
+ *  "" only when the arc path is unknown. */
+function resolveParenteProjectBase(tab: TabState): string {
+  const gameKey = parenteArcDir(tab);
+  if (!gameKey) return "";
+  return store.parenteProjectDirs[gameKey] ?? gameKey;
+}
+
+/** Ask ONCE, at game-load time, where to save this game's Parente projects when
+ *  the game folder is read-only (the co-located "Parente Projects" can't be
+ *  created there). User-initiated only — NEVER call from autosave. Remembered per
+ *  game + persisted. No-op when the folder is writable or an override already
+ *  exists. `gameKey` is the arc directory (co-located target's parent). */
+async function ensureParenteProjectDir(gameKey: string): Promise<void> {
+  if (!gameKey || store.parenteProjectDirs[gameKey]) return;
+  let writable = false;
+  try {
+    writable = await isFolderWritable(gameKey);
+  } catch {
+    writable = false;
+  }
+  if (writable) return; // co-located folder works — no prompt needed
+  const picked = await open({
+    directory: true,
+    title: "This game's folder is read-only — choose a folder to save Parente translation projects (asked once)",
+  });
+  if (picked && typeof picked === "string") {
+    store.parenteProjectDirs = { ...store.parenteProjectDirs, [gameKey]: picked };
+    void import("./settings").then((m) => m.persistAllSettingsDebounced());
+  }
 }
 
 /** Persist a Parente tab's translations + notes to the app data dir. Clears the
@@ -366,7 +456,7 @@ export async function saveParenteProject(tab: TabState): Promise<boolean> {
           notes: e.notes,
         })),
     };
-    await parenteSaveProject(parenteProjectKey(tab), JSON.stringify(project));
+    await parenteSaveProject(resolveParenteProjectBase(tab), tab.parenteName, JSON.stringify(project));
     tab.isDirty = false;
     return true;
   } catch (err) {
@@ -379,7 +469,10 @@ export async function saveParenteProject(tab: TabState): Promise<boolean> {
  *  matched by ordinal (with original-text sanity check). */
 async function applyParenteProject(tab: TabState): Promise<void> {
   try {
-    const raw = await parenteLoadProject(parenteProjectKey(tab));
+    // Prefer the override folder if the user chose one for this game; never
+    // prompt on load (loading shouldn't pop a dialog). Rust still falls back to
+    // the legacy app-data location when neither has the project.
+    const raw = await parenteLoadProject(resolveParenteProjectBase(tab), tab.parenteName, parenteProjectKey(tab));
     if (!raw) return;
     const project = JSON.parse(raw) as {
       rows?: { ordinal: number; original?: string; translated?: string; notes?: string }[];
@@ -481,22 +574,12 @@ export async function doLoadBin(filePath: string): Promise<void> {
       tab.entries = project.entries;
       tab.glossary = project.glossary;
 
-      // Reconstruct _syntheticIndex links
-      const negativeEntries = project.entries.filter((e) => e.instruction_index < 0);
-      const usedIndices = new Set<number>();
-      for (const ins of project.inserted_instructions) {
-        const match = negativeEntries.find(
-          (e) =>
-            e.label === ins.label &&
-            e.opcode === ins.opcode &&
-            !usedIndices.has(e.instruction_index)
-        );
-        if (match) {
-          ins._syntheticIndex = match.instruction_index;
-          usedIndices.add(match.instruction_index);
-        }
-      }
+      // Relink inserted instructions to their visual rows (exact via persisted
+      // synthetic_index; legacy projects via reverse-group zip) — then repair any
+      // bridge runs a scrambled legacy save left with permuted args.
+      relinkInsertedInstructions(project.entries, project.inserted_instructions);
       tab.insertedInstructions = project.inserted_instructions;
+      await repairScrambledBridgesOnLoad(tab);
       tab.characters = project.characters || [];
 
       tab.binPath = filePath;
@@ -535,7 +618,7 @@ export async function doLoadBin(filePath: string): Promise<void> {
       // then by direct address lookup, then by CHINIT's ID-register table.
       await tryMergeInitNames(tab);
       await tryDirectPointerLookup(tab);
-      await tryChinitIdMapLookup(tab);
+      await tryGameNameTables(tab);
 
       try {
         tab.rowSpeakers = await getRowSpeakers(tab.id);
@@ -583,7 +666,7 @@ export async function doLoadBin(filePath: string): Promise<void> {
     // then direct address lookup, then CHINIT's ID-register table.
     const initResult = await tryMergeInitNames(tab);
     await tryDirectPointerLookup(tab);
-    await tryChinitIdMapLookup(tab);
+    await tryGameNameTables(tab);
 
     // Folder-level glossary: if <binDir>/glossary.json exists, merge its
     // entries into the tab's project glossary. Skips entries whose japanese
@@ -686,22 +769,12 @@ export async function doLoadProject(filePath: string): Promise<void> {
     tab.entries = project.entries;
     tab.glossary = project.glossary;
 
-    // Reconstruct _syntheticIndex links
-    const negativeEntries = project.entries.filter((e) => e.instruction_index < 0);
-    const usedIndices = new Set<number>();
-    for (const ins of project.inserted_instructions) {
-      const match = negativeEntries.find(
-        (e) =>
-          e.label === ins.label &&
-          e.opcode === ins.opcode &&
-          !usedIndices.has(e.instruction_index)
-      );
-      if (match) {
-        ins._syntheticIndex = match.instruction_index;
-        usedIndices.add(match.instruction_index);
-      }
-    }
+    // Relink inserted instructions to their visual rows (exact via persisted
+    // synthetic_index; legacy projects via reverse-group zip) — then repair any
+    // bridge runs a scrambled legacy save left with permuted args.
+    relinkInsertedInstructions(project.entries, project.inserted_instructions);
     tab.insertedInstructions = project.inserted_instructions;
+    await repairScrambledBridgesOnLoad(tab);
     tab.characters = project.characters || [];
 
     tab.binPath = binFilePath;
@@ -738,7 +811,7 @@ export async function doLoadProject(filePath: string): Promise<void> {
     // Fill in empty names from CVINIT/CNINIT/CIINIT, then by CHINIT's table.
     await tryMergeInitNames(tab);
     await tryDirectPointerLookup(tab);
-    await tryChinitIdMapLookup(tab);
+    await tryGameNameTables(tab);
 
     try {
       tab.rowSpeakers = await getRowSpeakers(tab.id);
@@ -832,6 +905,8 @@ export async function doOpenSysGameFolder(dir: string): Promise<boolean> {
     // (autosave/backups write next to the BIN and would otherwise fail).
     const writable = await isFolderWritable(dir);
     store.sysBinFolderRequest = { folder: dir, files, writable };
+    store.lastSysGameDir = dir;
+    void import("./settings").then((m) => m.persistAllSettingsDebounced());
     const scenes = files.filter((f) => f.category === "sc").length;
     const ro = writable ? "" : " — read-only folder, you'll choose a workspace";
     store.statusMessage = `${files.length} BIN file(s) found (${scenes} scene)${ro}.`;
@@ -998,6 +1073,13 @@ export async function doOpenSysBins(paths: string[]): Promise<void> {
 
 /** Load the chosen Parente scenes, each into its own tab. */
 export async function doLoadParenteEntries(files: ParenteGameFile[]): Promise<void> {
+  // Ask ONCE here (user-initiated load, never from autosave) where to save this
+  // game's projects if the game folder is read-only — so autosave stays fully
+  // dialog-free. Keyed by the first file's arc directory.
+  if (files.length > 0) {
+    const arcDir = files[0].arc_path.replace(/\\/g, "/").replace(/\/[^/]*$/, "");
+    await ensureParenteProjectDir(arcDir);
+  }
   if (files.length > 1) {
     store.loadingProgress = { current: 0, total: files.length, currentFile: "" };
   }
@@ -1018,7 +1100,7 @@ export async function doLoadParenteEntries(files: ParenteGameFile[]): Promise<vo
       tab.entries = load.entries;
       tab.sourceBinFilename = load.name;
       tab.binPath = null;
-      tab.projectPath = null; // no project persistence for parente tabs (yet)
+      tab.projectPath = null; // Parente persists via its own auto-save (saveParenteProject/applyParenteProject), not the SYS .json project path
       const speakers: Record<string, { source_type: number; source_raw_data: number; literal_name: string | null }> = {};
       const cast: { pointer: number; name: string }[] = [];
       const seenNames = new Set<string>();
@@ -1046,13 +1128,16 @@ export async function doLoadParenteEntries(files: ParenteGameFile[]): Promise<vo
   store.statusMessage = `Loaded ${files.length} scene file(s)`;
 }
 
-/** Export all Parente tabs as one FULL, NON-DESTRUCTIVE English ver999 patch:
+/** Export all Parente tabs as one FULL, NON-DESTRUCTIVE English patch arc:
  *  English is written into the engine's slot-2 language field (Japanese stays in
  *  slot 1), with text()/LangArray patched so the game renders English where
  *  present and falls back to Japanese otherwise. Rebuilds the current official
- *  patch archive into a complete ver999.arc — drop it in Patch and move the
- *  official ver10x archives out. */
-export async function doExportParenteTab(_tab: TabState): Promise<boolean> {
+ *  patch archive into a complete patch arc (any name) — drop it in Patch; its
+ *  export-time header timestamp outranks the official ver10x archives. */
+export async function doExportParenteTab(
+  _tab: TabState,
+  opts?: { destructive?: boolean },
+): Promise<boolean> {
   const tabs = store.tabs.filter((t) => t.format === "parente" && t.parenteArcPath);
   const files: ParentePatchFile[] = tabs
     .map((t) => ({
@@ -1072,49 +1157,192 @@ export async function doExportParenteTab(_tab: TabState): Promise<boolean> {
     return false;
   }
 
-  // The full patch is built by rebuilding the highest official patch archive
-  // present (the one in a "Patch" folder with the highest filename). The user
-  // must keep the official patch installed when translating so scenes resolve
-  // from it (and so we can rebuild it here).
+  // The patch is built on the highest official patch archive present (the one
+  // in a "Patch" folder with the highest filename; the editor's own TL patches
+  // are never sources). It only carries changed files, so the official patch
+  // must stay installed both while translating and when playing.
   const norm = (p: string) => p.replace(/\\/g, "/");
-  const patchSources = [...new Set(tabs.map((t) => norm(t.parenteArcPath!)))]
-    .filter((p) => /\/patch\//i.test(p))
-    .sort();
-  const primaryArc = patchSources[patchSources.length - 1];
+  const allSources = [...new Set(tabs.map((t) => norm(t.parenteArcPath!)))].sort();
+  const patchSources = allSources.filter((p) => /\/patch\//i.test(p));
+  // Prefer the highest official Patch archive; otherwise fall back to the
+  // highest-priority source archive (each scene already carries the effective
+  // arc it resolved from), so games without a literal "Patch" folder still export.
+  const primaryArc = patchSources[patchSources.length - 1] ?? allSources[allSources.length - 1];
   if (!primaryArc) {
     store.statusMessage =
-      "No official patch found to build on. Restore ver103_x1.arc in Start\\Archives\\Patch, reload via the game folder, then export.";
+      "No source archive found to build on. Reload the game via the game folder, then export.";
     return false;
   }
 
   // Default the save dialog to a WRITABLE location, not the game's
   // admin-protected Archives folder. Prefer the last folder the user exported
   // to; otherwise just a bare filename (dialog opens in its writable default).
-  const defaultPath = store.lastParenteExportDir
-    ? `${store.lastParenteExportDir}/ver999.arc`
-    : "ver999.arc";
-  const outputPath = await save({
-    filters: [{ name: "Eushully Archive", extensions: ["arc"] }],
-    defaultPath,
-  });
+  const outputPath = await pickParentePatchOutputPath();
   if (!outputPath) return false;
 
-  // Remember the chosen folder for next time.
-  const outDir = outputPath.replace(/\\/g, "/").replace(/\/[^/]*$/, "");
-  if (outDir) {
-    store.lastParenteExportDir = outDir;
-    void import("./settings").then((m) => m.persistAllSettingsDebounced());
-  }
-
+  // Destructive = write English directly into slot 1 (what the game always
+  // renders), so no in-game language toggle is needed — sidesteps the native
+  // LangNo==2 switch. Non-destructive = English in slot 2 + patched lang funcs.
+  const destructive = opts?.destructive === true;
   try {
-    store.statusMessage = `Building English patch from ${primaryArc.split("/").pop()}…`;
-    const changed = await parenteExportEnglish(primaryArc, files, outputPath);
+    store.statusMessage =
+      `Building ${destructive ? "English-replaces-Japanese" : "English"} patch from ${primaryArc.split("/").pop()}…`;
+    const changed = destructive
+      ? await parenteExportFull(primaryArc, files, outputPath)
+      : await parenteExportEnglish(primaryArc, files, outputPath);
     for (const t of tabs) t.isDirty = false;
     const outName = outputPath.replace(/\\/g, "/").split("/").pop();
+    const summary = destructive ? "English REPLACES Japanese" : "English in slot 2, JP fallback";
     store.statusMessage =
-      `Wrote ${outName} (${changed} scene${changed === 1 ? "" : "s"}; English in slot 2, JP fallback, ` +
-      `in-game language toggle enabled). Install: in Start\\Archives\\Patch, rename EVERY official ` +
-      `ver10x_x1.arc to .bak, leaving only ${outName}. In game: Config → language button (persists).`;
+      `Wrote ${outName} (${changed} scene${changed === 1 ? "" : "s"}; ${summary}). ` +
+      parentePatchInstallHint(outName ?? "the patch", destructive);
+    return true;
+  } catch (err) {
+    store.statusMessage = `Error building patch: ${err}`;
+    return false;
+  }
+}
+
+/**
+ * Build the final English patch archive from a folder of translated CC
+ * Translate projects, WITHOUT needing every scene open in a tab. Prompts for the
+ * CC-projects parent folder and the game folder, matches each subfolder's
+ * translation.json to a live scene by filename, imports each (dedup + cross-folder
+ * sibling duplicate resolution happens inside Rust), then builds the same
+ * non-destructive slot-2 English patch as {@link doExportParenteTab}.
+ */
+export async function doBuildParenteArcFromCcFolders(
+  opts?: { destructive?: boolean },
+): Promise<boolean> {
+  const destructive = opts?.destructive === true;
+  // 1. CC translation-projects parent folder.
+  const ccParent = await open({
+    directory: true,
+    title: "Choose the parent folder of CC translation subfolders",
+  });
+  if (!ccParent || typeof ccParent !== "string") return false;
+  const ccParentDir = ccParent;
+
+  // 2. Game folder — default to a currently-open Parente tab's game dir if any.
+  const openParenteTab = store.tabs.find((t) => t.format === "parente" && t.parenteArcPath);
+  const gameDefault = openParenteTab ? parenteArcDir(openParenteTab) : "";
+  const gamePick = await open({
+    directory: true,
+    title: "Select the game folder (containing Archives)",
+    defaultPath: gameDefault || undefined,
+  });
+  if (!gamePick || typeof gamePick !== "string") return false;
+  const gameDir = gamePick;
+
+  // 3. Effective scenes across the game (no tabs opened), keyed by scene name.
+  const scenes = await parenteListGame(gameDir);
+  if (scenes.length === 0) {
+    store.statusMessage = "No scenes found in that game folder.";
+    return false;
+  }
+  const sceneByName = new Map<string, ParenteGameFile>();
+  for (const scene of scenes) sceneByName.set(scene.name, scene);
+
+  // 4. CC translation subfolders.
+  const folders = await scanTranslationProjectStatus(ccParentDir);
+  if (folders.length === 0) {
+    store.statusMessage = "No translation.json files found.";
+    return false;
+  }
+
+  // 5. Import each folder against its freshly-loaded scene, collecting patch files.
+  const files: ParentePatchFile[] = [];
+  let matched = 0;
+  let unmatched = 0;
+  let errored = 0;
+  const unmatchedNames: string[] = [];
+  try {
+    for (let idx = 0; idx < folders.length; idx++) {
+      const folder = folders[idx];
+      store.loadingProgress = { current: idx, total: folders.length, currentFile: folder.folder };
+      if (folder.error) {
+        errored++;
+        continue;
+      }
+      const sceneFile = sceneByName.get(folder.source_bin);
+      if (!sceneFile) {
+        unmatched++;
+        unmatchedNames.push(folder.source_bin || folder.folder);
+        continue;
+      }
+      // One bad folder shouldn't abort the whole batch — count + continue.
+      try {
+        const load = await parenteLoadGameEntry(sceneFile);
+        const jsonPath = `${ccParentDir}/${folder.folder}/translation.json`;
+        // Empty hash = skip validation; overwrite = scenes are freshly loaded so
+        // there's nothing to preserve. Dedup + cross-folder siblings (resolved
+        // relative to jsonPath) are applied inside Rust here.
+        const result = await importTranslations(jsonPath, "", "overwrite", load.entries);
+        const translations = result.entries
+          .filter((e) => e.translated_text.trim() !== "")
+          .map((e) => [Number(e.instruction_index), e.translated_text] as [number, string]);
+        if (translations.length > 0) {
+          files.push({
+            arc_path: sceneFile.arc_path,
+            name: sceneFile.name,
+            path: sceneFile.path,
+            offset: sceneFile.offset,
+            size: sceneFile.size,
+            translations,
+          });
+          matched++;
+        }
+      } catch {
+        errored++;
+      }
+    }
+  } finally {
+    store.loadingProgress = null;
+  }
+
+  if (files.length === 0) {
+    store.statusMessage = "No matching translated scenes to export.";
+    return false;
+  }
+
+  // 6. Primary arc: SAME relaxed logic as doExportParenteTab, derived from the
+  // collected patch files' arc paths — prefer the highest official "Patch" arc,
+  // else the highest-priority source arc.
+  const norm = (p: string) => p.replace(/\\/g, "/");
+  const allSources = [...new Set(files.map((f) => norm(f.arc_path)))].sort();
+  const patchSources = allSources.filter((p) => /\/patch\//i.test(p));
+  const primaryArc = patchSources.at(-1) ?? allSources.at(-1);
+  if (!primaryArc) {
+    store.statusMessage =
+      "No source archive found to build on. Reload the game via the game folder, then export.";
+    return false;
+  }
+
+  // 7. Save dialog — default to the last writable export folder, not the game's
+  // admin-protected Archives folder.
+  const outputPath = await pickParentePatchOutputPath();
+  if (!outputPath) return false;
+
+  // 8. Build the patch (destructive = English replaces Japanese, no toggle).
+  try {
+    store.statusMessage =
+      `Building ${destructive ? "English-replaces-Japanese" : "English"} patch from ${primaryArc.split("/").pop()}…`;
+    const changed = destructive
+      ? await parenteExportFull(primaryArc, files, outputPath)
+      : await parenteExportEnglish(primaryArc, files, outputPath);
+    const outName = outputPath.replace(/\\/g, "/").split("/").pop();
+    const tally =
+      `${matched} folder${matched === 1 ? "" : "s"} matched` +
+      (unmatched > 0 ? `, ${unmatched} unmatched` : "") +
+      (errored > 0 ? `, ${errored} errored` : "");
+    const summary = destructive ? "English REPLACES Japanese" : "English in slot 2, JP fallback";
+    let msg =
+      `Wrote ${outName} (${changed} scene${changed === 1 ? "" : "s"}; ${tally}; ${summary}). ` +
+      parentePatchInstallHint(outName ?? "the patch", destructive);
+    if (unmatchedNames.length > 0) {
+      msg += ` Unmatched: ${unmatchedNames.slice(0, 3).join(", ")}${unmatchedNames.length > 3 ? "…" : ""}`;
+    }
+    store.statusMessage = msg;
     return true;
   } catch (err) {
     store.statusMessage = `Error building patch: ${err}`;
@@ -1209,22 +1437,12 @@ export async function doLoadProjectFolders(): Promise<void> {
       tab.entries = project.entries;
       tab.glossary = project.glossary;
 
-      // Reconstruct _syntheticIndex links
-      const negativeEntries = project.entries.filter((e) => e.instruction_index < 0);
-      const usedIndices = new Set<number>();
-      for (const ins of project.inserted_instructions) {
-        const match = negativeEntries.find(
-          (e) =>
-            e.label === ins.label &&
-            e.opcode === ins.opcode &&
-            !usedIndices.has(e.instruction_index)
-        );
-        if (match) {
-          ins._syntheticIndex = match.instruction_index;
-          usedIndices.add(match.instruction_index);
-        }
-      }
+      // Relink inserted instructions to their visual rows (exact via persisted
+      // synthetic_index; legacy projects via reverse-group zip) — then repair any
+      // bridge runs a scrambled legacy save left with permuted args.
+      relinkInsertedInstructions(project.entries, project.inserted_instructions);
       tab.insertedInstructions = project.inserted_instructions;
+      await repairScrambledBridgesOnLoad(tab);
       tab.characters = project.characters || [];
 
       try {
@@ -1302,11 +1520,20 @@ export async function doSaveAllProjects(): Promise<number> {
 export async function doExportAllBins(): Promise<number> {
   if (store.tabs.length === 0) return 0;
 
+  // Parente tabs rebuild a single .arc, not per-tab BINs. If every open tab is
+  // Parente, delegate to the arc builder — otherwise this BIN-export loop throws
+  // on each (no BIN state) and silently reports "Exported 0". (Belt-and-suspenders:
+  // the toolbar already routes Parente straight to doExportBin.)
+  if (store.tabs.every((t) => t.format === "parente")) {
+    return (await doExportParenteTab(store.tabs[0])) ? 1 : 0;
+  }
+
   const selected = await open({ directory: true, title: "Select folder to export BINs" });
   if (!selected) return 0;
   const outputDir = selected;
 
   let exportedCount = 0;
+  const allLintWarnings: string[] = [];
   for (const tab of store.tabs) {
     try {
       const outPath = `${outputDir}/${tab.sourceBinFilename.replace(/\.BIN$/i, "_translated.BIN")}`;
@@ -1314,7 +1541,8 @@ export async function doExportAllBins(): Promise<number> {
       // Pass FULL entries (incl. negative-index continuation rows): exportBin's
       // resolveInsertionsForExport needs them for insertion ordering (_visualOrder)
       // and continuation-row text sync. Rust's apply_changes skips negatives.
-      await exportBin(tab.id, outPath, tab.entries, tab.insertedInstructions);
+      const lintWarnings = await exportBin(tab.id, outPath, tab.entries, tab.insertedInstructions);
+      allLintWarnings.push(...lintWarnings.map((w) => `: `));
       exportedCount++;
     } catch (err) {
       store.statusMessage = `Error exporting ${tab.sourceBinFilename}: ${err}`;
@@ -1322,6 +1550,7 @@ export async function doExportAllBins(): Promise<number> {
   }
 
   store.statusMessage = `Exported ${exportedCount} of ${store.tabs.length} BIN files`;
+  reportExportLint(allLintWarnings);
   return exportedCount;
 }
 
@@ -1399,7 +1628,8 @@ export async function doExportBin(): Promise<boolean> {
           store.statusMessage = "Exporting BIN...";
           // Full entries (incl. negative continuation rows) — see exportBin note;
           // resolveInsertionsForExport needs them for ordering + text sync.
-          await exportBin(tab.id, outputPath, tab.entries, tab.insertedInstructions);
+          const lintWarnings = await exportBin(tab.id, outputPath, tab.entries, tab.insertedInstructions);
+          reportExportLint(lintWarnings);
           // Count display-furigana entries that apply.rs converts to show-text
           // (prose translation, no "[reading]" suffix) — mirror its condition so
           // the status surfaces the change; entries kept as ruby are excluded.
@@ -1454,13 +1684,35 @@ export async function doExportFanpatchFromTabs(): Promise<boolean> {
       outputPath,
       store.fanpatchTitle,
       store.fanpatchLabel,
-      store.fanpatchUiConfigPath
+      store.fanpatchUiConfigPath,
+      fanpatchFeatures(),
+      ...exportBoxProfile(binTabs),
     );
     return reportFanpatchResult(result, outputPath);
   } catch (err) {
     store.statusMessage = `Error exporting fanpatch: ${err}`;
     return false;
   }
+}
+
+/**
+ * The enabled text box profile for the exported tabs' game: [profile, game folder], or
+ * [null, null]. The game comes from the first tab whose text layout knows it.
+ */
+function exportBoxProfile(tabs: TabState[]): [import("./ipc").BoxProfile | null, string | null] {
+  const gameDir = tabs.map((t) => store.textLayoutByTab[t.id]?.gameDir).find((d): d is string => !!d) ?? store.lastSysGameDir;
+  const entry = gameDir ? store.boxProfiles[gameDir] : undefined;
+  return entry?.enabled && gameDir ? [entry.profile, gameDir] : [null, null];
+}
+
+/** Box profile for a folder export: the enabled profile of the game folder that contains
+ *  `sourceDir`, else the one the tab export would use. */
+function folderExportBoxProfile(sourceDir: string): [import("./ipc").BoxProfile | null, string | null] {
+  const normalize = (path: string) => path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() + "/";
+  const source = normalize(sourceDir);
+  const owner = Object.entries(store.boxProfiles).find(([gameDir]) => source.startsWith(normalize(gameDir)));
+  if (owner) return owner[1].enabled ? [owner[1].profile, owner[0]] : [null, null];
+  return exportBoxProfile(store.tabs);
 }
 
 /**
@@ -1479,12 +1731,16 @@ export async function doPackFanpatchFromFolder(): Promise<boolean> {
 
   store.statusMessage = "Packaging folder into .fanpatch…";
   try {
+    const [boxProfile, gameDirHint] = folderExportBoxProfile(sourceDir);
     const result = await packFanpatchFromDir(
       sourceDir,
       outputPath,
       store.fanpatchTitle,
       store.fanpatchLabel,
-      store.fanpatchUiConfigPath
+      store.fanpatchUiConfigPath,
+      fanpatchFeatures(),
+      boxProfile,
+      gameDirHint
     );
     return reportFanpatchResult(result, outputPath);
   } catch (err) {
@@ -1528,7 +1784,8 @@ export async function doPackDualLanguageFanpatch(bilingual: boolean): Promise<bo
       outputPath,
       store.fanpatchTitle,
       store.fanpatchLabel,
-      store.fanpatchUiConfigPath
+      store.fanpatchUiConfigPath,
+      fanpatchFeatures()
     );
     return reportFanpatchResult(result, outputPath);
   } catch (err) {
@@ -1537,12 +1794,139 @@ export async function doPackDualLanguageFanpatch(bilingual: boolean): Promise<bo
   }
 }
 
+/**
+ * Surface warn-only export-lint findings (editor/lint.rs): one toast with the
+ * count + first finding, full list in the console. The file was still written.
+ */
+function reportExportLint(warnings: string[]): void {
+  if (warnings.length === 0) return;
+  console.warn("Export lint warnings:", warnings);
+  const more = warnings.length > 1 ? ` (+${warnings.length - 1} more — see console)` : "";
+  toastWarn(`Export check: ${warnings[0]}${more}`, 12000);
+}
+
+/**
+ * Re-apply the engine-level fixes to an existing patch arc (no scene re-export):
+ * LTSINIT "Non" fill, drop obsolete bundles + entries identical to the official
+ * copy (slims old full-size exports), and re-stamp the header timestamp so it
+ * outranks the official patches. Writes in place after keeping a
+ * one-time `.pre-upgrade.bak` copy.
+ */
+export async function doUpgradeParentePatch(): Promise<boolean> {
+  const picked = await open({
+    title: "Select the exported Parente patch (.arc)",
+    filters: [{ name: "Parente patch", extensions: ["arc"] }],
+  });
+  if (!picked || Array.isArray(picked)) return false;
+  try {
+    store.statusMessage = "Upgrading patch (engine fixes)…";
+    const dropped = await parenteUpgradePatch(picked);
+    toastInfo(`Patch upgraded (${dropped} redundant entr${dropped === 1 ? "y" : "ies"} removed). Original kept as .pre-upgrade.bak`);
+    store.statusMessage = `Upgraded ${picked}`;
+    return true;
+  } catch (err) {
+    toastWarn(`Upgrade failed: ${err}`);
+    return false;
+  }
+}
+
+/**
+ * Save dialog for a Parente patch arc. Defaults to the last export folder +
+ * last patch name (versioned, e.g. "moist English TL v1.0.arc" — the game ranks
+ * arcs by header timestamp, not name) and remembers both for next time.
+ */
+async function pickParentePatchOutputPath(): Promise<string | null> {
+  const outputPath = await save({
+    filters: [{ name: "Eushully Archive", extensions: ["arc"] }],
+    defaultPath: parentePatchSaveDefault(store.lastParenteExportDir, store.lastParenteExportName),
+  });
+  if (!outputPath) return null;
+  const { folder, fileName } = splitExportPath(outputPath);
+  if (folder) store.lastParenteExportDir = folder;
+  store.lastParenteExportName = fileName;
+  void import("./settings").then((m) => m.persistAllSettingsDebounced());
+  return outputPath;
+}
+
+/** Loader features to bundle into every exported `.fanpatch` (Settings). */
+function fanpatchFeatures(): FanpatchFeatures {
+  return { resizableWindow: store.fanpatchResizableWindow, devMenu: store.fanpatchDevMenu, crispHd: store.fanpatchCrispHd, englishWordWrap: store.fanpatchWordWrap };
+}
+
+/** Pick the Parente game folder (or its Start / START_Data folder). */
+async function pickParenteGameDir(title: string): Promise<string | null> {
+  const picked = await open({ directory: true, title });
+  return !picked || Array.isArray(picked) ? null : picked;
+}
+
+/**
+ * Apply the monospace dialogue font: Parente's message window puts every English
+ * letter in a fixed half-width cell, so its proportional Noto glyphs look uneven.
+ * Redraws the RUNTIME font's ASCII glyphs (START_Data/sharedassets0.assets) with
+ * the game's own half-width M+ font. Close the game first. Verified in-game.
+ */
+export async function doApplyParenteFontFix(): Promise<boolean> {
+  const dir = await pickParenteGameDir("Select the Parente game folder (font fix)");
+  if (!dir) return false;
+  try {
+    const glyphs = await parenteApplyFontFix(dir);
+    toastInfo(`Dialogue font fixed (${glyphs} glyphs). Originals kept as .pre-fontfix.bak`);
+    store.statusMessage = `Font fix applied in ${dir}`;
+    return true;
+  } catch (err) {
+    toastWarn(`Font fix failed: ${err}`);
+    return false;
+  }
+}
+
+/** Restore the game's original dialogue font from the .pre-fontfix.bak backups. */
+export async function doRevertParenteFontFix(): Promise<boolean> {
+  const dir = await pickParenteGameDir("Select the Parente game folder (restore font)");
+  if (!dir) return false;
+  try {
+    await parenteRevertFontFix(dir);
+    toastInfo("Original dialogue font restored.");
+    return true;
+  } catch (err) {
+    toastWarn(`Restore failed: ${err}`);
+    return false;
+  }
+}
+
+/** Parente language ids as stored in CONFIG.DAT (global_config.txt). */
+export const PARENTE_LANGUAGE = { japanese: 1, english: 2 } as const;
+
+/**
+ * Set Parente's saved language directly in CONFIG.DAT. The in-game language
+ * button crashes (NullReferenceException in ui_allmap.UpdateString), freezing
+ * input; the engine honours the saved value on next launch instead. Close the
+ * game first — it rewrites CONFIG.DAT on exit.
+ */
+export async function doSetParenteGameLanguage(lang: number): Promise<boolean> {
+  const name = lang === PARENTE_LANGUAGE.english ? "English" : "Japanese";
+  try {
+    const current = await parenteGetGameLanguage();
+    if (current === lang) {
+      toastInfo(`Game language is already ${name}.`);
+      return true;
+    }
+    const backup = await parenteSetGameLanguage(lang);
+    store.statusMessage = `Game language set to ${name} — launch the game (don't use the in-game language button). Backup: ${backup}`;
+    toastInfo(`Game language set to ${name}. Launch the game normally.`);
+    return true;
+  } catch (err) {
+    toastWarn(`Couldn't set game language: ${err}`);
+    return false;
+  }
+}
+
 /** Shared status reporting for the two .fanpatch builders. */
 function reportFanpatchResult(
-  result: { written: number; skipped: string[]; loader_written: boolean },
+  result: { written: number; skipped: string[]; loader_written: boolean; lint_warnings?: string[]; box_profile_files?: number },
   outputPath: string
 ): boolean {
   const name = outputPath.replace(/\\/g, "/").split("/").pop();
+  reportExportLint(result.lint_warnings ?? []);
   if (result.skipped.length > 0) {
     console.warn("Fanpatch skipped entries:", result.skipped);
   }
@@ -1553,7 +1937,8 @@ function reportFanpatchResult(
   // version.dll + README are written alongside so it's a complete drop-in.
   const loader = result.loader_written ? " + version.dll" : " (⚠ version.dll not written — see console)";
   const skip = result.skipped.length > 0 ? ` — ${result.skipped.length} skipped (see console)` : "";
-  store.statusMessage = `Exported ${result.written} BIN(s)${loader} to ${name}${skip}. Drop both into the game folder.`;
+  const profile = result.box_profile_files ? ` + text box profile (${result.box_profile_files} system/scene files)` : "";
+  store.statusMessage = `Exported ${result.written} BIN(s)${profile}${loader} to ${name}${skip}. Drop both into the game folder.`;
   return true;
 }
 
@@ -1879,7 +2264,20 @@ export async function bulkAutoSplitActiveTab(
 ): Promise<{ split: number; failed: number; errors: string[] }> {
   const out = { split: 0, failed: 0, errors: [] as string[] };
   const tab = store.activeTab;
-  if (!tab || store.translatedLineCharCap <= 0) return out;
+  if (!tab) return out;
+
+  // Engine box mode: the engine wraps rows itself — split only boxes that don't fit, into
+  // more boxes (never 0x6F lines).
+  const { engineBoxRulesFor, engineMetricsFor } = await import("./engineMode");
+  const engineRules = engineBoxRulesFor(tab);
+  const engineMetrics = engineMetricsFor(tab);
+  if (engineRules && engineMetrics) {
+    const { findEngineBoxOverflows } = await import("./engineOverflow");
+    const ids = findEngineBoxOverflows(tab.entries, engineRules).filter((b) => b.singleText).map((b) => b.id);
+    const r = await engineSplitEntries(tab, ids, engineMetrics, engineRules.rowsPerBox, engineRules.bottomCap);
+    return { split: r.split, failed: ids.length - r.split, errors: r.errors };
+  }
+  if (store.translatedLineCharCap <= 0) return out;
 
   const { findOverflows, entryDisplayLength } = await import("./overflow");
   const { applySplitPlan, splitOverflowingGroup } = await import("./insertions");
@@ -1909,17 +2307,19 @@ export async function bulkAutoSplitActiveTab(
   if (reqs.length > 0) {
     let outcomes: import("./ipc").SplitOutcome[];
     try {
-      outcomes = await autoSplitEntriesBatch(tab.id, reqs, cap);
+      outcomes = await autoSplitEntriesBatch(tab.id, reqs, cap, store.maxLinesPerBox, store.bottomLineCharCap);
     } catch (err) {
       out.failed += reqs.length;
       if (out.errors.length < 3) out.errors.push(`batch: ${err}`);
       outcomes = [];
     }
+    const { splitBoxBridge } = await import("./insertions");
+    const boxBridge = outcomes.some((o) => o.plan) ? await splitBoxBridge(tab.id) : undefined;
     for (let i = 0; i < outcomes.length; i++) {
       onProgress?.(i + 1, outcomes.length);
       const o = outcomes[i];
       if (o.plan) {
-        const r = applySplitPlan(o.plan);
+        const r = applySplitPlan(o.plan, boxBridge);
         if (typeof r === "string") {
           out.failed++;
           if (out.errors.length < 3) out.errors.push(`#${o.entry_index}: ${r}`);
@@ -1998,58 +2398,59 @@ export async function bulkAutoSplitAllTabs(
  * action, this switches the active tab transiently (paginateBox uses per-tab
  * state) and restores it. Returns aggregated totals.
  */
+/**
+ * The box-transition bridge for `tab` (or why there is none). Native/semantic per the
+ * user's mode; a scene without a native bridge (e.g. MZ event scenes) borrows a
+ * CALL-FREE box-open from another open scene: control flow (call 0x8F / jmp 0x8C /
+ * jcc 0xA0) is stripped since its address args are scene-specific; the remaining
+ * box-state + box-open opcodes carry no addresses (verified in-game on MZ SC0740/SC0750).
+ */
+async function resolveBoxBridge(tab: TabState): Promise<import("./types").SerializedInstruction[] | string> {
+  const { fetchBoxBridge } = await import("./insertions");
+  const { getBridgeClone } = await import("./ipc");
+  const q = tab.bridgeTemplateQuality;
+  if (store.boxBridgeMode === "semantic" || q === "clean" || q === "degraded") {
+    try {
+      return await fetchBoxBridge(tab.id);
+    } catch (err) {
+      return `No box bridge: ${err}`;
+    }
+  }
+  const donor = store.tabs.find(
+    (t) => t.id !== tab.id && (t.bridgeTemplateQuality === "clean" || t.bridgeTemplateQuality === "degraded"),
+  );
+  if (!donor) return "No box bridge in this scene; open a scene that paginates in another tab to borrow one.";
+  let bridge: import("./types").SerializedInstruction[];
+  try {
+    bridge = (await getBridgeClone(donor.id)).filter((i) => i.opcode !== 0x8f && i.opcode !== 0x8c && i.opcode !== 0xa0);
+  } catch (err) {
+    return `borrowed bridge: ${err}`;
+  }
+  return bridge.some((i) => i.opcode === 0x1f5) ? bridge : "borrowed bridge had no box-open after stripping control-flow.";
+}
+
 export async function bulkPaginateActiveTab(): Promise<{ paginated: number; errors: string[] }> {
   const out = { paginated: 0, errors: [] as string[] };
   const tab = store.activeTab;
   if (!tab || store.maxLinesPerBox < 1) return out;
   const { findBoxOverflows } = await import("./overflow");
   const { paginateBoxWithBridge } = await import("./insertions");
-  const { getBridgeClone } = await import("./ipc");
-  const boxes = findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox)
-    .filter((b) => b.tooManyLines)
+  const boxes = findBoxOverflows(tab.entries, store.translatedCharCap, store.maxLinesPerBox, store.bottomLineCharCap)
+    .filter((b) => b.tooManyLines || b.bottomLineTooLong)
     .sort((a, b) => b.index - a.index); // back-to-front so indices stay valid
   if (boxes.length === 0) return out;
   // Resolve the box-transition bridge ONCE (not per box), then paginate
   // synchronously (Svelte coalesces every insert into one repaint).
-  let bridge: import("./types").SerializedInstruction[];
-  const q = tab.bridgeTemplateQuality;
-  if (q === "clean" || q === "degraded") {
-    try {
-      bridge = await getBridgeClone(tab.id);
-    } catch (err) {
-      out.errors.push(`No box bridge: ${err}`);
-      return out;
-    }
-  } else {
-    // This scene has no native bridge (e.g. MZ event scenes). Borrow a CALL-FREE
-    // box-open from another open scene: strip control-flow (call 0x8F / jmp 0x8C /
-    // jcc 0xA0) whose address args are scene-specific and would mis-resolve here.
-    // The remaining box-state + box-open opcodes carry no addresses → safe to
-    // clone. Verified in-game on MZ SC0740/SC0750 (clean box, no crash).
-    const donor = store.tabs.find(
-      (t) => t.id !== tab.id && (t.bridgeTemplateQuality === "clean" || t.bridgeTemplateQuality === "degraded"),
-    );
-    if (!donor) {
-      out.errors.push("No box bridge in this scene; open a scene that paginates in another tab to borrow one.");
-      return out;
-    }
-    try {
-      bridge = (await getBridgeClone(donor.id)).filter(
-        (i) => i.opcode !== 0x8f && i.opcode !== 0x8c && i.opcode !== 0xa0,
-      );
-    } catch (err) {
-      out.errors.push(`borrowed bridge: ${err}`);
-      return out;
-    }
-    if (!bridge.some((i) => i.opcode === 0x1f5)) {
-      out.errors.push("borrowed bridge had no box-open after stripping control-flow.");
-      return out;
-    }
+  const resolved = await resolveBoxBridge(tab);
+  if (typeof resolved === "string") {
+    out.errors.push(resolved);
+    return out;
   }
+  const bridge = resolved;
   for (const box of boxes) {
     const startEntry = tab.entries[box.index];
     if (!startEntry) continue;
-    const r = paginateBoxWithBridge(startEntry, store.maxLinesPerBox, bridge);
+    const r = paginateBoxWithBridge(startEntry, store.maxLinesPerBox, bridge, [], store.bottomLineCharCap);
     if (typeof r === "number" && r > 0) out.paginated++;
     else if (typeof r === "string" && !r.includes("already fits")) {
       if (out.errors.length < 5) out.errors.push(r);
@@ -2100,6 +2501,11 @@ export async function reflowActiveTab(
   const { revertAllAutoSplits } = await import("./insertions");
   store.translatedLineCharCap = lineCharCap;
   store.maxLinesPerBox = maxLinesPerBox;
+  store.translatedCharCap = lineCharCap * maxLinesPerBox; // box total follows the box shape
+  const { engineMetricsFor, ensureTextLayout } = await import("./engineMode");
+  await ensureTextLayout(store.activeTab); // tabs never shown yet (re-flow all tabs)
+  const engine = engineMetricsFor(store.activeTab);
+  if (engine) return reflowActiveTabEngine(engine, maxLinesPerBox);
   const rev = revertAllAutoSplits();
   const wrap = await bulkAutoSplitActiveTab();
   const pag = await bulkPaginateActiveTab();
@@ -2109,6 +2515,101 @@ export async function reflowActiveTab(
     paginated: pag.paginated,
     errors: [...rev.errors, ...wrap.errors, ...pag.errors],
   };
+}
+
+/**
+ * Re-flow the active tab for an engine that wraps rows itself (loader word-wrap hook):
+ * revert every split, then split only texts that don't fit ONE engine-wrapped box into
+ * balanced box texts (wrap.rs engine_boxes, bottom row within the button cap) and open a
+ * box per text. No line breaks are inserted inside a box.
+ */
+async function reflowActiveTabEngine(
+  metrics: import("./ipc").EngineTextMetrics,
+  rowsPerBox: number,
+): Promise<{ reverted: number; split: number; paginated: number; errors: string[] }> {
+  const { revertAllAutoSplits } = await import("./insertions");
+  const { engineBoxFits } = await import("./gameLayout");
+  const out = { reverted: 0, split: 0, paginated: 0, errors: [] as string[] };
+  const tab = store.activeTab;
+  if (!tab) return out;
+  const rev = revertAllAutoSplits();
+  out.reverted = rev.reverted;
+  out.errors.push(...rev.errors);
+  const bottomCap = store.bottomLineCharCap;
+  const ids = tab.entries
+    .filter((e) => e.label === "show-text" && !e.deleted && !e.is_context_row && e.instruction_index >= 0)
+    .filter((e) => e.translated_text.trim() !== "" && !engineBoxFits(e.translated_text, metrics, true, rowsPerBox, bottomCap))
+    .map((e) => e.instruction_index);
+  const split = await engineSplitEntries(tab, ids, metrics, rowsPerBox, bottomCap);
+  out.split = split.split;
+  out.paginated = split.paginated;
+  out.errors.push(...split.errors);
+  return out;
+}
+
+/**
+ * Split show-text entries (by instruction_index) into balanced engine boxes (wrap.rs
+ * engine_boxes: word boundaries, bottom row within `bottomCap`) and open a box per box
+ * text. Used by engine re-flow and the overflow review's "Split into boxes".
+ * `tab` must be the ACTIVE tab: the insert helpers (applySplitPlan, paginateBoxWithBridge)
+ * edit store.activeTab, so another tab's instruction indices would hit the wrong BIN.
+ */
+export async function engineSplitEntries(
+  tab: TabState,
+  instructionIds: number[],
+  metrics: import("./ipc").EngineTextMetrics,
+  rowsPerBox: number,
+  bottomCap: number,
+): Promise<{ split: number; paginated: number; errors: string[] }> {
+  const { applySplitPlan, paginateBoxWithBridge } = await import("./insertions");
+  const out = { split: 0, paginated: 0, errors: [] as string[] };
+  if (tab !== store.activeTab) {
+    out.errors.push(`${tab.sourceBinFilename || tab.id}: not the active tab — split skipped`);
+    return out;
+  }
+  const wanted = new Set(instructionIds);
+  const reqs: import("./ipc").SplitRequest[] = tab.entries
+    .filter((e) => wanted.has(e.instruction_index) && e.label === "show-text" && !e.deleted)
+    .map((e) => ({ translated_text: e.translated_text, entry_index: e.instruction_index }));
+  if (reqs.length === 0) return out;
+  const engine = { metrics, wordWrap: true, rowsPerBox, bottomCap };
+  let outcomes: import("./ipc").SplitOutcome[];
+  try {
+    outcomes = await autoSplitEntriesBatch(tab.id, reqs, 9999, rowsPerBox, bottomCap, engine);
+  } catch (err) {
+    out.errors.push(`engine split: ${err}`);
+    return out;
+  }
+  const splitSources: number[] = [];
+  for (const o of outcomes) {
+    if (!o.plan) {
+      if (o.error && out.errors.length < 5) out.errors.push(`#${o.entry_index}: ${o.error}`);
+      continue;
+    }
+    const r = applySplitPlan(o.plan);
+    if (typeof r === "string") {
+      if (out.errors.length < 5) out.errors.push(`#${o.entry_index}: ${r}`);
+    } else {
+      out.split++;
+      splitSources.push(o.entry_index);
+    }
+  }
+  const bridge = await resolveBoxBridge(tab);
+  if (typeof bridge === "string") {
+    out.errors.push(bridge);
+    return out;
+  }
+  // One box per box text (the ETL-separated lines the split inserted), back-to-front.
+  for (const index of splitSources.sort((a, b) => b - a)) {
+    const start = tab.entries.find((e) => e.instruction_index === index);
+    if (!start) continue;
+    const r = paginateBoxWithBridge(start, 1, bridge, [], 0);
+    if (typeof r === "number" && r > 0) out.paginated++;
+    else if (typeof r === "string" && !r.includes("already fits") && out.errors.length < 5) out.errors.push(r);
+  }
+  tab.isDirty = true;
+  tab.entries = [...tab.entries];
+  return out;
 }
 
 /**
@@ -2519,10 +3020,21 @@ export async function doExportAllTabsForTranslation(): Promise<boolean> {
   }
 }
 
+/** Match a CC translation folder to a loaded tab. SYS BINs match on their
+ *  SHA-256 (unique + tamper-evident); Parente tabs carry no BIN hash
+ *  (`sourceBinHash === ""`), so an empty folder hash falls back to matching the
+ *  scene filename — which is unique per game. Without this, every Parente folder
+ *  collides on the empty-hash match and the import lands nothing. */
+function matchFolderToTab(folder: TranslationFolderStatus): TabState | undefined {
+  return folder.source_bin_sha256
+    ? store.tabs.find((t) => t.sourceBinHash === folder.source_bin_sha256)
+    : store.tabs.find((t) => t.sourceBinFilename === folder.source_bin);
+}
+
 /**
  * Import every translation.json under a chosen parent folder. Matches each
- * subfolder's source_bin_sha256 against currently-loaded tabs and applies the
- * import. Per-folder stats reported in a single status line.
+ * subfolder to a loaded tab (BIN hash, or scene filename for Parente) and applies
+ * the import. Per-folder stats reported in a single status line.
  */
 export async function doImportAllTranslations(): Promise<boolean> {
   if (store.tabs.length === 0) {
@@ -2564,8 +3076,8 @@ export async function doImportAllTranslations(): Promise<boolean> {
         unmatchedNames.push(`${folder.folder} (${folder.error})`);
         continue;
       }
-      // Find a tab matching this folder's source BIN hash
-      const matchingTab = store.tabs.find((t) => t.sourceBinHash === folder.source_bin_sha256);
+      // Find a tab matching this folder (hash for SYS, filename for Parente).
+      const matchingTab = matchFolderToTab(folder);
       if (!matchingTab) {
         unmatched++;
         unmatchedNames.push(folder.folder);
@@ -2645,7 +3157,7 @@ export async function doImportSingleFolder(
 ): Promise<number> {
   if (folder.error) throw new Error(folder.error);
 
-  const matchingTab = store.tabs.find((t) => t.sourceBinHash === folder.source_bin_sha256);
+  const matchingTab = matchFolderToTab(folder);
   if (!matchingTab) {
     throw new Error(`No open tab matches ${folder.source_bin || folder.folder}. Open that BIN first.`);
   }

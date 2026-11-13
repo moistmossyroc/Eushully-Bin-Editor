@@ -5,4 +5,5 @@ pub mod dual_language;
 pub mod characters;
 pub mod extract;
 pub mod game_profile;
+pub mod lint;
 pub mod wrap;

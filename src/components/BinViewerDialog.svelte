@@ -3,6 +3,7 @@
   import { store } from "../lib/stores.svelte";
   import { getAllInstructions, type BinInstruction } from "../lib/ipc";
   import { persistAllSettings } from "../lib/settings";
+  import { opcodeDisplayName } from "../lib/opcodeNames";
 
   interface Props {
     onClose: () => void;
@@ -465,7 +466,7 @@
                 <td class="cell-idx">{globalIdx}</td>
                 <td class="cell-offset">0x{instr.offset.toString(16).toUpperCase()}</td>
                 <td class="cell-opcode">0x{instr.opcode.toString(16).toUpperCase()}</td>
-                <td class="cell-label">{instr.label}</td>
+                <td class="cell-label" title={instr.label}>{opcodeDisplayName(instr.opcode, instr.label)}</td>
                 <td class="cell-args">
                   {#each instr.arguments as arg, ai}
                     <button

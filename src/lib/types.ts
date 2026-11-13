@@ -38,6 +38,9 @@ export interface InsertedInstruction {
   arguments: SerializedArg[];
   /** Frontend-only: links this to the visual entry's instruction_index */
   _syntheticIndex?: number;
+  /** Persisted copy of `_syntheticIndex` (written on save, read on load) so
+   *  project reload relinks exactly. Absent in legacy projects. */
+  synthetic_index?: number;
 }
 
 /** Mirrors Rust SerializedArg */

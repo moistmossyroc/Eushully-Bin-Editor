@@ -35,8 +35,10 @@ pub fn write_bin(header: &Header, instructions: &[Instruction]) -> Result<Vec<u8
     // Skip instructions with offset u64::MAX (sentinel for inserted entries
     // that have no original offset — they aren't referenced by any label
     // and would collide with each other / corrupt the map).
-    let mut old_to_new_offset: std::collections::HashMap<u64, u64> =
-        std::collections::HashMap::new();
+    // Ordered so a jump whose target instruction was DELETED can fall through to
+    // the next surviving original instruction (see label fixup below).
+    let mut old_to_new_offset: std::collections::BTreeMap<u64, u64> =
+        std::collections::BTreeMap::new();
     for (i, instr) in instructions.iter().enumerate() {
         if instr.offset == u64::MAX {
             continue;
@@ -232,13 +234,17 @@ pub fn write_bin(header: &Header, instructions: &[Instruction]) -> Result<Vec<u8
                     .map(|(_, _, offset)| *offset)
                     .unwrap_or(arg.raw_data)
             } else if is_control_flow(instr.opcode)
-                && is_label_argument(instr.opcode, arg_idx, arg.raw_data)
+                && is_label_argument(instr.opcode, arg_idx, arg.arg_type, arg.raw_data)
             {
-                // Label: convert old offset to new offset
-                if let Some(&new_byte_offset) = old_to_new_offset.get(&(arg.raw_data as u64)) {
-                    ((new_byte_offset - header_len) >> 2) as u32
-                } else {
-                    arg.raw_data
+                // Label: convert old offset to new offset. If the target was
+                // deleted, jump to the next surviving original instruction
+                // (the code the deleted one would have fallen through to). A
+                // target past every instruction can't be resolved → error rather
+                // than silently keeping a stale address (was: kept raw value).
+                let target = arg.raw_data as u64;
+                match old_to_new_offset.range(target..).next() {
+                    Some((_, &new_byte_offset)) => ((new_byte_offset - header_len) >> 2) as u32,
+                    None => return Err(WriteError::LabelNotFound { target: arg.raw_data }),
                 }
             } else {
                 arg.raw_data
@@ -272,6 +278,27 @@ pub fn write_bin(header: &Header, instructions: &[Instruction]) -> Result<Vec<u8
     output[..header_bytes.len()].copy_from_slice(&header_bytes);
 
     Ok(output)
+}
+
+/// Code targets (immediate label args) that don't land on an instruction start.
+/// Pure; used by the export corruption guard on the RE-PARSED output, where
+/// `offset` is the real position. Empty = every jump/call/callback resolves.
+pub fn unresolved_code_targets(instructions: &[Instruction]) -> Vec<String> {
+    let starts: std::collections::HashSet<u64> = instructions.iter().map(|i| i.offset).collect();
+    let mut unresolved = Vec::new();
+    for (index, instr) in instructions.iter().enumerate() {
+        if !is_control_flow(instr.opcode) {
+            continue;
+        }
+        for (arg_idx, arg) in instr.arguments.iter().enumerate() {
+            if is_label_argument(instr.opcode, arg_idx, arg.arg_type, arg.raw_data)
+                && !starts.contains(&(arg.raw_data as u64))
+            {
+                unresolved.push(format!("#{index} {} arg{arg_idx} → 0x{:X}", instr.label, arg.raw_data));
+            }
+        }
+    }
+    unresolved
 }
 
 #[cfg(test)]

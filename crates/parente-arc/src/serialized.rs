@@ -181,15 +181,20 @@ fn locate_textasset(blob: &[u8], dofs: usize, objs: &[ObjInfo]) -> Result<TextAs
     best.ok_or_else(|| "serialized: no TextAsset object found".to_string())
 }
 
-/// Read the TextAsset's script text and its original encoding.
-pub fn read_textasset(blob: &[u8]) -> Result<(String, ScriptEncoding), String> {
+/// Read the TextAsset's payload as raw bytes, no text decoding. Parente stores
+/// images (and other binary assets) as `.bytes` TextAssets whose payload is the
+/// original file verbatim (e.g. a complete PNG).
+pub fn read_textasset_bytes(blob: &[u8]) -> Result<&[u8], String> {
     let dofs = data_offset(blob)?;
     let objs = find_object_table(blob, dofs)?;
     let ta = locate_textasset(blob, dofs, &objs)?;
-    let bytes = blob
-        .get(ta.script_pos + 4..ta.script_pos + 4 + ta.script_len)
-        .ok_or("serialized: script out of range")?;
-    Ok(decode_script(bytes))
+    blob.get(ta.script_pos + 4..ta.script_pos + 4 + ta.script_len)
+        .ok_or_else(|| "serialized: payload out of range".to_string())
+}
+
+/// Read the TextAsset's script text and its original encoding.
+pub fn read_textasset(blob: &[u8]) -> Result<(String, ScriptEncoding), String> {
+    Ok(decode_script(read_textasset_bytes(blob)?))
 }
 
 /// Read the TextAsset's script text (encoding auto-detected).
